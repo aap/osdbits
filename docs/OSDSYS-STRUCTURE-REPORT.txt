@@ -1,0 +1,251 @@
+OSDSYS structure map — osdsys_dump.idb vs osdbits
+==================================================
+generated 2026-08-21, hermes/reveng, all scratch in /tmp/osdsys-idb/
+(the IDB and osdbits were only READ, never modified)
+
+WHAT THE IDB IS
+---------------
+osdsys_dump.idb = your 3-year-old annotated database of the emulator dump
+"osdsys_dump_200000". Provenance now closed (was an open question):
+
+  - Its RAM segment (0x200000..0x2a7eb5, 687,797 bytes) is BYTE-IDENTICAL
+    to /u/aap/src/osdsys/expanded.bin (687,796 B + 1 stray byte) — i.e. the
+    payload your launcher decompresses. The decompressed OSDSYS blob and the
+    emulator dump are the same bytes.
+  - So this is not just "the boot animation program": it is the WHOLE
+    OSDSYS EE program — boot browser + memory-card/DVD/config machinery +
+    the boot animation — linked to run at 0x200000.
+  - Built with the SCE toolchain ee-gcc-3.2-final-rc2 (full
+    /proj/ee-toolchain/... paths in the strings). Same toolchain family as
+    your osdbits Makefile (/usr/local/sce/ee), so instruction-level
+    comparison of your code vs the binary is meaningful.
+  - Extra "low" segment 0x1f0000..0x200000 (64 KB) = separate dump of the
+    region below the program; holds OSDSYS globals (history @0x1f0138,
+    systemState @0x1f05e8, dbuff @0x1f0a10, evenOddFrame/Field,
+    screen_width/height @0x1f0c40..). BSS segment 0x2a7f00..0x3f32b0
+    (1.35 MB) = the program's scratch.
+  - 1527 functions in the RAM segment; you named ~756 things (mostly
+    animation-side); 68 of your old comments survive (GS-register param
+    docs on the pktSet*/vif1Set* family, jumptable case comments).
+
+HOW I COMPARED
+--------------
+Reconstructed the loaded image from the IDB (python-idb GetManyBytes, the
+venv at /u/aap/src/osdsys/.venv still works), disassembled both sides with
+system objdump -m mips:5900, and per function computed:
+  mnem = difflib ratio on the mnemonic sequence (robust to addresses/
+         register allocs), n = instruction counts.
+"m=1.00" = same instruction sequence, same constants, only addresses differ.
+
+PROGRAM MAP (VA = file offset + 0x200000)
+-----------------------------------------
+  0x200000  crt0 start (bss clear loop), then main's helpers
+  0x200250  sound init/upload (SNDBOOT* etc.)
+  0x200c90  Expand* — the same decompressor your ps2expand.c reconstructs
+  0x201ce8  BootBrowser / ReadKey / ExecutePs2GameDisk / readSystemCnf /
+            CheckMemcardHistory / memcardHistory2 / radMemcardHistory1 —
+            the boot browser + SYSTEM.CNF + game-disk boot logic
+  0x2040d0  GetLanguage / IsPAL / romver_204238 (ROMVER file)
+  0x2052e0  loadResources (628 insns — the whole resource table),
+            getResourcePtr/getResourceSize
+  0x205ce0  InitDraw / StartFrame / waitNextFrame / SwapThread /
+            SwapBuffers — the frame/sema/vblank machinery
+  0x2068f0  vblankHandler, ThreadY, ThreadX_pad_timer? — threads
+  0x207478  main (631 insns: semas, 3x CreateThread/StartThread,
+            makeThreadA/B, loadResources, InitDraw, the browser state
+            machine, ExecutePs2GameDisk path)
+  0x20b5e0  makeThreadA (pad/timer thread), 0x20be60 makeThreadB
+  0x211c70  makeOpeningThread — the boot animation subsystem starts here
+  0x211c70..0x21dfff  animation init/draw (details below)
+  0x22ee00..0x230898  sendDma / setScreenMatrix / setLightMatrices /
+            setTextureUpload / SetWorldMatrix — matrix/DMA upload helpers
+  0x230000..0x247000  a second renderer core (sub_238228, sub_248370,
+            sub_23fd78, sub_2445b0 ... -> sub_246050..sub_2469e0 -> the
+            set*Matrix helpers). This layer is unnamed in your IDB.
+  0x24xxxx..0x2a7eb5  linked runtime/libs (newlib, libvu0, SIF RPC, GS
+            debug). NOTE: your old note "VU1 upload/setup 0x2645a8..0x264b40"
+            is actually SIF RPC glue (_request_end/RemoveDmacHandler/
+            sceSifInitCmd), not the VU uploader.
+  0x2678f0..0x26b060  the 7 VU1 programs (vucode_1..7) live INSIDE the
+            library region here; a descriptor table with end-pointers
+            follows vucode_2 (refs to 0x26b060 at 0x268d64..0x2690d4,
+            stride 0x50).
+
+THREAD ARCHITECTURE (from main's CreateThread calls + thread bodies)
+--------------------------------------------------------------------
+  main -> makeThreadA (pad/mc timer), makeThreadB, makeOpeningThread
+  OpeningThread:  SleepThread; InitOpeningType; InitOpening; loop:
+                  DoOpeningIllegal { ProcessOpening -> DrawOpening ->
+                  DrawEnd }; sub_212010 (per-type dispatch); SignalSema
+  plus SwapThread/vblankHandler frame machinery (your main.c matches this
+  part; your osdbits harness main only creates SwapThread + the opening
+  thread, which is fine for a standalone repro).
+
+THE BOOT ANIMATION SUBSYSTEM (real, with your code overlaid)
+------------------------------------------------------------
+INIT CHAIN — real InitOpening (0x211db0, 33i):
+    OpeningInitRender     <- your InitRender      m=0.94  (device resets +
+                                                           memset, exact same
+                                                           structure)
+      OpeningInitDMA      <- your InitDMA         m=0.76  (3x sceDmaGetChan)
+      OpeningInitSPR      <- your InitSPR         m=1.00  (4x sprAlloc(48,48,
+                                                           640,576) + sprSet-
+                                                           BasePtr + tail j to
+                                                           sceVu0UnitMatrix)
+      initDoubleBuffer    <- your InitDoubleBuffer m=0.29  (same flow, detail
+                                                           drift; see below)
+      gsInitAlloc         <- your gsInitAlloc     m=0.67
+      gsAllocExtraBuffers <- your gsAllocExtraBuffers m=0.67
+    OpeningInitAnimation  <- your InitAnimation    m=0.61
+    OpeningInitTowersFog  <- your InitTowersFog   STUB. Real = 276 insns:
+                             memset, strcmp, FlushCache, DmaSync, GsSyncPath,
+                             sub_217e30 (212i, 3x sqrt — tower geometry!),
+                             InitFog. Yours is 5 insns calling InitFog only.
+    sub_219f08 (flare setup: sub_21a438 cos/sin, sub_215798 rand,
+                sub_219cb8/sub_21b690)  <- your Init() has the placeholder
+                comment "// ??? flare and illegal stuff?" — this is it.
+    initTextShit         <- "// InitText()" placeholder. Real = text upload.
+    StartFrame           <- your StartFrame      m=0.50
+
+FRAME LOOP — real DoOpeningIllegal (0x211f00, 35i):
+    ProcessOpening (0x211e38, 32i)  <- your Process m=0.30
+        ProcessOpeningAnimation (446i — the per-frame animation state
+        machine: IsPAL checks, sub_200b80, sinf/cosf, sceVu0NormalLight-
+        Matrix/CameraMatrix/ViewScreenMatrix/MulMatrix = libvu0 camera
+        setup)                         <- your Process is the same idea
+                                          but its own implementation
+                                          (m=0.38, 188 vs 446 insns)
+        vif1SetScissor
+    DrawOpening (0x219250, 28i)    <- your DoOpening m=0.72
+        InitOpeningScene            <- your InitOpeningScene m=0.51
+    DrawIllegalDisc (0x219f40, 28i) <- your DoIllegalDisc (weak match,
+                                        also resembles DrawOpening)
+        InitIllegalScene -> InitIllegalDisc
+    DrawEnd (0x211eb8, 17i)        <- your DrawEnd m=0.83
+        DoText -> DoSCEText        <- your DoText is a 2-insn stub
+        DrawBlackBars (97i)        <- MISSING in your code
+        waitNextFrame              <- your WaitNextFrame m=0.67
+
+PER-TYPE DRAW — the 11 opening types ('j'..'t' = 106..116, global at
+gp-30928 = 0x2a77a0): sub_212010 switches on type-106 (sltiu a0,11) into a
+jumptable at 0x2a4120 whose entries are 11 small state-setting stubs
+(0x21209c..0x212150). DrawOpeningScene and DrawSCEText have NO direct jal
+callers — they are reached through this typed dispatch (computed jumps),
+which is why a plain call scan misses them.
+  DrawOpeningScene (0x218d80, 31i) <- your DrawOpeningScene is a 7-insn stub
+    -> DrawToExtraBuf2 (123i)        MISSING
+    -> DrawFog (343i)                <- your DrawFog m=0.10 (your own code)
+    -> DrawTowers (342i)             MISSING
+    -> DrawLightsAndCubes (30i)      <- your version is a 10-insn stub
+        -> sceVu0Normalize
+        -> DrawLights (560i)         <- your DrawLights m=0.03 (your own
+                                        code; same helpers, different math)
+        -> DrawCube (355i)           MISSING
+
+DRAW LEAVES (all real, all missing/own-code on your side):
+  DrawLights  560i  vif1SetZWrite/ZTest/Texture, libvu0 matrix ops,
+                   sprTransformVertex (vertex transform), pktSetAlphaBlend,
+                   sceVu0ClipAll, rand, vif1End. Yours: same helper calls,
+                   completely different body.
+  DrawFog     343i  vif1SetClamp/AD, pktSetAlphaBlend, ClipAll,
+                   sprTransformVertex. Yours: different body.
+  DrawCube    355i  cube_21BF88 (236i: LightColor/Rot/Trans/Mul/Apply/Normal-
+                   ize/FTOI4/ClipAll), cube_21BC90 (189i: SubVector/OuterPro-
+                   duct/Normalize x5/ClampVector/InnerProduct — cube normals),
+                   sub_21c7a8 (GS state: vif1SetFramebuffer/AlphaBlend/
+                   Texture_24_32/TexRect), CubeTextureFuckery (87i),
+                   cube_21B798 (155i), 10x DrawTexturedQuad (146i each),
+                   cube_21BBE0/cube_21BA08. MISSING entirely in osdbits.
+  DrawTowers  342i  vif1SetTextureMIP, sinf, Rot/Trans/Mul matrices,
+                   tower_218180..2184D0 (5 helpers, one 109i). MISSING.
+  FlareThing   78i  -> sub_219fb0 (211i, pktSetAlphaBlend...) + flare_
+                   21A6D8/21AA50/21AF18, DrawRedFlare (41i). MISSING.
+  DrawSCEText 111i  + DoSCEText (36i). MISSING (stubbed via your DoText).
+  DrawIllegalText/DoIllegalText, DrawIllegalFog (319i), DrawIllegalCube(s),
+  DrawToExtraBuf2 (123i), DrawExtraBuf2 (160i), DrawBlackBars (97i),
+  DrawSomeSprite2 (89i), DrawTexturedQuad (236i), vif1SetTexture_24_32
+  (49i) — MISSING.
+
+VU1 MICROCODE
+-------------
+The 7 VU programs (your vucode_1..7, byte-exact in the blob at 0x2678f0+)
+are the animation's geometry pipeline (4 dir lights, morph 2/4/6/8 verts,
+backface cull — matches your notes.txt: this is the cubes/towers pipeline).
+osdbits does NOT contain them: your Makefile has no .dsm/.vsm objects and
+your draw code does EE-side math only (libvu0). The real draw path feeds
+the cubes/towers through VU1 — that's the biggest architectural gap
+between osdbits and the real thing, together with the missing renderer
+core at 0x230000..0x247000.
+
+MATCH TABLE (your functions -> real OSDSYS, mnemonic ratio)
+-----------------------------------------------------------
+  exact-name pairs (m = mnemonic sequence ratio):
+    sprGetFreeSize 1.00 | sprInit 1.00 | sprSetBasePtr 1.00
+    sprGetChainBuffer 0.95 | sprAlloc 0.93 | vif1End 0.93
+    vif1SetAlphaBlend 0.92 | vif1SetAD 0.90 | sprInitChains 0.89
+    vif1Pad 0.86 | vif1SetTexRect 0.86 | vif1SetFlatRect 0.84
+    sprInitAlloc 0.83 | swapthread 0.83 | drawend 0.83
+    psmtobppgs 0.79 | gettexexponent 0.76 | psmtobppee 0.71
+    vif1begin 0.70 | vif1setztest 0.72 | doopeningillegal 0.71
+    sprtransformvertex 0.65 | pktsetad 0.64 | makeopeningthread 0.63
+    initdraw 0.61 | vif1settexturemip 0.57 | vblankhandler 0.56
+    gsallocbuffer 0.51 | startframe 0.50 | pktsettexrect 0.49
+    pktsetflatrect 0.57 | swapbuffers 0.40 | initfog 0.39 ...
+  cross-named pairs (his name -> real name, m):
+    InitSPR -> OpeningInitSPR 1.00 | InitRender -> OpeningInitRender 0.94
+    InitDMA -> OpeningInitDMA 0.76 | DoOpening -> DrawOpening 0.72
+    InitAnimation -> OpeningInitAnimation 0.61
+    InitTextures -> OpeningInitTextures 0.41 | UploadImage -> OpeningLoadImage 0.41
+    Process -> ProcessOpeningAnimation 0.38
+    InitTexture -> OpeningInitTexture 0.09 (your own impl)
+    InitLightsCubes -> nothing (your own impl, 76i vs real 194i)
+  stubs in your code (2..7 insns where the real one has a body):
+    DoText(7i real) InitIllegalScene(54i) DrawIllegalScene(18i)
+    GetLanguage(7i) IsPAL(9i) OpeningThread(32i) DrawOpeningScene(31i)
+    DrawLightsAndCubes(30i) InitTowersFog(276i!)
+    InitDoubleBuffer(26i, yours 22i but m=0.29 — details drifted)
+  completely different implementations (share no instructions):
+    DrawLights (best match vs ALL 1527 real functions: 0.05)
+    DrawFog (0.12) InitTexture (0.09) LoadResources (real 628i vs yours
+    108i — the real one loads the whole resource set incl. fonts/sounds)
+    main (real 631i boot browser vs your 65i harness — expected)
+
+ODDS AND ENDS
+-------------
+  - Your main.c comments match your IDB comments: "TODO: some unknown
+    function" = real InitDraw also calls sub_205dc0 (49i, 2x SetGsVParam);
+    "what is mode 2?" = the literal 2 in sceGsResetGraph(2, ...).
+  - The "switch 24 cases" you commented at 0x206ba0 (ThreadY) and
+    "switch 25 cases" at 0x209364 (texture upload dispatch) are still
+    unnamed on the real side.
+  - Strings: your ELF shares 114 strings with the real program (the
+    resource names ICO*/SND*/TEX*/FNT*, the libdev "<D1_CHCR=%08x>" debug
+    formats); the real program additionally has the whole browser UI
+    (9 languages), icon.sys/osdmain.elf paths etc. — out of scope for
+    the animation repro.
+
+SUGGESTED NEXT STEPS (if you continue this)
+-------------------------------------------
+  1. The 11-type state machine: recover sub_212010's 11 stubs + the
+     type->global assignments (0x2a77a0 area), then map each type to its
+     draw sequence via the typed dispatch (this unlocks DrawOpeningScene
+     and DrawSCEText, which have no static callers).
+  2. OpeningInitTowersFog + sub_217e30 (212i, 3x sqrt) = the tower
+     geometry init — your stub hides ~490 insns of the real thing.
+  3. Port the cubes: DrawCube + cube_* + DrawTexturedQuad + vif1SetTex-
+     ture_24_32 are well-bounded (~1500 insns) and pure libvu0 + your
+     existing pktSet/vif1Set helpers — the most mechanical gap to close.
+  4. The VU1 pipelines (vucode_1..7) + their uploader + the 0x230000..
+     0x247000 renderer core are the long pole; the descriptor table at
+     0x268d64 is the entry point into the uploader.
+  5. Your DrawLights/DrawFog: since they share zero instructions with the
+     real ones, consider re-porting from the IDB rather than evolving
+     the current versions — the real DrawLights is 560 insns of libvu0 +
+     vif1 helper calls, all primitives you already have reconstructed
+     faithfully.
+
+Scratch (all read-only w.r.t. your files): /tmp/osdsys-idb/
+  dump_idb.py dump_image.py compare.py debug1-4.py graph.py callers.py
+  final_bits.py ptrscan.py jumptable.py sidebyside.py
+  image.bin (reconstructed RAM segment) comparison.txt functions.txt
+  names.txt names_nonauto.txt comments.txt strings.txt

@@ -1,0 +1,229 @@
+0000:   NOP                                      IADDIU VI01, VI00, 0x0
+0008:   NOP                                      IADDIU VI02, VI00, 0x4
+0010:   NOP                                      IADDIU VI03, VI00, 0x16
+0018:   NOP                                      BAL VI15, 0x648
+0020:   NOP                                      NOP
+0028:   NOP                                      IADDIU VI01, VI00, 0x8
+0030:   NOP                                      LQI.xyzw VF09, (VI01++)
+0038:   NOP                                      LQI.xyzw VF10, (VI01++)
+0040:   NOP                                      LQI.xyzw VF11, (VI01++)
+0048:   NOP                                      LQI.xyzw VF12, (VI01++)
+0050:   NOP                                      LQI.xyzw VF05, (VI01++)
+0058:   NOP                                      LQI.xyzw VF06, (VI01++)
+0060:   NOP                                      LQI.xyzw VF07, (VI01++)
+0068:   NOP                                      LQI.xyzw VF08, (VI01++)
+0070:   NOP                                      LQI.xyzw VF18, (VI01++)
+0078:   NOP                                      LQI.xyzw VF16, (VI01++)
+0080:   NOP                                      IADD VI02, VI00, VI01
+0088:   NOP                                      IADDIU VI01, VI01, 0x3
+0090:   NOP                                      LQI.xyzw VF31, (VI01++)
+0098:   NOP                                      LQI.xyzw VF01, (VI01++)
+00A0:   NOP                                      LQI.xyzw VF02, (VI01++)
+00A8:   NOP                                      LQI.xyzw VF03, (VI01++)
+00B0:   NOP                                      LQI.xyzw VF04, (VI01++)
+00B8:   NOP                                      NOP
+00C0:   NOP                                      XGKICK VI02
+00C8:   NOP[E]                                   NOP
+00D0:   NOP                                      NOP
+00D8:   NOP                                      MTIR VI01, VF31x
+00E0:   NOP                                      NOP
+00E8:   NOP                                      NOP
+00F0:   NOP                                      NOP
+00F8:   NOP                                      IBNE VI01, VI00, 0x318
+0100:   NOP                                      NOP
+0108:   NOP                                      XTOP VI01
+0110:   NOP                                      ILWR.x VI10, (VI01)
+0118:   NOP                                      IADDIU VI11, VI00, 0x7FFF
+0120:   NOP                                      IAND VI10, VI11, VI10
+0128:   NOP                                      IADDIU VI11, VI00, 0x7FFF
+0130:   NOP                                      IADDIU VI11, VI11, 0x1
+0138:   NOP                                      IADDIU VI12, VI00, 0xD0
+0140:   NOP                                      LQ.xyzw VF15, 0x0(VI01)
+0148:   NOP                                      IADDIU VI03, VI01, 0x1
+0150:   NOP                                      IADD VI04, VI03, VI10
+0158:   NOP                                      IADD VI05, VI04, VI10
+0160:   NOP                                      IADD VI06, VI05, VI10
+0168:   NOP                                      IADD VI02, VI06, VI10
+0170:   NOP                                      IADDIU VI02, VI02, 0x4
+0178:   NOP                                      SQ.xyzw VF15, 0x0(VI02)
+0180:   NOP                                      IADDIU VI07, VI02, 0x1
+0188:   NOP                                      IADDIU VI08, VI02, 0x2
+0190:   NOP                                      IADDIU VI09, VI02, 0x3
+0198:   NOP                                      IADDIU VI13, VI00, 0x0
+01A0:   NOP                                      LQI.xyzw VF20, (VI03++)
+01A8:   NOP                                      LQI.xyzw VF21, (VI04++)
+01B0:   NOP                                      LQI.xyzw VF23, (VI05++)
+01B8:   NOP                                      LQI.xyzw VF22, (VI06++)
+01C0:   MULAx.xyzw ACC, VF01, VF20               NOP
+01C8:   MADDAy.xyzw ACC, VF02, VF20              NOP
+01D0:   MADDAz.xyzw ACC, VF03, VF20              NOP
+01D8:   MADDw.xyzw VF24, VF04, VF20              NOP
+01E0:   MULAx.xyzw ACC, VF05, VF21               LQI.xyzw VF20, (VI03++)
+01E8:   MADDAy.xyzw ACC, VF06, VF21              NOP
+01F0:   MADDAz.xyzw ACC, VF07, VF21              NOP
+01F8:   MADDw.xyzw VF13, VF08, VF21              DIV Q, VF00w, VF24w
+0200:   MULq.xyz VF24, VF24, Q                   WAITQ
+0208:   MULq.xyzw VF27, VF22, Q                  NOP
+0210:   NOP                                      LQI.xyzw VF22, (VI06++)
+0218:   MAXx.xyzw VF13, VF13, VF00               LQI.xyzw VF21, (VI04++)
+0220:   SUB.xyw VF30, VF18, VF24                 MFIR.w VF19, VI00
+0228:   SUB.xyw VF30, VF24, VF16                 MFIR.w VF17, VI11
+0230:   FTOI4.xyz VF19, VF24                     NOP
+0238:   FTOI4.xyz VF17, VF24                     IADDI VI10, VI10, 0x1F
+0240:   MULAx.xyzw ACC, VF09, VF13               FMAND VI01, VI12
+0248:   MADDAy.xyzw ACC, VF10, VF13              FMAND VI01, VI01
+0250:   MADDAz.xyzw ACC, VF11, VF13              IBNE VI01, VI12, 0x298
+0258:   MADDw.xyzw VF14, VF12, VF13              NOP
+0260:   NOP                                      SQ.xyzw VF19, 0x0(VI09)
+0268:   NOP                                      ISUBIU VI13, VI13, 0x1
+0270:   NOP                                      IBLEZ VI13, 0x2B0
+0278:   MUL.xyzw VF26, VF23, VF14                NOP
+0280:   NOP                                      SQ.xyzw VF17, 0x0(VI09)
+0288:   NOP                                      B 0x2B0
+0290:   NOP                                      NOP
+0298:   NOP                                      SQ.xyzw VF17, 0x0(VI09)
+02A0:   NOP                                      IADDIU VI13, VI00, 0x3
+02A8:   NOP                                      NOP
+02B0:   FTOI0.xyzw VF25, VF26                    IADDIU VI09, VI09, 0x3
+02B8:   NOP                                      LQI.xyzw VF23, (VI05++)
+02C0:   NOP                                      SQ.xyzw VF27, 0x0(VI07)
+02C8:   NOP                                      IADDIU VI07, VI07, 0x3
+02D0:   NOP                                      SQ.xyzw VF25, 0x0(VI08)
+02D8:   NOP                                      IADDIU VI08, VI08, 0x3
+02E0:   NOP                                      IBNE VI10, VI00, 0x1C0
+02E8:   NOP                                      NOP
+02F0:   NOP                                      XGKICK VI02
+02F8:   NOP[E]                                   NOP
+0300:   NOP                                      NOP
+0308:   NOP                                      B 0x108
+0310:   NOP                                      NOP
+0318:   NOP                                      XTOP VI01
+0320:   NOP                                      ILWR.x VI10, (VI01)
+0328:   NOP                                      IADDIU VI11, VI00, 0x7FFF
+0330:   NOP                                      IAND VI10, VI11, VI10
+0338:   NOP                                      IADDIU VI11, VI00, 0x7FFF
+0340:   NOP                                      IADDIU VI11, VI11, 0x1
+0348:   NOP                                      IADDIU VI12, VI00, 0xD0
+0350:   NOP                                      LQ.xyzw VF15, 0x0(VI01)
+0358:   NOP                                      IADDIU VI03, VI01, 0x1
+0360:   NOP                                      IADD VI04, VI03, VI10
+0368:   NOP                                      IADD VI05, VI04, VI10
+0370:   NOP                                      IADD VI06, VI05, VI10
+0378:   NOP                                      IADD VI02, VI06, VI10
+0380:   NOP                                      IADDIU VI02, VI02, 0x4
+0388:   NOP                                      SQ.xyzw VF15, 0x0(VI02)
+0390:   NOP                                      IADDIU VI07, VI02, 0x1
+0398:   NOP                                      IADDIU VI08, VI02, 0x2
+03A0:   NOP                                      IADDIU VI09, VI02, 0x3
+03A8:   NOP                                      IADDIU VI13, VI00, 0x0
+03B0:   NOP                                      LQI.xyzw VF20, (VI03++)
+03B8:   NOP                                      LQI.xyzw VF21, (VI04++)
+03C0:   NOP                                      LQI.xyzw VF23, (VI05++)
+03C8:   NOP                                      LQI.xyzw VF22, (VI06++)
+03D0:   MULAx.xyzw ACC, VF01, VF20               NOP
+03D8:   MADDAy.xyzw ACC, VF02, VF20              NOP
+03E0:   MADDAz.xyzw ACC, VF03, VF20              NOP
+03E8:   MADDw.xyzw VF24, VF04, VF20              NOP
+03F0:   NOP                                      NOP
+03F8:   NOP                                      NOP
+0400:   NOP                                      DIV Q, VF00w, VF24w
+0408:   MULq.xyz VF24, VF24, Q                   WAITQ
+0410:   NOP                                      NOP
+0418:   NOP                                      NOP
+0420:   NOP                                      NOP
+0428:   SUB.xyw VF30, VF18, VF24                 MFIR.w VF19, VI00
+0430:   SUB.xyw VF30, VF24, VF16                 MFIR.w VF17, VI11
+0438:   FTOI4.xyz VF19, VF24                     NOP
+0440:   FTOI4.xyz VF17, VF24                     NOP
+0448:   NOP                                      FMAND VI01, VI12
+0450:   NOP                                      FMAND VI01, VI01
+0458:   NOP                                      IBNE VI01, VI12, 0x4A0
+0460:   NOP                                      NOP
+0468:   NOP                                      SQ.xyzw VF19, 0x0(VI09)
+0470:   NOP                                      ISUBIU VI13, VI13, 0x1
+0478:   NOP                                      IBLEZ VI13, 0x4B8
+0480:   NOP                                      NOP
+0488:   NOP                                      SQ.xyzw VF17, 0x0(VI09)
+0490:   NOP                                      B 0x4B8
+0498:   NOP                                      NOP
+04A0:   NOP                                      SQ.xyzw VF17, 0x0(VI09)
+04A8:   NOP                                      IADDIU VI13, VI00, 0x3
+04B0:   NOP                                      NOP
+04B8:   MULAx.xyzw ACC, VF05, VF21               IADDIU VI09, VI09, 0x3
+04C0:   MADDAy.xyzw ACC, VF06, VF21              NOP
+04C8:   MADDAz.xyzw ACC, VF07, VF21              NOP
+04D0:   MADDw.xyzw VF13, VF08, VF21              NOP
+04D8:   NOP                                      NOP
+04E0:   NOP                                      NOP
+04E8:   NOP                                      NOP
+04F0:   MULq.xyzw VF27, VF22, Q                  NOP
+04F8:   MULq.xyzw VF28, VF31, Q                  NOP
+0500:   NOP                                      NOP
+0508:   NOP                                      NOP
+0510:   NOP                                      NOP
+0518:   MUL.xyzw VF29, VF13, VF28                NOP
+0520:   NOP                                      NOP
+0528:   NOP                                      NOP
+0530:   NOP                                      NOP
+0538:   ADDx.x VF27, VF27, VF29                  NOP
+0540:   SUBy.y VF27, VF27, VF29                  NOP
+0548:   MAXx.xyzw VF13, VF13, VF00               NOP
+0550:   NOP                                      NOP
+0558:   NOP                                      NOP
+0560:   NOP                                      NOP
+0568:   NOP                                      SQ.xyzw VF27, 0x0(VI07)
+0570:   NOP                                      IADDIU VI07, VI07, 0x3
+0578:   NOP                                      NOP
+0580:   NOP                                      NOP
+0588:   MULAx.xyzw ACC, VF09, VF13               NOP
+0590:   MADDAy.xyzw ACC, VF10, VF13              NOP
+0598:   MADDAz.xyzw ACC, VF11, VF13              NOP
+05A0:   MADDw.xyzw VF14, VF12, VF13              NOP
+05A8:   NOP                                      NOP
+05B0:   NOP                                      NOP
+05B8:   NOP                                      NOP
+05C0:   MUL.xyzw VF26, VF23, VF14                NOP
+05C8:   NOP                                      NOP
+05D0:   NOP                                      NOP
+05D8:   NOP                                      NOP
+05E0:   FTOI0.xyzw VF25, VF26                    NOP
+05E8:   NOP                                      IADDI VI10, VI10, 0x1F
+05F0:   NOP                                      NOP
+05F8:   NOP                                      NOP
+0600:   NOP                                      SQ.xyzw VF25, 0x0(VI08)
+0608:   NOP                                      IADDIU VI08, VI08, 0x3
+0610:   NOP                                      IBNE VI10, VI00, 0x3B0
+0618:   NOP                                      NOP
+0620:   NOP                                      XGKICK VI02
+0628:   NOP[E]                                   NOP
+0630:   NOP                                      NOP
+0638:   NOP                                      B 0x318
+0640:   NOP                                      NOP
+0648:   NOP                                      LQI.xyzw VF08, (VI02++)
+0650:   NOP                                      LQI.xyzw VF04, (VI01++)
+0658:   NOP                                      LQI.xyzw VF05, (VI01++)
+0660:   NOP                                      LQI.xyzw VF06, (VI01++)
+0668:   NOP                                      LQI.xyzw VF07, (VI01++)
+0670:   MULAx.xyzw ACC, VF04, VF08               LQI.xyzw VF09, (VI02++)
+0678:   MADDAy.xyzw ACC, VF05, VF08              NOP
+0680:   MADDAz.xyzw ACC, VF06, VF08              NOP
+0688:   MADDw.xyzw VF12, VF07, VF08              NOP
+0690:   MULAx.xyzw ACC, VF04, VF09               LQI.xyzw VF10, (VI02++)
+0698:   MADDAy.xyzw ACC, VF05, VF09              NOP
+06A0:   MADDAz.xyzw ACC, VF06, VF09              NOP
+06A8:   MADDw.xyzw VF13, VF07, VF09              SQI.xyzw VF12, (VI03++)
+06B0:   MULAx.xyzw ACC, VF04, VF10               LQI.xyzw VF11, (VI02++)
+06B8:   MADDAy.xyzw ACC, VF05, VF10              NOP
+06C0:   MADDAz.xyzw ACC, VF06, VF10              NOP
+06C8:   MADDw.xyzw VF14, VF07, VF10              SQI.xyzw VF13, (VI03++)
+06D0:   MULAx.xyzw ACC, VF04, VF11               NOP
+06D8:   MADDAy.xyzw ACC, VF05, VF11              NOP
+06E0:   MADDAz.xyzw ACC, VF06, VF11              NOP
+06E8:   MADDw.xyzw VF15, VF07, VF11              SQI.xyzw VF14, (VI03++)
+06F0:   NOP                                      NOP
+06F8:   NOP                                      NOP
+0700:   NOP                                      NOP
+0708:   NOP                                      SQI.xyzw VF15, (VI03++)
+0710:   NOP                                      NOP
+0718:   NOP                                      JR VI15
+0720:   NOP                                      NOP

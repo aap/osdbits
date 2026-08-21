@@ -1,0 +1,10 @@
+# build artifacts
+*.o
+*.elf
+*.map
+*.lst
+*.dis
+
+# editors
+*.swp
+*.swo

@@ -1,0 +1,106 @@
+	NOP                                      IADDIU VI01, VI00, 0
+	NOP                                      IADDIU VI02, VI00, 4
+	NOP                                      IADDIU VI03, VI00, 16
+	NOP                                      BAL VI15, MulMatrix
+	NOP                                      NOP
+
+	NOP                                      IADDIU VI01, VI00, 8
+	NOP                                      LQI VF09, (VI01++)		; light colors
+	NOP                                      LQI VF10, (VI01++)
+	NOP                                      LQI VF11, (VI01++)
+	NOP                                      LQI VF12, (VI01++)
+	NOP                                      LQI VF05, (VI01++)		; light vector matrix
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	NOP                                      LQI VF08, (VI01++)
+	NOP                                      LQI VF01, (VI01++)		; object to screen matrix
+	NOP                                      LQI VF02, (VI01++)
+	NOP                                      LQI VF03, (VI01++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF16, (VI01++)		; load color clamp
+	NOP[E]                                   NOP
+	NOP                                      NOP
+
+START0:
+	NOP                                      XTOP VI01			; input packet
+	NOP                                      ILWR.x VI10, (VI01)
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IAND VI10, VI11, VI10		; vertex count
+	NOP                                      LQ VF19, 0(VI01)		; load gif tag
+	NOP                                      IADDIU VI03, VI01, 1		; pointer for vertices
+	NOP                                      IADD VI04, VI03, VI10		; pointer for normals
+	NOP                                      IADD VI05, VI04, VI10		; pointer for colors
+	NOP                                      IADD VI06, VI05, VI10		; pointer for st
+	NOP                                      IADD VI02, VI06, VI10		; XGKICK pointer
+	NOP                                      SQ VF19, 0(VI02)		; store gif tag
+	NOP                                      IADDIU VI07, VI02, 2		; store pointer for colors (unused)
+	NOP                                      IADDIU VI08, VI02, 1		; store pointer for st
+	NOP                                      IADDIU VI09, VI02, 3		; store pointer for vertices (unused)
+	NOP                                      LQI VF20, (VI03++)		; load vertex
+
+LOOP:
+	; transform vertex
+	MULAx ACC, VF01, VF20                    LQI VF21, (VI04++)		; load normal
+	MADDAy ACC, VF02, VF20                   LQI VF22, (VI05++)		; load color
+	MADDAz ACC, VF03, VF20                   LQI VF23, (VI06++)		; load st
+	MADDw VF25, VF04, VF20                   NOP
+	; dot(normal, lights)
+	MULAx ACC, VF05, VF21                    DIV Q, VF00w, VF25w
+	MADDAy ACC, VF06, VF21                   NOP
+	MADDAz ACC, VF07, VF21                   NOP
+	MADDw VF13, VF08, VF21                   NOP
+	MAXx VF13, VF13, VF00                    NOP				; clamp light factors
+	MULq.xyz VF27, VF23, Q                   NOP				; divide st. BUG? Q used too early
+	; multiply light intensities by light colors
+	MULAx ACC, VF09, VF13                    NOP
+	MADDAy ACC, VF10, VF13                   NOP
+	MADDz VF14, VF11, VF13                   NOP
+	ADD VF14, VF14, VF12                     SQI VF27, (VI08++)		; ambient light - store st
+	MUL.xyz VF27, VF22, VF14                 NOP				; light*color
+	MINIx VF27, VF27, VF16                   NOP				; clamp color
+	FTOI0 VF26, VF27                         NOP
+	MULq VF28, VF25, Q                       SQI VF26, (VI08++)		; store color
+	FTOI4 VF27, VF28                         IADDI VI10, VI10, -1
+	NOP                                      SQI VF27, (VI08++)		; store vertex
+	NOP                                      IBNE VI10, VI00, LOOP
+	NOP                                      LQI VF20, (VI03++)
+	NOP                                      XGKICK VI02
+	NOP[E]                                   B START0
+	NOP                                      NOP
+
+; -------------------------------------------------------------------
+;   MulMatrix
+;      VI01 : address of source matrix
+;      VI02 : address of source matrix
+;      VI03 : address of destination matrix
+;
+
+MulMatrix:
+	NOP                                      LQI VF08, (VI02++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	MULAx ACC, VF04, VF08                    LQI VF09, (VI02++)
+	MADDAy ACC, VF05, VF08                   NOP
+	MADDAz ACC, VF06, VF08                   NOP
+	MADDw VF12, VF07, VF08                   NOP
+	MULAx ACC, VF04, VF09                    LQI VF10, (VI02++)
+	MADDAy ACC, VF05, VF09                   NOP
+	MADDAz ACC, VF06, VF09                   NOP
+	MADDw VF13, VF07, VF09                   SQI VF12, (VI03++)
+	MULAx ACC, VF04, VF10                    LQI VF11, (VI02++)
+	MADDAy ACC, VF05, VF10                   NOP
+	MADDAz ACC, VF06, VF10                   NOP
+	MADDw VF14, VF07, VF10                   SQI VF13, (VI03++)
+	MULAx ACC, VF04, VF11                    NOP
+	MADDAy ACC, VF05, VF11                   NOP
+	MADDAz ACC, VF06, VF11                   NOP
+	MADDw VF15, VF07, VF11                   SQI VF14, (VI03++)
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQI VF15, (VI03++)
+	NOP                                      NOP
+	NOP                                      JR VI15
+	NOP                                      NOP

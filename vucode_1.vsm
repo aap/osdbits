@@ -1,0 +1,268 @@
+	NOP                                      IADDIU VI01, VI00, 0
+	NOP                                      IADDIU VI02, VI00, 4
+	NOP                                      IADDIU VI03, VI00, 22
+	NOP                                      BAL VI15, MulMatrix
+	NOP                                      NOP
+
+	NOP                                      IADDIU VI01, VI00, 8
+	NOP                                      LQI VF09, (VI01++)		; light colors
+	NOP                                      LQI VF10, (VI01++)
+	NOP                                      LQI VF11, (VI01++)
+	NOP                                      LQI VF12, (VI01++)
+	NOP                                      LQI VF05, (VI01++)		; light vector matrix
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	NOP                                      LQI VF08, (VI01++)
+	NOP                                      LQI VF18, (VI01++)		; clip vectors
+	NOP                                      LQI VF16, (VI01++)
+	NOP                                      IADD VI02, VI00, VI01
+	NOP                                      IADDIU VI01, VI01, 3
+	NOP                                      LQI VF31, (VI01++)		; tex mapping params
+	NOP                                      LQI VF01, (VI01++)		; object to screen matrix
+	NOP                                      LQI VF02, (VI01++)
+	NOP                                      LQI VF03, (VI01++)
+	NOP                                      LQI VF04, (VI01++)
+
+	NOP                                      NOP
+	NOP                                      XGKICK VI02
+	NOP[E]                                   NOP
+	NOP                                      NOP
+
+	NOP                                      MTIR VI01, VF31x
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      IBNE VI01, VI00, START1	; tex mapping
+	NOP                                      NOP
+
+START0:
+	NOP                                      XTOP VI01			; input packet
+	NOP                                      ILWR.x VI10, (VI01)
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IAND VI10, VI11, VI10		; vertex count
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IADDIU VI11, VI11, 1		; ADC flag
+	NOP                                      IADDIU VI12, VI00, 0xD0	; clip flags, Sxyz
+	NOP                                      LQ VF15, 0(VI01)		; load gif tag
+	NOP                                      IADDIU VI03, VI01, 1		; pointer for vertices
+	NOP                                      IADD VI04, VI03, VI10		; pointer for normals
+	NOP                                      IADD VI05, VI04, VI10		; pointer for colors
+	NOP                                      IADD VI06, VI05, VI10		; pointer for st
+	NOP                                      IADD VI02, VI06, VI10
+	NOP                                      IADDIU VI02, VI02, 4		; XGKICK pointer
+	NOP                                      SQ VF15, 0(VI02)		; store gif tag
+	NOP                                      IADDIU VI07, VI02, 1		; store pointer for st
+	NOP                                      IADDIU VI08, VI02, 2		; store pointer for colors
+	NOP                                      IADDIU VI09, VI02, 3		; store pointer for vertices
+	NOP                                      IADDIU VI13, VI00, 0
+	NOP                                      LQI VF20, (VI03++)		; load vertex
+	NOP                                      LQI VF21, (VI04++)		; load normal
+	NOP                                      LQI VF23, (VI05++)		; load color
+	NOP                                      LQI VF22, (VI06++)		; load st
+
+LOOP0:
+	; transform vertex
+	MULAx ACC, VF01, VF20                    NOP
+	MADDAy ACC, VF02, VF20                   NOP
+	MADDAz ACC, VF03, VF20                   NOP
+	MADDw VF24, VF04, VF20                   NOP
+	; dot(normal, lights)
+	MULAx ACC, VF05, VF21                    LQI VF20, (VI03++)		; next vertex
+	MADDAy ACC, VF06, VF21                   NOP
+	MADDAz ACC, VF07, VF21                   NOP
+	MADDw VF13, VF08, VF21                   DIV Q, VF00w, VF24w
+
+	MULq.xyz VF24, VF25, Q                   WAITQ				; perspective division
+	MULq VF27, VF22, Q                       NOP				; also divide st
+	NOP                                      LQI VF22, (VI06++)		; next st
+	MAXx VF13, VF13, VF00                    LQI VF21, (VI04++)		; clamp light factors - next normal
+	SUB.xyw VF30, VF18, VF24                 MFIR.w VF19, VI00		; test min clip - clear ADC flag
+	SUB.xyw VF30, VF24, VF16                 MFIR.w VF17, VI11		; test max clip - set ADC flag
+	FTOI4.xyz VF19, VF24                     NOP
+	FTOI4.xyz VF17, VF24                     IADDI VI10, VI10, -1
+	; multiply light intensities by light colors
+	MULAx ACC, VF09, VF13                    FMAND VI01, VI12
+	MADDAy ACC, VF10, VF13                   FMAND VI01, VI01
+	MADDAz ACC, VF11, VF13                   IBNE VI01, VI12, L0		; vertex is clipped
+	MADDw VF14, VF12, VF13                   NOP
+
+	NOP                                      SQ VF19, 0(VI09)		; store vertex
+	NOP                                      ISUBIU VI13, VI13, 1
+	NOP                                      IBLEZ VI13, L1			; branch if restart strip
+	MUL VF26, VF23, VF14                     NOP				; light*color
+
+	NOP                                      SQ VF17, 0(VI09)		; store clipped vertex
+	NOP                                      B L1
+	NOP                                      NOP
+L0:
+	NOP                                      SQ VF17, 0(VI09)		; store clipped vertex
+	NOP                                      IADDIU VI13, VI00, 3		; clip triangle
+	NOP                                      NOP
+L1:
+	FTOI0 VF25, VF26                         IADDIU VI09, VI09, 3
+	NOP                                      LQI VF23, (VI05++)
+	NOP                                      SQ VF27, 0(VI07)		; store st
+	NOP                                      IADDIU VI07, VI07, 3
+	NOP                                      SQ VF25, 0(VI08)		; store color
+	NOP                                      IADDIU VI08, VI08, 3
+	NOP                                      IBNE VI10, VI00, LOOP0
+	NOP                                      NOP
+
+	NOP                                      XGKICK VI02
+	NOP[E]                                   NOP
+	NOP                                      NOP
+	NOP                                      B START0
+	NOP                                      NOP
+
+
+START1:
+	NOP                                      XTOP VI01			; input packet
+	NOP                                      ILWR.x VI10, (VI01)
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IAND VI10, VI11, VI10		; vertex count
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IADDIU VI11, VI11, 1		; ADC flag
+	NOP                                      IADDIU VI12, VI00, 0xD0	; clip flags, Sxyz
+	NOP                                      LQ VF15, 0(VI01)		; load gif tag
+	NOP                                      IADDIU VI03, VI01, 1		; pointer for vertices
+	NOP                                      IADD VI04, VI03, VI10		; pointer for normals
+	NOP                                      IADD VI05, VI04, VI10		; pointer for colors
+	NOP                                      IADD VI06, VI05, VI10		; pointer for st
+	NOP                                      IADD VI02, VI06, VI10
+	NOP                                      IADDIU VI02, VI02, 4		; XGKICK pointer
+	NOP                                      SQ VF15, 0(VI02)		; store gif tag
+	NOP                                      IADDIU VI07, VI02, 1		; store pointer for st
+	NOP                                      IADDIU VI08, VI02, 2		; store pointer for color
+	NOP                                      IADDIU VI09, VI02, 3		; store pointer for vertices
+	NOP                                      IADDIU VI13, VI00, 0
+
+LOOP1:
+	NOP                                      LQI VF20, (VI03++)		; load vertex
+	NOP                                      LQI VF21, (VI04++)		; load normal
+	NOP                                      LQI VF23, (VI05++)		; load color
+	NOP                                      LQI VF22, (VI06++)		; load st
+	; transform vertex
+	MULAx ACC, VF01, VF20                    NOP
+	MADDAy ACC, VF02, VF20                   NOP
+	MADDAz ACC, VF03, VF20                   NOP
+	MADDw VF24, VF04, VF20                   NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      DIV Q, VF00w, VF24w
+	MULq.xyz VF24, VF24, Q                   WAITQ				; perspective division
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	SUB.xyw VF30, VF18, VF24                 MFIR.w VF19, VI00		; test min clip	- clear ADC flag
+	SUB.xyw VF30, VF24, VF16                 MFIR.w VF17, VI11		; test max clip	- set ADC flag
+	FTOI4.xyz VF19, VF24                     NOP
+	FTOI4.xyz VF17, VF24                     NOP
+	NOP                                      FMAND VI01, VI12
+	NOP                                      FMAND VI01, VI01
+	NOP                                      IBNE VI01, VI12, L2		; vertex is clipped
+	NOP                                      NOP
+
+	NOP                                      SQ VF19, 0(VI09)		; store vertex
+	NOP                                      ISUBIU VI13, VI13, 1
+	NOP                                      IBLEZ VI13, L3
+	NOP                                      NOP
+
+	NOP                                      SQ VF17, 0(VI09)		; store clipped vertex
+	NOP                                      B L3
+	NOP                                      NOP
+L2:
+	NOP                                      SQ VF17, 0(VI09)		; store clipped vertex
+	NOP                                      IADDIU VI13, VI00, 3		; clip triangle
+	NOP                                      NOP
+L3:
+	; dot(normal, lights)
+	MULAx ACC, VF05, VF21                    IADDIU VI09, VI09, 3
+	MADDAy ACC, VF06, VF21                   NOP
+	MADDAz ACC, VF07, VF21                   NOP
+	MADDw VF13, VF08, VF21                   NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	; calculate some crazy st coordinates. refraction effect?
+	MULq VF27, VF22, Q                       NOP
+	MULq VF28, VF31, Q                       NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	MUL VF29, VF13, VF28                     NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	ADDx.x VF27, VF27, VF29                  NOP
+	SUBy.y VF27, VF27, VF29                  NOP
+	MAXx VF13, VF13, VF00                    NOP				; clamp light factors
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQ VF27, 0(VI07)		; store st
+	NOP                                      IADDIU VI07, VI07, 3
+	NOP                                      NOP
+	NOP                                      NOP
+	; multiply light intensities by light colors
+	MULAx ACC, VF09, VF13                    NOP
+	MADDAy ACC, VF10, VF13                   NOP
+	MADDAz ACC, VF11, VF13                   NOP
+	MADDw VF14, VF12, VF13                   NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	MUL VF26, VF23, VF14                     NOP				; light*color
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	FTOI0 VF25, VF26                         NOP
+	NOP                                      IADDI VI10, VI10, -1
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQ VF25, 0(VI08)		; store color
+	NOP                                      IADDIU VI08, VI08, 3
+	NOP                                      IBNE VI10, VI00, LOOP1
+	NOP                                      NOP
+
+	NOP                                      XGKICK VI02
+	NOP[E]                                   NOP
+	NOP                                      NOP
+	NOP                                      B START1
+	NOP                                      NOP
+
+; -------------------------------------------------------------------
+;   MulMatrix
+;      VI01 : address of source matrix
+;      VI02 : address of source matrix
+;      VI03 : address of destination matrix
+;
+
+MulMatrix:
+	NOP                                      LQI VF08, (VI02++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	MULAx ACC, VF04, VF08                    LQI VF09, (VI02++)
+	MADDAy ACC, VF05, VF08                   NOP
+	MADDAz ACC, VF06, VF08                   NOP
+	MADDw VF12, VF07, VF08                   NOP
+	MULAx ACC, VF04, VF09                    LQI VF10, (VI02++)
+	MADDAy ACC, VF05, VF09                   NOP
+	MADDAz ACC, VF06, VF09                   NOP
+	MADDw VF13, VF07, VF09                   SQI VF12, (VI03++)
+	MULAx ACC, VF04, VF10                    LQI VF11, (VI02++)
+	MADDAy ACC, VF05, VF10                   NOP
+	MADDAz ACC, VF06, VF10                   NOP
+	MADDw VF14, VF07, VF10                   SQI VF13, (VI03++)
+	MULAx ACC, VF04, VF11                    NOP
+	MADDAy ACC, VF05, VF11                   NOP
+	MADDAz ACC, VF06, VF11                   NOP
+	MADDw VF15, VF07, VF11                   SQI VF14, (VI03++)
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQI VF15, (VI03++)
+	NOP                                      NOP
+	NOP                                      JR VI15
+	NOP                                      NOP

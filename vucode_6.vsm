@@ -1,0 +1,134 @@
+	NOP                                      IADDIU VI01, VI00, 0
+	NOP                                      IADDIU VI02, VI00, 4
+	NOP                                      IADDIU VI03, VI00, 16
+	NOP                                      BAL VI15, MulMatrix
+	NOP                                      LQ VF31, 24(VI00)
+
+	NOP                                      IADDIU VI14, VI00, 0x7FFF
+	NOP                                      IADDIU VI14, VI14, 1
+	NOP                                      IADDIU VI01, VI00, 8
+	NOP                                      LQI VF09, (VI01++)
+	NOP                                      LQI VF10, (VI01++)
+	NOP                                      LQI VF11, (VI01++)
+	NOP                                      LQI VF12, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	NOP                                      LQI VF08, (VI01++)
+	NOP                                      LQI VF01, (VI01++)
+	NOP                                      LQI VF02, (VI01++)
+	NOP                                      LQI VF03, (VI01++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF13, (VI01++)		; load interpolators
+	NOP                                      LQI VF14, (VI01++)
+	NOP[E]                                   NOP
+	NOP                                      NOP
+
+START0:
+	NOP                                      XTOP VI01
+	NOP                                      ILWR.x VI10, (VI01)
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IAND VI10, VI11, VI10
+	NOP                                      LQ VF19, 0(VI01)
+	NOP                                      IADDIU VI03, VI01, 1
+	NOP                                      IADDIU VI02, VI01, 364		; 1+40*9
+	NOP                                      LQI VF15, (VI03++)
+	NOP                                      LQI VF16, (VI03++)
+	NOP                                      LQI VF17, (VI03++)
+	NOP                                      LQI VF18, (VI03++)
+	MULAx ACC, VF15, VF13                    LQI VF15, (VI03++)
+	MADDAy ACC, VF16, VF13                   LQI VF16, (VI03++)
+	MADDAz ACC, VF17, VF13                   NOP
+	MADDAw ACC, VF18, VF13                   NOP
+	MADDAx ACC, VF15, VF14                   LQI VF21, (VI03++)
+	MADDy VF20, VF16, VF14                   LQI VF23, (VI03++)
+	NOP                                      LQI VF22, (VI03++)
+	NOP                                      SQ VF19, 0(VI02)
+	MULAx ACC, VF05, VF21                    IADDIU VI07, VI02, 2
+	MADDAy ACC, VF06, VF21                   IADDIU VI08, VI02, 1
+	MADDAz ACC, VF07, VF21                   IADDIU VI09, VI02, 3
+	MADDw VF19, VF08, VF21                   NOP
+	MULAx ACC, VF01, VF20                    NOP
+	MADDAy ACC, VF02, VF20                   NOP
+
+LOOP:
+	MADDAz ACC, VF03, VF20                   LQI VF15, (VI03++)
+	MADDw VF25, VF04, VF20                   LQI VF16, (VI03++)
+	MAXx VF19, VF19, VF00                    LQI VF17, (VI03++)
+	SUB VF26, VF29, VF30                     LQI VF18, (VI03++)
+	NOP                                      NOP
+	NOP                                      DIV Q, VF00w, VF25w
+	MULAx ACC, VF09, VF19                    NOP
+	MADDAy ACC, VF10, VF19                   NOP
+	MADDAz ACC, VF11, VF19                   NOP
+	MADDw VF19, VF12, VF19                   NOP
+	NOP                                      IADDIU VI12, VI00, 0x20
+	NOP                                      NOP
+	MULq VF28, VF25, Q                       NOP
+	MUL.xyz VF19, VF22, VF19                 NOP
+	MULq VF23, VF23, Q                       NOP
+	NOP                                      NOP
+	SUB VF27, VF28, VF30                     NOP
+	FTOI4 VF21, VF28                         LOI 255
+	MINIi VF19, VF19, I                      SQ VF23, 0(VI08)
+	NOP                                      IADDIU VI08, VI08, 3
+	OPMULA.xyz ACC, VF27, VF26               MOVE VF30, VF29
+	OPMSUB.xyz VF25, VF26, VF27              SQ VF21, 0x0(VI09)
+	FTOI0 VF19, VF19                         IADDIU VI09, VI09, 3
+	MULAx ACC, VF15, VF13                    LQI VF15, (VI03++)
+	MADDAy ACC, VF16, VF13                   LQI VF16, (VI03++)
+	SUBx.z VF25, VF25, VF31                  MOVE VF29, VF28
+	MADDAz ACC, VF17, VF13                   NOP
+	MADDAw ACC, VF18, VF13                   NOP
+	MADDAx ACC, VF15, VF14                   LQI VF21, (VI03++)
+	MULw.z VF25, VF25, VF00                  LQI VF23, (VI03++)
+	MADDy VF20, VF16, VF14                   LQI VF22, (VI03++)
+	NOP                                      SQ VF19, 0(VI07)
+	NOP                                      IADDIU VI07, VI07, 3
+	MULAx ACC, VF05, VF21                    FMAND VI13, VI12
+	MADDAy ACC, VF06, VF21                   IADDI VI10, VI10, -1
+	MADDAz ACC, VF07, VF21                   IBNE VI13, VI00, L2
+	MADDw VF19, VF08, VF21                   NOP
+
+L1:
+	MULAx ACC, VF01, VF20                    IBNE VI10, VI00, LOOP
+	MADDAy ACC, VF02, VF20                   NOP
+	NOP                                      XGKICK VI02
+	NOP[E]                                   NOP
+	NOP                                      NOP
+	NOP                                      B START0
+	NOP                                      NOP
+
+L2:
+	NOP                                      B L1
+	NOP                                      ISW.w VI14, -3(VI09)
+
+MulMatrix:
+	NOP                                      LQI VF08, (VI02++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	MULAx ACC, VF04, VF08                    LQI VF09, (VI02++)
+	MADDAy ACC, VF05, VF08                   NOP
+	MADDAz ACC, VF06, VF08                   NOP
+	MADDw VF12, VF07, VF08                   NOP
+	MULAx ACC, VF04, VF09                    LQI VF10, (VI02++)
+	MADDAy ACC, VF05, VF09                   NOP
+	MADDAz ACC, VF06, VF09                   NOP
+	MADDw VF13, VF07, VF09                   SQI VF12, (VI03++)
+	MULAx ACC, VF04, VF10                    LQI VF11, (VI02++)
+	MADDAy ACC, VF05, VF10                   NOP
+	MADDAz ACC, VF06, VF10                   NOP
+	MADDw VF14, VF07, VF10                   SQI VF13, (VI03++)
+	MULAx ACC, VF04, VF11                    NOP
+	MADDAy ACC, VF05, VF11                   NOP
+	MADDAz ACC, VF06, VF11                   NOP
+	MADDw VF15, VF07, VF11                   SQI VF14, (VI03++)
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQI VF15, (VI03++)
+	NOP                                      NOP
+	NOP                                      JR VI15
+	NOP                                      NOP

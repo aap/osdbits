@@ -1,0 +1,131 @@
+	NOP                                      IADDIU VI01, VI00, 0
+	NOP                                      IADDIU VI02, VI00, 4
+	NOP                                      IADDIU VI03, VI00, 16
+	NOP                                      BAL VI15, MulMatrix
+	NOP                                      LQ VF31, 24(VI00)		; thing for backface culling
+	
+	NOP                                      IADDIU VI14, VI00, 0x7FFF
+	NOP                                      IADDIU VI14, VI14, 1
+	NOP                                      IADDIU VI01, VI00, 8
+	NOP                                      LQI VF09, (VI01++)		; light colors
+	NOP                                      LQI VF10, (VI01++)
+	NOP                                      LQI VF11, (VI01++)
+	NOP                                      LQI VF12, (VI01++)
+	NOP                                      LQI VF05, (VI01++)		; light vector matrix
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	NOP                                      LQI VF08, (VI01++)
+	NOP                                      LQI VF01, (VI01++)		; object to screen matrix
+	NOP                                      LQI VF02, (VI01++)
+	NOP                                      LQI VF03, (VI01++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP[E]                                   NOP
+	NOP                                      NOP
+
+START0:
+	NOP                                      XTOP VI01			; input packet
+	NOP                                      ILWR.x VI10, (VI01)
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IAND VI10, VI11, VI10		; vertex count
+	NOP                                      LQ VF15, 0(VI01)		; load gif tag
+	NOP                                      IADDIU VI03, VI01, 1		; pointer for input
+	NOP                                      IADDIU VI02, VI01, 277		; pointer for XGKICK(277=1+69*4)
+	NOP                                      SQ VF15, 0(VI02)		; store gif tag
+	NOP                                      LQI VF20, (VI03++)		; load vertex
+	NOP[D]                                   IADDIU VI07, VI02, 2		; store pointer for colors
+	NOP                                      IADDIU VI08, VI02, 1		; store pointer for st
+	NOP                                      IADDIU VI09, VI02, 3		; store pointer for vertices
+	MULAx ACC, VF01, VF20                    LQI VF21, (VI03++)		; - load normal
+	MADDAy ACC, VF02, VF20                   LQI VF23, (VI03++)		; - load st
+	MADDAz ACC, VF03, VF20                   LQI VF22, (VI03++)		; - load color
+	MADDw VF25, VF04, VF20                   NOP
+	MULAx ACC, VF05, VF21                    NOP
+	MADDAy ACC, VF06, VF21                   NOP
+	MADDAz ACC, VF07, VF21                   NOP
+	MADDw VF19, VF08, VF21                   NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	MAXx VF19, VF19, VF00                    NOP				; clamp light factors
+	NOP                                      NOP
+	NOP                                      IADDIU VI12, VI00, 0x20
+	NOP                                      LQI VF20, (VI03++)		; load next vertex
+
+LOOP:
+	MULAx ACC, VF09, VF19                    DIV Q, VF00w, VF25w
+	MADDAy ACC, VF10, VF19                   NOP
+	MADDAz ACC, VF11, VF19                   NOP
+	MADDw VF15, VF12, VF19                   NOP				; light color
+	MULAx ACC, VF01, VF20                    LQI VF21, (VI03++)
+	MADDAy ACC, VF02, VF20                   NOP
+	MADDAz ACC, VF03, VF20                   NOP
+	MULq VF28, VF25, Q                       NOP				; perspective divide
+	MULq VF23, VF23, Q                       NOP				; also divide st
+	MADDw VF18, VF04, VF20                   NOP
+	MUL VF19, VF22, VF15                     NOP				; light*color
+	FTOI4 VF27, VF28                         LOI 255
+	SUB VF17, VF28, VF30                     SQ VF23, 0(VI08)
+	NOP                                      IADDIU VI08, VI08, 3
+	MINIi VF19, VF19, I                      MOVE VF25, VF18		; clamp color - next vertex
+	NOP                                      SQ VF27, 0(VI09)
+	OPMULA.xyz ACC, VF17, VF26               IADDIU VI09, VI09, 3
+	OPMSUB.xyz VF16, VF26, VF17              LQI VF23, (VI03++)		; load next st
+	FTOI0 VF18, VF19                         LOI 1
+	MULAx ACC, VF05, VF21                    MOVE VF30, VF29		; rotate vertices
+	MADDAy ACC, VF06, VF21                   MOVE VF29, VF28
+	SUBx.z VF16, VF16, VF31                  LQI VF22, (VI03++)		; load next color
+	MADDAz ACC, VF07, VF21                   LQI VF20, (VI03++)		; load next vertex
+	MADDw VF19, VF08, VF21                   NOP
+	SUB VF26, VF29, VF30                     SQ VF18, 0(VI07)		; store color
+	MULw.z VF16, VF16, VF00                  IADDIU VI07, VI07, 3		; get backfacing flag
+	NOP                                      NOP
+	MAXx VF19, VF19, VF00                    NOP				; clamp light factors
+	NOP[D]                                   NOP
+	NOP                                      FMAND VI13, VI12
+	NOP                                      IBNE VI13, VI00, L2		; reject backface
+	NOP                                      NOP
+
+L1:
+	NOP                                      IADDI VI10, VI10, -1
+	NOP                                      IBNE VI10, VI00, LOOP
+	NOP                                      NOP
+	
+	NOP                                      XGKICK VI02
+	NOP[E]                                   NOP
+	NOP                                      NOP
+	NOP                                      B START0
+	NOP                                      NOP
+
+L2:
+	NOP                                      B L1
+	NOP                                      ISW.w VI14, -3(VI09)
+
+MulMatrix:
+	NOP                                      LQI VF08, (VI02++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	MULAx ACC, VF04, VF08                    LQI VF09, (VI02++)
+	MADDAy ACC, VF05, VF08                   NOP
+	MADDAz ACC, VF06, VF08                   NOP
+	MADDw VF12, VF07, VF08                   NOP
+	MULAx ACC, VF04, VF09                    LQI VF10, (VI02++)
+	MADDAy ACC, VF05, VF09                   NOP
+	MADDAz ACC, VF06, VF09                   NOP
+	MADDw VF13, VF07, VF09                   SQI VF12, (VI03++)
+	MULAx ACC, VF04, VF10                    LQI VF11, (VI02++)
+	MADDAy ACC, VF05, VF10                   NOP
+	MADDAz ACC, VF06, VF10                   NOP
+	MADDw VF14, VF07, VF10                   SQI VF13, (VI03++)
+	MULAx ACC, VF04, VF11                    NOP
+	MADDAy ACC, VF05, VF11                   NOP
+	MADDAz ACC, VF06, VF11                   NOP
+	MADDw VF15, VF07, VF11                   SQI VF14, (VI03++)
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQI VF15, (VI03++)
+	NOP                                      NOP
+	NOP                                      JR VI15
+	NOP                                      NOP

@@ -1,0 +1,146 @@
+	NOP                                      IADDIU VI01, VI00, 0
+	NOP                                      IADDIU VI02, VI00, 4
+	NOP                                      IADDIU VI03, VI00, 16
+	NOP                                      BAL VI15, MulMatrix
+	NOP                                      LQ VF31, 24(VI00)		; thing for backface culling
+	
+	NOP                                      IADDIU VI14, VI00, 0x7FFF
+	NOP                                      IADDIU VI14, VI14, 1
+	NOP                                      IADDIU VI01, VI00, 8
+	NOP                                      LQI VF09, (VI01++)
+	NOP                                      LQI VF10, (VI01++)
+	NOP                                      LQI VF11, (VI01++)
+	NOP                                      LQI VF12, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	NOP                                      LQI VF08, (VI01++)
+	NOP                                      LQI VF01, (VI01++)
+	NOP                                      LQI VF02, (VI01++)
+	NOP                                      LQI VF03, (VI01++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF13, (VI01++)		; load interpolator
+	NOP[E]                                   NOP
+	NOP                                      NOP
+
+START0:
+	NOP                                      XTOP VI01
+	NOP                                      ILWR.x VI10, (VI01)
+	NOP                                      IADDIU VI11, VI00, 0x7FFF
+	NOP                                      IAND VI10, VI11, VI10
+	NOP                                      LQ VF15, 0(VI01)
+	NOP                                      IADDIU VI03, VI01, 1
+	NOP                                      IADDIU VI02, VI01, 301		; pointer for XGKICK(301=1+60*5)
+	NOP                                      SQ VF15, 0(VI02)
+	NOP                                      IADDIU VI07, VI02, 2
+	NOP                                      IADDIU VI08, VI02, 1
+	NOP                                      IADDIU VI09, VI02, 3
+	NOP                                      LQI VF15, (VI03++)		; load vertex A
+	NOP                                      LQI VF16, (VI03++)		; load vertex B
+	NOP                                      NOP
+	NOP                                      LQI VF21, (VI03++)		; load normal
+	NOP                                      LQI VF23, (VI03++)		; load st
+	MULAx ACC, VF15, VF13                    LQI VF22, (VI03++)		; load color
+	MADDy VF20, VF16, VF13                   NOP				; interpolate vertex
+	MULAx ACC, VF05, VF21                    NOP				; normal, light vectors
+	MADDAy ACC, VF06, VF21                   NOP
+	MADDAz ACC, VF07, VF21                   NOP
+	MADDw VF14, VF08, VF21                   NOP
+	MULAx ACC, VF01, VF20                    NOP				; transform vertex
+	MADDAy ACC, VF02, VF20                   NOP
+	MADDAz ACC, VF03, VF20                   NOP
+	MADDw VF25, VF04, VF20                   NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+
+LOOP:
+	MAXx VF14, VF14, VF00                    DIV Q, VF00w, VF25w		; clamp light vectors
+	NOP                                      LQI VF15, (VI03++)		; load next vetex A
+	NOP                                      LQI VF16, (VI03++)		; load next vetex B
+	NOP                                      NOP
+	NOP                                      NOP
+	SUB VF26, VF29, VF30                     NOP
+	NOP                                      NOP
+	MULq VF28, VF25, Q                       NOP
+	NOP                                      NOP
+	MULq VF23, VF23, Q                       NOP
+	NOP                                      NOP
+	FTOI4 VF27, VF28                         NOP
+	MULAx ACC, VF09, VF14                    NOP
+	MADDAy ACC, VF10, VF14                   SQ VF23, 0(VI08)		; store stq
+	MADDAz ACC, VF11, VF14                   IADDIU VI08, VI08, 3
+	MADDw VF14, VF12, VF14                   SQ VF27, 0(VI09)		; store vertex
+	SUB VF27, VF28, VF30                     IADDIU VI09, VI09, 3
+	NOP                                      LQI VF21, (VI03++)		; load next normal
+	NOP                                      LQI VF23, (VI03++)		; load next st
+	MUL VF14, VF22, VF14                     LQI VF22, (VI03++)		; load next color
+	OPMULA.xyz ACC, VF27, VF26               MOVE VF30, VF29
+	OPMSUB.xyz VF19, VF26, VF27              MOVE VF29, VF28
+	MULAx ACC, VF15, VF13                    LOI 255
+	MINIi VF14, VF14, I                      NOP
+	MADDy VF20, VF16, VF13                   NOP
+	SUBx.z VF19, VF19, VF31                  NOP
+	NOP                                      NOP
+	FTOI0 VF14, VF14                         NOP
+	NOP                                      NOP
+	MULw.z VF19, VF19, VF00                  IADDIU VI12, VI00, 0x20
+	NOP                                      NOP
+	NOP                                      SQ VF14, 0(VI07)		; store color
+	MULAx ACC, VF01, VF20                    IADDIU VI07, VI07, 3
+	MADDAy ACC, VF02, VF20                   FMAND VI13, VI12
+	MADDAz ACC, VF03, VF20                   NOP
+	MADDw VF25, VF04, VF20                   NOP
+	MULAx ACC, VF05, VF21                    NOP
+	MADDAy ACC, VF06, VF21                   NOP
+	MADDAz ACC, VF07, VF21                   NOP
+	MADDw VF14, VF08, VF21                   IBNE VI13, VI00, L2
+	NOP                                      NOP
+
+L1:
+	NOP                                      IADDI VI10, VI10, -1
+	NOP                                      IBNE VI10, VI00, LOOP
+	NOP                                      NOP
+	NOP                                      XGKICK VI02
+	NOP[E]                                   NOP
+	NOP                                      NOP
+	NOP                                      B START0
+	NOP                                      NOP
+
+L2:
+	NOP                                      ISW.w VI14, -3(VI09)
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      B L1
+	NOP                                      NOP
+
+MulMatrix:
+	NOP                                      LQI VF08, (VI02++)
+	NOP                                      LQI VF04, (VI01++)
+	NOP                                      LQI VF05, (VI01++)
+	NOP                                      LQI VF06, (VI01++)
+	NOP                                      LQI VF07, (VI01++)
+	MULAx ACC, VF04, VF08                    LQI VF09, (VI02++)
+	MADDAy ACC, VF05, VF08                   NOP
+	MADDAz ACC, VF06, VF08                   NOP
+	MADDw VF12, VF07, VF08                   NOP
+	MULAx ACC, VF04, VF09                    LQI VF10, (VI02++)
+	MADDAy ACC, VF05, VF09                   NOP
+	MADDAz ACC, VF06, VF09                   NOP
+	MADDw VF13, VF07, VF09                   SQI VF12, (VI03++)
+	MULAx ACC, VF04, VF10                    LQI VF11, (VI02++)
+	MADDAy ACC, VF05, VF10                   NOP
+	MADDAz ACC, VF06, VF10                   NOP
+	MADDw VF14, VF07, VF10                   SQI VF13, (VI03++)
+	MULAx ACC, VF04, VF11                    NOP
+	MADDAy ACC, VF05, VF11                   NOP
+	MADDAz ACC, VF06, VF11                   NOP
+	MADDw VF15, VF07, VF11                   SQI VF14, (VI03++)
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      NOP
+	NOP                                      SQI VF15, (VI03++)
+	NOP                                      NOP
+	NOP                                      JR VI15
+	NOP                                      NOP

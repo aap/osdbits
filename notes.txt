@@ -1,0 +1,7 @@
+vucode_1	4 dir lights, frustum cull. two paths: raw st, some kind of env map effect (overlap with lights)
+vucode_2	3 dir lights, 1 ambient. no culling
+vucode_3	4 dir lights, backface culling
+vucode_4	4 dir lights, 2 vertex morph, backface culling
+vucode_5	4 dir lights, 4 vertex morph, backface culling
+vucode_6	4 dir lights, 6 vertex morph, backface culling
+vucode_7	4 dir lights, 8 vertex morph, backface culling
