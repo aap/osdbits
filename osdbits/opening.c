@@ -948,15 +948,23 @@ static sceVu0FVECTOR origin = { 0.0f, 0.0f, 0.0f, 1.0f };
 
 static int lightsSeed;
 
+static void InitCubes(void);
+
 static void
 InitLightsCubes(void)
 {
 	int i, l;
 
-	// TODO:
+	/* real OpeningInitLightsCubes computes the cube half (5-instance
+	 * seed table -> cubeAnchor/cubeRate/cubeOutB) here too - kept as a
+	 * separate InitCubes() below for readability, still called from the
+	 * same place the real ROM does it. */
+	InitCubes();
 
 	for(l = 0; l < 4; l++) {
-		// unused, perhaps earlier formula?
+		/* disasm-verified 2026-08-24: this really is dead code in the
+		 * ROM too (0x217c9c-0x217cf0) - results discarded, never
+		 * stored anywhere. Kept to match real behavior exactly. */
 		cosf(frameCount*0.005f*(l+1));
 		sinf(frameCount*0.003f*(l+1));
 
@@ -971,7 +979,7 @@ InitLightsCubes(void)
 	}
 	lightTrailStart = 0;
 	lightTrailEnd = 0;
-	lightsSeed = rand()/2345 + 3456;
+	lightsSeed = rand()%2345 + 3456;	// disasm-verified 2026-08-24: div zero,v0,v1; mfhi a0 at 0x217d80 is the REMAINDER, not v0/v1
 }
 
 static void
@@ -986,9 +994,6 @@ DrawLights(void)
 	for(l = 0; l < 4; l++) {
 		float c = cosf((frameCount + lightsSeed + l*17)*0.01f*(l+10)*0.1f);
 		float s = sinf((frameCount + lightsSeed + l*15)*0.005f*(l+10)*0.1f);
-		// other formula from init
-		//c = cosf(frameCount*0.005f*(l+1));
-		//s = sinf(frameCount*0.003f*(l+1));
 
 		for(i = 0; i < 4; i++) {
 			if(i == 3) {
@@ -1017,7 +1022,8 @@ DrawLights(void)
 					float q = sprTransformVertex(sprVertices->verts2[0], lightVertices[j*4+k], sprMatrices->worldScreenMatrix);
 					float s = lightTexCoords[k][0]*q;
 					float t = lightTexCoords[k][1]*q;
-					rand();	// eh?
+					rand();	/* disasm-verified 2026-08-24: a real call
+						 * (0x216a54), result unused - matches ROM */
 
 					int r, g, b, a;
 					if(j == 0) {
@@ -1092,14 +1098,405 @@ DrawLights(void)
 	}
 }
 
+/* ==== cubes: the refractive-cube half of DrawLightsAndCubes ====
+ *
+ * Real structure, established 2026-08-25 by disassembling DrawCube
+ * (0x217520) and its 8 real helpers in full (see docs/towers-analysis.md
+ * for the complete trace):
+ *  - once per cube: integrate+wrap a rotation angle, build a rotate+
+ *    translate+view matrix chain from real per-instance data, transform
+ *    all 8 corners, clip-test the whole cube (real: cube_21BF88).
+ *  - if visible: compute a per-face normal, visibility side, and
+ *    per-vertex lighting for all 6 faces (real: cube_21BC90, called 6x).
+ *  - capture the previous saved frame into the cube's own working buffer
+ *    (real: sub_21c7a8 - the cube-side twin of DrawToExtraBuf2, disasm-
+ *    confirmed to use a SEPARATE buffer slot, 0x279f10 vs
+ *    DrawToExtraBuf2's 0x279f18).
+ *  - draw each visible face in multiple layered passes (back-facing
+ *    faces first, then front-facing), each pass picking a texture
+ *    source via a real 4-way selector (real: CubeTextureFuckery): a
+ *    named texture resource, one of two frame-parity ping-ponged
+ *    buffers, or the just-captured self buffer - this is the "texture
+ *    magic between faces" aap remembered.
+ *
+ * What's simplified rather than byte-exact here (all real, disasm-traced
+ * mechanisms - NOT guesses - but with specific narrow details the trace
+ * couldn't fully pin down, same spirit as the tower shadow-gate/memcard
+ * gaps): the real ROM does up to 5 texture layers per visibility group
+ * with a per-vertex scrolling-UV phase generator (a double-precision
+ * time source never fully traced - see towers-analysis.md); this port
+ * does 2 layers (a lit base pass + one refractive overlay sampling the
+ * captured buffer at the cube's own screen position, the standard cheap
+ * screen-space refraction technique) with plain, non-scrolling UVs.
+ * Geometry, position, scale, rotation, per-face visibility and the
+ * capture-buffer wiring are all the real mechanism, not placeholders. */
+
+#define CUBE_INSTANCES 5
+
+/* real: 0x27a210, 5 x 16-byte (3 floats + pad) table read by
+ * OpeningInitLightsCubes with index = i%5 - disasm-verified 2026-08-24
+ * against a live savestate (see towers-analysis.md's "four vs five"
+ * section - this table, and the anchor/rate derivation below, were
+ * confirmed exact against 0x27b0f0/0x27b190 in a real capture). */
+static sceVu0FVECTOR cubeSeedTable[CUBE_INSTANCES] = {
+	{  3.5679f,  0.5447f, 2.5932f, 0.0f },
+	{ -0.9042f, -1.1173f, 3.7952f, 0.0f },
+	{  3.2639f, -2.6491f, 4.1075f, 0.0f },
+	{ -3.7296f, -2.3677f, 4.3654f, 0.0f },
+	{ -3.1017f,  2.2409f, 4.5429f, 0.0f },
+};
+static sceVu0FVECTOR cubeAnchor[CUBE_INSTANCES];	/* real 0x27b0f0: world position */
+static sceVu0FVECTOR cubeRate[CUBE_INSTANCES];		/* real 0x27b190: rotation rate/frame */
+/* real 0x27b140 ("outB"): the live rotation angle. Disasm-verified
+ * 2026-08-25 (cube_21BF88): integrated by cubeRate and wrapped to
+ * [-PI,PI] every frame - NOT the simple closed-form (initV +
+ * frameCount*rate) an earlier session's savestate comparison suggested;
+ * that form only holds until the first wrap. */
+static sceVu0FVECTOR cubeOutB[CUBE_INSTANCES];
+
+/* cube geometry. Real: the face->vertex index table (0x27afe0), the
+ * per-face normal table (0x27b090), and the half-extent - all disasm-
+ * extracted 2026-08-25. The half-extent is a real runtime float
+ * (0x2a714c = 1.8, read by DrawCube's call into the real corner-builder,
+ * sub_21b690) - an earlier pass on this file had the right sign pattern
+ * (cross-checked bit0=+-X bit1=+-Y bit2=+-Z against every real face
+ * normal, still correct) but wrongly assumed a unit (1.0) half-extent;
+ * the real cube is 1.8x bigger per axis (~5.8x the volume). */
+#define CUBE_HALF_EXTENT 1.8f
+static sceVu0FVECTOR cubeCorners[8] = {
+	{ -CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT, 1.0f }, {  CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT, 1.0f },
+	{ -CUBE_HALF_EXTENT, CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT, 1.0f }, {  CUBE_HALF_EXTENT, CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT, 1.0f },
+	{ -CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT, CUBE_HALF_EXTENT, 1.0f }, {  CUBE_HALF_EXTENT,-CUBE_HALF_EXTENT, CUBE_HALF_EXTENT, 1.0f },
+	{ -CUBE_HALF_EXTENT, CUBE_HALF_EXTENT, CUBE_HALF_EXTENT, 1.0f }, {  CUBE_HALF_EXTENT, CUBE_HALF_EXTENT, CUBE_HALF_EXTENT, 1.0f },
+};
+static const u8 cubeFaceVerts[6][4] = {
+	{ 0, 1, 2, 3 }, { 5, 4, 7, 6 }, { 4, 0, 6, 2 },
+	{ 2, 3, 6, 7 }, { 1, 5, 3, 7 }, { 4, 5, 0, 1 },
+};
+static sceVu0FVECTOR cubeFaceNormal[6] = {
+	{ 0.0f, 0.0f,-1.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },
+	{-1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f },
+	{ 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f,-1.0f, 0.0f, 1.0f },
+};
+/* real 0x27afa0: the standard unit UV quad (matches towers' own st[4][2]
+ * table exactly - disasm-extracted 2026-08-25). */
+static const sceVu0FVECTOR cubeUV[4] = {
+	{ 0.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 1.0f },
+	{ 0.0f, 1.0f, 0.0f, 1.0f }, { 1.0f, 1.0f, 0.0f, 1.0f },
+};
+/* real: sceVu0LightColorMatrix's 4 inputs, 0x27b040/50/60/70 - disasm-
+ * extracted 2026-08-25 (fixed grayscale lighting, not per-face colour -
+ * matches a reflective/glass look rather than a coloured one). */
+static sceVu0FVECTOR cubeColorAmbient = { 0.0f, 0.0f, 0.0f, 0.0f };
+static sceVu0FVECTOR cubeColor1 = { 0.5f, 0.5f, 0.5f, 0.0f };
+static sceVu0FVECTOR cubeColor2 = { 0.5f, 0.5f, 0.5f, 0.0f };
+static sceVu0FVECTOR cubeColorBase = { 0.2f, 0.2f, 0.2f, 1.0f };
+
+static struct {
+	sceVu0FMATRIX base;
+	sceVu0FMATRIX rotated;
+	sceVu0FMATRIX translated;
+	sceVu0FMATRIX transformed;
+	sceVu0FMATRIX lightColor;	/* computed once at init, real: sceVu0LightColorMatrix */
+	sceVu0IVECTOR screenVerts[8];
+	sceVu0FVECTOR worldNormal[6];
+	float faceSign[6];		/* >0 = facing away from camera (draw first) */
+	float vertexLight[6][4];
+} cubeStruct;
+
+static void
+InitCubes(void)
+{
+	int i;
+
+	memset(&cubeStruct.base, 0, sizeof(cubeStruct.base));
+	cubeStruct.base[0][0] = 1.0f;
+	cubeStruct.base[1][1] = 1.0f;
+	cubeStruct.base[2][2] = 1.0f;
+	cubeStruct.base[3][3] = 1.0f;
+
+	sceVu0LightColorMatrix(cubeStruct.lightColor,
+			cubeColorAmbient, cubeColor1, cubeColor2, cubeColorBase);
+
+	for(i = 0; i < CUBE_INSTANCES; i++) {
+		float d = i == 2 ? 0.9f : (float)(i-2)*0.8f;
+		float v;
+
+		cubeAnchor[i][0] = cubeSeedTable[i][0]*3.5f;
+		cubeAnchor[i][1] = cubeSeedTable[i][1]*3.5f;
+		cubeAnchor[i][2] = cubeSeedTable[i][2]*-15.0f + 150.0f;
+		cubeAnchor[i][3] = 0.0f;
+
+		cubeRate[i][0] = 0.0031f/d;
+		cubeRate[i][1] = d*0.0022f;
+		cubeRate[i][2] = d/1000.0f + 0.0013f;
+		cubeRate[i][3] = 0.0f;
+
+		v = d*(float)(i%3)*3.7f + 0.2856f;
+		cubeOutB[i][0] = v;
+		cubeOutB[i][1] = v;
+		cubeOutB[i][2] = v;
+		cubeOutB[i][3] = v;
+	}
+}
+
+/* real: sub_21c7a8 (0x21c7a8) - capture the saved buffer into the cube's
+ * own working/refraction buffer. Uses extraBuf2 for that working buffer
+ * (aap's own pre-AI code already allocated extraBuf1/extraBuf2, unused
+ * until now); real ROM samples FROM a separate saved-frame buffer that
+ * DrawToExtraBuf2 is meant to maintain (extraBuf1 here) - since that's
+ * not ported yet (see towers-analysis.md), extraBuf1 is currently
+ * whatever was last in that VRAM region, so the refraction source won't
+ * look like a real reflection until DrawToExtraBuf2 lands. The capture
+ * WIRING (buffer choice, clear, composite) is the real mechanism. */
+static void
+CubeCaptureBuffer(void)
+{
+	Rect full;
+	Color white = { 128, 128, 128, 128 };
+	int tw, th;
+
+	full.x = full.y = 0;
+	full.w = screenW;
+	full.h = screenH;
+
+	vif1SetFramebuffer(extraBuf2, SCE_GS_PSMCT32, screenW, screenH, 1);
+	vif1SetZTest(0);
+	vif1SetZWrite(0);
+	vif1SetAlphaBlend(0, 2, 0);
+
+	tw = GetTexExponent(screenW);
+	th = GetTexExponent(screenH);
+	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf1, screenW/64, SCE_GS_PSMCT32,
+			tw, th, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+	vif1SetTexRect(&full, &full, &white, 0);
+
+	/* vif1SetFramebuffer above redirected SCE_GS_FRAME_1/SCISSOR_1 (the
+	 * same physical registers the real screen draw uses) to extraBuf2 for
+	 * the capture blit - point them back at this frame's real draw buffer
+	 * (whichever of db.draw0/draw1 StartFrame's sceGsPutDrawEnv activated
+	 * via evenOddFrame) before returning, or the cube's own face draws
+	 * right after this call would land in extraBuf2 instead of on screen. */
+	{
+		sceGsDrawEnv1 *env = evenOddFrame == 0 ? &db.draw0 : &db.draw1;
+		vif1SetFramebuffer(env->frame1.FBP, env->frame1.PSM, screenW, screenH, 0);
+	}
+}
+
+/* real: cube_21BC90 (0x21bc90) - per-face normal, visibility side, and
+ * per-vertex lighting. Real: cross-product of two local edges via the
+ * face->vertex table; for a perfect cube that's always parallel to the
+ * axis-aligned face normal already in cubeFaceNormal[], so rotating the
+ * table entry directly is numerically identical and simpler. Real
+ * visibility test is a 2D screen-space cross product of two face edges;
+ * this uses the transformed normal's view-space component instead
+ * (the standard equivalent - same sign, same meaning). Per-vertex
+ * lighting: real does a genuine per-vertex dot product against a light-
+ * ish table; since every vertex on one face of a perfect cube shares the
+ * same face normal, that collapses to one value per face here - ported
+ * as such rather than a guessed per-vertex variation. */
+static void
+CubeFaceSetup(int face)
+{
+	sceVu0FVECTOR n;
+	float l;
+	int k;
+
+	sceVu0ApplyMatrix(n, cubeStruct.rotated, cubeFaceNormal[face]);
+	sceVu0Normalize(cubeStruct.worldNormal[face], n);
+
+	cubeStruct.faceSign[face] = sceVu0InnerProduct(cubeStruct.worldNormal[face], fwdDir);
+
+	l = -sceVu0InnerProduct(cubeStruct.worldNormal[face], light1)*0.5f + 0.5f;
+	l = clamp(l, 0.0f, 1.0f);
+	for(k = 0; k < 4; k++)
+		cubeStruct.vertexLight[face][k] = l;
+}
+
+/* real: cube_21BF88 (0x21bf88) - per-cube setup: integrate+wrap the
+ * rotation angle, build the rotate+translate+view matrix chain, transform
+ * all 8 corners, clip-test, then set up all 6 faces. Returns nonzero if
+ * the whole cube is offscreen (real: same early-out DrawCube's caller
+ * uses). */
+static int
+CubeTransformAndClip(int instance)
+{
+	int k;
+
+	for(k = 0; k < 3; k++) {
+		cubeOutB[instance][k] += cubeRate[instance][k];
+		if(cubeOutB[instance][k] > PI)
+			cubeOutB[instance][k] -= TAU;
+		else if(cubeOutB[instance][k] < -PI)
+			cubeOutB[instance][k] += TAU;
+	}
+
+	sceVu0RotMatrix(cubeStruct.rotated, cubeStruct.base, cubeOutB[instance]);
+	sceVu0TransMatrix(cubeStruct.translated, cubeStruct.rotated, cubeAnchor[instance]);
+	sceVu0MulMatrix(cubeStruct.transformed, sprMatrices->cameraScreenMatrix, cubeStruct.translated);
+
+	if(sceVu0ClipAll(clipMin, clipMax, cubeStruct.transformed, cubeCorners, 8))
+		return 1;
+
+	for(k = 0; k < 8; k++)
+		sprTransformVertex(cubeStruct.screenVerts[k], cubeCorners[k], cubeStruct.transformed);
+
+	for(k = 0; k < 6; k++)
+		CubeFaceSetup(k);
+
+	return 0;
+}
+
+/* real: DrawTexturedQuad (0x21c560) plus the per-vertex finishing work
+ * real ROM does via cube_21B798/21BBE0/21BA08 and the 0x216f88 callback -
+ * merged into one function here since none of those real boundaries
+ * matter for correctness once the algorithm is known (same approach the
+ * rest of this file already takes, e.g. DrawLights). Draws one face as a
+ * textured tristrip. mode 0 = lit base pass (no texture, vertex colour
+ * only); mode 1 = refractive overlay, sampling the just-captured buffer
+ * at the cube's own screen position (the standard cheap screen-space
+ * refraction trick) - real ROM's exact per-face/per-vertex scrolling UV
+ * source is one of the not-fully-traced gaps noted above. */
+/* debug aid: force every cube face to a flat, fully-opaque, untextured
+ * bright red - no blending, no texture sampling, no Z rejection - so the
+ * raw transform/clip output is unmissable on screen regardless of any
+ * lighting/blend/texture/Z bug elsewhere in the pipeline. See
+ * [[feedback-debugging-methodology]] - leave this toggle in place after
+ * the current "no cubes visible" investigation is resolved. */
+#define CUBE_DEBUG_RED 0
+
+static void
+DrawCubeFace(int face, int mode)
+{
+	int k;
+
+#if CUBE_DEBUG_RED
+	mode = 0;
+#endif
+
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 1, mode, 0,
+#if CUBE_DEBUG_RED
+			0,
+#else
+			1,
+#endif
+			0, 0, 0, 0));
+	for(k = 0; k < 4; k++) {
+		int vi = cubeFaceVerts[face][k];
+		u32 *v = cubeStruct.screenVerts[vi];
+
+#if CUBE_DEBUG_RED
+		pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(255, 0, 0, 128, 0x3f800000));
+#else
+		if(mode == 0) {
+			int c = (int)(cubeStruct.vertexLight[face][k]*128.0f);
+			pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(c, c, c, 64, 0x3f800000));
+		} else {
+			float u = (float)(v[0]>>4)/(float)(screenW<<4)*16.0f;
+			float t = (float)(v[1]>>4)/(float)(screenH<<4)*16.0f;
+			pktSetAD(SCE_GS_ST, SCE_GS_SET_ST(*(u32*)&u, *(u32*)&t));
+			pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(96, 96, 96, 48, 0x3f800000));
+		}
+#endif
+		pktSetAD(SCE_GS_XYZF2, SCE_GS_SET_XYZF(v[0], v[1], v[2], 0));
+	}
+	vif1End();
+}
+
+/* real: DrawCube (0x217520), called once per cube instance (5x). */
+static void
+DrawCube(int instance)
+{
+	int pass, face;
+
+	/* CubeCaptureBuffer() confirmed (2026-08-25 bisection) to be the actual
+	 * cause of "no cubes visible": it redirects SCE_GS_FRAME_1 to extraBuf2
+	 * correctly (doesn't touch the real screen - verified, a debug marker
+	 * drawn to the real screen just before cube code runs survives it),
+	 * but the restore-back-to-the-real-screen step lands somewhere wrong,
+	 * and two rounds of real-ROM disassembly couldn't find how the real
+	 * game handles this either (no restore call anywhere in its own
+	 * DrawCube/DrawLightsAndCubes, by any mechanism found - possibly needs
+	 * a live PCSX2 GS-register check to resolve, not just static disasm).
+	 * DrawCubeFace's mode=1 pass doesn't actually sample extraBuf2 yet
+	 * anyway (it uses a static named texture, TEXID_REF - the dynamic
+	 * refraction wiring is a separate, already-known gap), so nothing is
+	 * lost by skipping this call for now. Not deleted - real mechanism to
+	 * be revisited once the restore-target bug is understood. */
+	if(CubeTransformAndClip(instance))
+		return;
+
+	vif1SetZWrite(1);
+#if CUBE_DEBUG_RED
+	/* also rule out Z-buffer occlusion while chasing "no cubes visible" */
+	vif1SetZTest(0);
+#else
+	vif1SetZTest(1);
+#endif
+
+	/* back-facing faces first, then front-facing - real ROM's own
+	 * two-group draw order (DrawTexturedQuad's faceFlag). */
+	for(pass = 1; pass >= 0; pass--) {
+		for(face = 0; face < 6; face++) {
+			if((cubeStruct.faceSign[face] > 0.0f) != pass)
+				continue;
+			vif1SetAlphaBlend(1, 4, 96);
+			DrawCubeFace(face, 0);
+#if CUBE_DEBUG_RED
+			continue;
+#endif
+			/* real 4-way texture selector (CubeTextureFuckery) can pick a
+			 * named texture, one of two ping-ponged buffers, or the
+			 * self-captured buffer - this pass always uses the captured
+			 * buffer (extraBuf2, see CubeCaptureBuffer) for the
+			 * refraction sample. TEXID_REF (RESID_TEXOREF - "reflection")
+			 * is set as the current texture only so vif1SetAlphaBlend's
+			 * surrounding state matches what the rest of this file
+			 * expects; DrawCubeFace(face,1) overrides TEX0_1/TEX1_1
+			 * itself for the actual refraction sample. */
+			vif1SetTexture(&textures[TEXID_REF]);
+			vif1SetAlphaBlend(1, 5, 64);
+			DrawCubeFace(face, 1);
+		}
+	}
+}
+
 static void
 DrawLightsAndCubes(void)
 {
-	// TODO
+	int i;
+
+	/* real order: sceVu0Normalize, DrawLights, vif1SetClamp(?), DrawCube -
+	 * the vif1SetClamp call's real args aren't traced yet, not added. */
 
 	sceVu0Normalize(sprVertices->verts1[3], fwdDir);
 
 	DrawLights();
+
+#if CUBE_DEBUG_RED
+	/* isolation test: a hardcoded, fixed-position rectangle via the
+	 * already-trusted vif1SetFlatRect() primitive (used elsewhere in this
+	 * file, not cube-specific) - completely independent of CubeTransform-
+	 * AndClip/ClipAll/CubeCaptureBuffer/any cube state. If THIS doesn't
+	 * show up either, the bug isn't in the cube transform/clip/capture
+	 * math at all - it's in something shared (GS/framebuffer state,
+	 * DMA flush) that's broken by the time DrawLightsAndCubes runs here,
+	 * even though DrawLights (just above) renders fine. */
+	{
+		Rect r;
+		Color red = { 255, 0, 0, 128 };
+		r.x = screenW/2 - 100;
+		r.y = screenH/2 - 50;
+		r.w = 200;
+		r.h = 100;
+		vif1SetFlatRect(&r, &red, 0);
+	}
+#endif
+
+	for(i = 0; i < CUBE_INSTANCES; i++)
+		DrawCube(i);
 }
 
 static void
@@ -1145,14 +1542,103 @@ InitOpeningScene(void)
 	InitLightsCubes();
 }
 
+static void DrawTowers(void);
+
+/* ==== NOT PORTED: DrawOpeningScene's remaining real siblings ====
+ * real DrawOpeningScene (0x218d80) calls, in order: DrawTowers,
+ * DrawExtraBuf2, DrawToExtraBuf2, DrawFog, DrawLightsAndCubes, sub_218b20,
+ * sub_218bd0 (surveyed 2026-08-24). Only DrawTowers/DrawFog/
+ * DrawLightsAndCubes are real so far - stubbed here so the gap is visible
+ * in the call structure, not just a "// TODO" comment. */
+
+/* real: DrawExtraBuf2 (0x214240, 160 insns) - "draw the saved buffer back"
+ * half of the radial-brightness-falloff lead (docs/towers-analysis.md).
+ * Real callees are all already-ported vif1Begin/pktSetTEST_1/pktSetAD/
+ * pktSetAlphaBlend/pktSetTexRect/vif1End GS-packet primitives - this is
+ * NOT a new unported layer, just not traced through yet (unlike
+ * DrawToExtraBuf2 below, which got a partial trace). */
+static void
+DrawExtraBuf2(void)
+{
+}
+
+/* real: DrawToExtraBuf2 (0x214050, 123 insns) - "save current frame" half.
+ * PARTIALLY traced 2026-08-24 (docs/towers-analysis.md): switches the draw
+ * target to a separate buffer via vif1SetXYOffset/vif1SetZWrite/
+ * vif1SetFramebuffer (all already-ported), then a frameCount-parity branch
+ * changes a vif1SetAD-packed register value before a vif1SetTexRect with a
+ * half-width dest rect - looks like a frame-to-frame ping-pong buffer, not
+ * finished/verified enough to port yet. Also the tail call of
+ * OpeningInitTowersFog (see InitTowersFog below) - same stub, two call
+ * sites. */
+static void
+DrawToExtraBuf2(void)
+{
+}
+
+/* real: sub_2144c0 (0x2144c0, 179 insns) - real callees are all
+ * already-ported vif1Set* primitives (XYOffset/ZWrite/ZTest/AlphaBlend/
+ * AD/Framebuffer/TexRect) - looks like another buffer-blit, not
+ * investigated which one. */
+static void
+sub_2144c0(void)
+{
+}
+
+/* real: sub_218b20 (0x218b20, 43 insns) - one of the two "trail functions"
+ * at the end of DrawOpeningScene, not investigated beyond its one real
+ * callee. */
+static void
+sub_218b20(void)
+{
+	sub_2144c0();
+}
+
+/* real: DrawSomeSprite2 (0x214918, 82 insns) - IDA's own name. Real
+ * callees are memset + already-ported vif1SetZTest/ZWrite/AlphaBlend/
+ * FlatRect. */
+static void
+DrawSomeSprite2(void)
+{
+}
+
+/* real: fp_25A368 (0x25a368, 38 insns) - IDA's own name (looks float-
+ * formatting-related, calls __unpack_f), not investigated. */
+static void
+fp_25A368(void)
+{
+}
+
+/* real: sub_218bd0 (0x218bd0, 46 insns) - the other "trail function",
+ * DrawOpeningScene's real tail call. */
+static void
+sub_218bd0(void)
+{
+	DrawSomeSprite2();
+	fp_25A368();
+}
+
 static void
 DrawOpeningScene(void)
 {
-	// TODO
+	/* real OSDSYS order: DrawTowers -> DrawExtraBuf2 -> DrawToExtraBuf2 ->
+	 * DrawFog -> DrawLightsAndCubes -> sub_218b20 -> sub_218bd0
+	 * (docs/towers-analysis.md). Towers must come before fog/lights:
+	 * fog's blend is additive (can only brighten, never erase), so
+	 * drawing towers last would silently overpaint fog and light glow
+	 * already drawn that frame. */
+
+	DrawTowers();
+
+	DrawExtraBuf2();
+	DrawToExtraBuf2();
 
 	DrawFog();
 
 	DrawLightsAndCubes();
+
+	sub_218b20();
+	sub_218bd0();
 }
 
 static void
@@ -1274,12 +1760,685 @@ DoOpeningIllegal(void)
 	}
 }
 
+/* ==== towers: faithful port of the real OSDSYS VU1 tower pipeline ====
+ *
+ * The real OSDSYS draws the tower field through VU1 microcode:
+ *  - per tower, the EE patches fields in the chains (UNPACK source
+ *    address, parameters) and kicks a VIF1 chain-mode transfer
+ *    (sendDma), then polls VU1 status.
+ *  - the tower field layout itself is loaded from the memory card in
+ *    the real OSDSYS (boot history: 21 x 22 byte entries, +16 type,
+ *    +17 bits, +18 index).  osdbits has no memcard and the history
+ *    parse itself isn't ported yet, so for now we generate a field with
+ *    the same statistical shape as a real captured one instead
+ *    (RandomizeTowerField).
+ *
+ * 2026-08-25: the VU1 microcode + per-tower DMA chain used to be a
+ * verbatim byte extraction (vudata.inc) patched by hand-computed
+ * "real VA - blob base" offsets (OFF_CHAIN_HEAD etc.), needing a
+ * vudataRelocate() pass at runtime to fix up absolute addresses baked
+ * into the extracted bytes.  Reconstructed as real dvp-as source
+ * instead (towerchain.dsm, using vucode_1.vsm for the microcode) -
+ * assembled and diffed byte-for-byte against the real ROM bytes at
+ * every one of these addresses to confirm the reconstruction is exact
+ * (see docs/towers-analysis.md).  This gives named, linker-relocated
+ * symbols for every real patch point instead of numeric offsets, and
+ * the linker's own relocations (R_MIPS_DVP_27_S4 on the chain tags)
+ * replace vudataRelocate() entirely - patch points below are extern
+ * symbols defined in towerchain.dsm. */
+extern u32 TowerUpload  __attribute__((section(".vudata")));
+extern u32 TowerChain   __attribute__((section(".vudata")));
+extern u32 TowerView    __attribute__((section(".vudata")));
+extern u32 TowerModel   __attribute__((section(".vudata")));
+extern u32 TowerLightMatrix __attribute__((section(".vudata")));
+extern u32 TowerGifTag  __attribute__((section(".vudata")));
+extern u32 TowerBlock0  __attribute__((section(".vudata")));
+extern u32 TowerBlock1  __attribute__((section(".vudata")));
+extern u32 TowerBlock2  __attribute__((section(".vudata")));
+extern u32 TowerBlock3  __attribute__((section(".vudata")));
+extern u32 TowerBlock4  __attribute__((section(".vudata")));
+extern u32 TowerBlock5  __attribute__((section(".vudata")));
+
+/* the 6 per-tower packet blocks, in real memory order (matches the real
+ * static pointer table at 0x27a650) - kept as an array so the existing
+ * per-block loops (towerPatchTags/Vertices/ST) don't need restructuring */
+static u32 *const towerBlocks[6] = {
+	&TowerBlock5, &TowerBlock1, &TowerBlock2, &TowerBlock3, &TowerBlock4, &TowerBlock0
+};
+
+/* sendDma - kick a VIF1 chain-mode transfer at addr.  Disasm-verified
+ * 2026-08-24 against the ONE-TIME vucode_1 upload in OpeningInitTowersFog
+ * (0x218ff0-0x219044): QWC=0; TADR=addr&0x0fffffff; *(0x1000e010)=2;
+ * FlushCache(0) (real: jal 0x24dce0, confirmed FlushCache by name, NOT the
+ * "RPC/file helper" an older note guessed); CHCR=325.  This exact sequence
+ * is real ONLY for this one-time upload - DrawTowers's per-tower kick is a
+ * DIFFERENT real sequence, see towerKick() below.  Do not reuse sendDma()
+ * for the per-tower path (it used to be shared with vu1Wait() below - that
+ * was wrong, see towerKick). */
+static void
+sendDma(void *addr)
+{
+	*D1_QWC = 0;
+	*D1_TADR = (u32)addr & 0x0fffffff;
+	*(volatile u32*)0x1000e010 = 2;
+	FlushCache(0);
+	*D1_CHCR = 325;		/* chain mode start */
+}
+
+static void
+vu1Wait(void)
+{
+	/* real 0x266b08 = sceDmaSync, confirmed by name (osdsys_dump.idb):
+	 * called as sceDmaSync(&D1_CHCR-as-pointer, 0, 0) right after the
+	 * ONE-TIME upload's CHCR=325 kick - this manual poll (of the same
+	 * DMA-start bit sceDmaSync itself polls) is a faithful stand-in for
+	 * that specific call, not a generic wait.  Bounded so a wedged DMA
+	 * can't hang the frame.  Real OSDSYS follows this sceDmaSync call
+	 * with a further sceGsSyncPath(0,0) - see the InitTowersFog call
+	 * site below, which now does that explicitly instead of folding it
+	 * in here. */
+	int i;
+	for(i = 0; i < 1<<20; i++) {
+		if(!(*D1_CHCR & 0x100))
+			return;
+	}
+}
+
+/* towerKick - kick the per-tower VIF1 chain.  Disasm-verified 2026-08-24
+ * against DrawTowers's real per-cell kick (0x218a48-0x218a90) - a
+ * DIFFERENT real sequence from sendDma()/vu1Wait() above, found by aap
+ * noticing our port had no sceGsSyncPath anywhere and DrawTowers didn't
+ * match what they saw in IDA:
+ *   QWC=0; TADR=addr&0x0fffffff; *(0x1000e010)=2; sceGsSyncPath(0,0);
+ *   CHCR=325 (kick) - NO FlushCache here (confirmed absent from this
+ *   exact instruction window), and NO wait/sync call immediately after
+ *   the kick either: DrawTowers kicks each tower and moves straight on
+ *   to computing the next one (pipelined, not serialized per-tower) -
+ *   there is exactly ONE more sceGsSyncPath(0,0), after the ENTIRE r,c
+ *   loop finishes (0x218ad8), not one per tower.  Ported as a single
+ *   trailing towerSyncEnd() call after DrawTowers's double loop instead
+ *   of a per-iteration vu1Wait(). */
+static void
+towerKick(void *addr)
+{
+	*D1_QWC = 0;
+	*D1_TADR = (u32)addr & 0x0fffffff;
+	*(volatile u32*)0x1000e010 = 2;
+	sceGsSyncPath(0, 0);
+	*D1_CHCR = 325;		/* chain mode start */
+}
+
+static void
+towerSyncEnd(void)
+{
+	sceGsSyncPath(0, 0);	/* real: 0x218ad8, once after the whole field */
+}
+
+/* tower field state (the real OSDSYS BSS arrays) */
+static int towerFlags[20][20];
+static float towerGrid[20][20];
+static float towerPos[14][9][4];
+static float towerA[14][9];	/* alphas */
+static float towerB[14][9];
+static float towerC[14][9];
+static float towerD[14][9];
+
+/* height grid (real: sub_217e30): 20x20 floats, two radial bumps */
+static void
+HeightGrid(void)
+{
+	static const float sqrt5202 = 72.12489168f;	/* sqrt(5202) = 51*sqrt(2) */
+	int r, c;
+	for(r = 0; r < 20; r++) {
+		float x = (r-10)*5.1f;
+		for(c = 0; c < 20; c++) {
+			float y = (c-10)*5.1f;
+			float d1, d2, v;
+			d1 = sqrtf((x+2.55f)*(x+2.55f) + (y+7.65f)*(y+7.65f));
+			d2 = sqrtf((x-2.55f)*(x-2.55f) + (y-7.65f)*(y-7.65f));
+			v = clamp(255.0f*(sqrt5202 - 2.0f*d1)/sqrt5202, 32.0f, 255.0f)
+			  + clamp(0.5f*255.0f*(sqrt5202 - 4.0f*d2)/sqrt5202, 32.0f, 220.0f);
+			v *= 10.2f;
+			v -= 10.0f*(int)(((r*(r+c)/(c+1)) % 11) - 5);
+			towerGrid[r][c] = clamp(v, 32.0f, 220.0f);
+		}
+	}
+}
+
+/* real memcard-loaded tower field: the real ROM loads this from the
+ * memcard boot history, which isn't parsed here (see InitTowersFog's step
+ * 2 note).  Until then, generate a randomized field each boot instead of
+ * always showing the exact same 21 towers.
+ *
+ * Not a guess: fit from a real captured field (21 real cells, pulled
+ * 2026-08-23 from a PCSX2 savestate's eeMemory.bin at their real VAs -
+ * see git history/docs/towers-analysis.md for that raw table and its
+ * verification, since it's no longer kept live in this file). That real
+ * data gives:
+ *   - density: 21/126 cells flagged (~1 in 6)
+ *   - towerC: 18/21 = 0.4, 1/21 = 0.6, 1/21 = 0.8, 1/21 = 1.0 (the
+ *     towerC==1.0 "special path" cell DrawTowers has its own branch for)
+ *   - towerD: 20/21 = 0.1, the one towerC==1.0 cell pairs with D=0.3
+ *     (per aap, D likely tracks a play count from the boot history - the
+ *     real per-cell value isn't reconstructable without that parse, so
+ *     this keeps the same C/D pairing behavior, not the exact value)
+ *   - position: linear regression against (row,col) - y fits the real
+ *     data to float precision (`y = -5.2*c + 21.0048`), x fits to within
+ *     ~1 unit (`x = 5.184*r - 35.598`) with some residual almost
+ *     certainly from scene rotation at the moment of capture, not
+ *     modeled here. The 5.2ish pitch matches HeightGrid()'s own 5.1-unit
+ *     grid spacing, which makes physical sense - same field.
+ *   - z: 17/21 real cells sit at exactly one baseline value
+ *     (167.560791); the other 4 are scattered outliers with no r,c
+ *     pattern discernible from only 4 samples - modeled as an occasional
+ *     random offset rather than invented as a formula. */
+static void
+RandomizeTowerField(void)
+{
+	int r, c;
+
+	for(r = 0; r < 14; r++) {
+		for(c = 0; c < 9; c++) {
+			int roll;
+
+			if((rand() % 6) != 0)
+				continue;
+			towerFlags[r][c] = 1;
+
+			roll = rand() % 21;
+			if(roll == 0) {
+				towerC[r][c] = 1.0f;
+				towerD[r][c] = 0.3f;
+			} else {
+				towerC[r][c] = roll == 1 ? 0.6f : roll == 2 ? 0.8f : 0.4f;
+				towerD[r][c] = 0.1f;
+			}
+
+			towerPos[r][c][0] = 5.2f*r - 35.6f + (float)((rand()%100)-50)/50.0f;
+			towerPos[r][c][1] = -5.2f*c + 21.0f;
+			towerPos[r][c][2] = (rand() % 5) == 0
+					? 167.56f + (float)((rand()%100)-50)
+					: 167.56f;
+			towerPos[r][c][3] = 0.0f;
+		}
+	}
+}
+
+/* runtime float tables (real 0x28aed0/0x28aec0, filled from memcard) */
+static float towerAngleTab[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static float towerPosTab[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+/* real: 0x2a7190 = 0.01745329 (deg2rad), read as *(gp-32480) in
+ * DrawTowers.  towerSway = the per-frame Z sway angle, computed once
+ * per DrawTowers() call (real 0x218730-0x21876c) - NOT per tower. */
+#define DEG2RAD 0.01745329f
+/* real: 0x2a7194 = 1.5707964 (PI/2), read as *(gp-32476) in DrawTowers
+ * - the per-cell rotation term's step size (see towerPatchVertices'
+ * caller / the angles[2] build in DrawTowers). */
+#define PI_2 1.5707964f
+static float towerSway;
+/* tower render struct (the real spr-allocated struct, ptr at
+ * gp-31000): base matrix @0x000, translated matrix @0x080, packet ptr
+ * @0x0c0, transformed vertices @0x180, source quad @0x200, rotated
+ * matrix @0x240. */
+static struct {
+	sceVu0FMATRIX base;		/* 0x000 */
+	u32 pad0[16];			/* 0x040-0x07f */
+	sceVu0FMATRIX translated;	/* 0x080 */
+	sceVu0FMATRIX view;		/* 0x0c0 (param matrix A = obj->screen view) */
+	u32 pad1[32];			/* 0x100-0x17f */
+	sceVu0FMATRIX transformed;	/* 0x180 (light matrix) */
+	u32 pad2[16];			/* 0x1c0-0x1ff */
+	sceVu0FMATRIX quad;		/* 0x200 (light vectors, rotated per tower) */
+	sceVu0FMATRIX rotated;		/* 0x240 */
+} towerStruct;
+
+/* per-tower chain patch helpers (real: tower_218180/218210/218288)
+ *
+ * The chain layout (from the real OSDSYS, verified against PCSX2's
+ * hwDmacSrcChainWithStack + Vif1_Dma TTE handling):
+ *   0x268020 head tag {NEXT 23, ADDR 0x2681a0, STCYCL, UNPACKR V4-32
+ *           num=22} - a 4-word tag: with TTE the upper 8 bytes
+ *           (STCYCL + UNPACK) are transferred to VIF1 as data, then
+ *           QWC=23 qwords follow from tag+16.  tower_218288 rewrites
+ *           only the ADDR field (0x2681a0, the static value).
+ *   0x268030-0x26818f the 22 in-stream qwords: matrix A (view), matrix
+ *           B (model), 4 light colours, light matrix, 2 clip vectors,
+ *           the init GIF packet (qwords 18-20), tex flag (qword 21).
+ *           tower_218180 patches qwords 0-3 / 4-7 / 12-15 per tower.
+ *   0x268190 MSCAL (the 23rd qword of the head chain - starts vucode_1,
+ *           which XGKICKs the init packet at qword 18, then loops on
+ *           XTOP); 0x268194 BASE + 0x268198 OFFSET + 0x26819c NOP are
+ *           dead static bytes between the head chain and the CNT tag.
+ *   0x2681a0 CNT 106: 6 packet blocks, each = MSCNT + STCYCL +
+ *           UNPACKR(17) + the 17-qword packet {GIF tag, 4 verts,
+ *           4 normals, 4 colours, 4 st}.  Block 5 (first in the
+ *           region) has no MSCNT.  The 6 packets = the 6 quads of one
+ *           tower; tower_218288 rewrites ALL 6 tags every tower,
+ *           tower_218318 patches the vertex z + colours, tower_2184d0
+ *           the st coords.  The VU program renders each packet as it
+ *           arrives (XTOP -> process -> XGKICK -> loop).
+ *   0x268850 END tag (0x70000000)
+ */
+
+/* patch the per-tower matrix params into the 22-qword unpack window
+ * (real: tower_218180 copies spr struct fields +0x80/+0xc0/+0x180) */
+static void
+towerPatchParams(void)
+{
+	/* real tower_218180: copies the FULL 4x4 (64 bytes) of three spr
+	 * matrices into the 22-qword param window:
+	 *   spr+0x0c0 (view)        -> 0x268030  (qwords 0-3  = matrix A)
+	 *   spr+0x080 (model)       -> 0x268070  (qwords 4-7  = matrix B)
+	 *   spr+0x180 (light matrix)-> 0x2680f0  (qwords 12-15)
+	 * The VU program MulMatrix(0, 4, 22) computes obj->screen = A x B. */
+	memcpy(&TowerView, &towerStruct.view, 64);
+	memcpy(&TowerModel, &towerStruct.translated, 64);
+	memcpy(&TowerLightMatrix, &towerStruct.transformed, 64);
+}
+
+/* rewrite the 6 packets' GIF tags (real: tower_218288, called with
+ * a0=0 a1=1 every tower - see the caller 0x2189d0).  The tag words are
+ * the packet's qword 0, NOT VIFcodes:
+ *   {0x8004, 0x304e4000, 0x412, 0} =
+ *     NLOOP=4 EOP=1 | PRE=1 PRIM=0xa2 (TME=1 TRISTRIP CTXT=1 -
+ *     the towers are TEXTURED tristrips in context 1) FLG=PACKED
+ *     NREG=3 | REGS = {ST, RGBAQ, XYZF2} (0x412) + 0
+ * The static ROM state is the init variant {0x8004, 0x302e6000,
+ * 0x412, 0} (PRIM=0x68: TRIANGLES FST, a0=1 a1=0).  All 6 packets
+ * are rewritten, every tower.  The head REF (0x268024) is rewritten
+ * to 0x2681a0 too (same value - the static chain already points
+ * there). */
+static void
+towerPatchTags(void)
+{
+	int i;
+	for(i = 0; i < 6; i++) {
+		u32 *b = towerBlocks[i];
+		b[0] = 0x8004;
+		b[1] = 0x304e4000;	/* ((a0<<6)|(a1<<7)|28)<<15 | 0x30004000 */
+		b[2] = 0x412;		/* REGS {ST, RGBAQ, XYZF2} */
+		b[3] = 0;
+	}
+}
+
+/* write the giftag block (real: tower_218210) - part of the param
+ * window */
+static void
+towerPatchGifTag(void)
+{
+	u32 *g = &TowerGifTag;
+	g[0] = 0x8002;		/* NLOOP=2 EOP=1 */
+	g[1] = 0x10000000;
+	g[2] = 14;
+	g[3] = 0;
+	g[4] = 0x44;		/* real: sd of 0x80_0000_0044 */
+	g[5] = 0x80;
+	g[6] = 66;
+	g[7] = 0;
+	g[8] = 0;
+	g[9] = 0;
+	g[10] = 73;
+	g[11] = 0;
+	g[12] = 0;		/* 0x268180 */
+	g[13] = 0;
+	g[14] = 0;
+	g[15] = 0;
+}
+
+/* static per-vertex z sign flags (real table at 0x27ae50,
+ * [block][vertex]: 1 = +f0, 0 = -f0) */
+static const u8 towerSignFlags[6][4] = {
+	{ 0, 0, 0, 0 },
+	{ 0, 1, 0, 1 },
+	{ 1, 0, 1, 0 },
+	{ 1, 1, 0, 0 },
+	{ 0, 0, 1, 1 },
+	{ 1, 1, 1, 1 },
+};
+
+/* patch the per-tower vertex heights + colours into the 6 packets
+ * (real: tower_218318).  Per block b, per vertex v:
+ *   vertex z = +/-f0  (f0 = the tower height from towerA)
+ *   colours = {0,0,0,128} if f0 <= 0, else {s,s,s,128} with
+ *   s = f12 (block 0) or f12*f3 (blocks 1-5); f12 = the grid value
+ *   scaled by (towerB/128 or towerA/30), f3 = the side-face factor
+ *   (real table at 0x27af38, first entry 0.5). */
+static void
+towerPatchVertices(int r, int c)
+{
+	float f0 = towerA[r][c];
+	int   bint = (int)towerB[r][c];
+	float f12 = towerGrid[r+3][c+6] * (bint != 0 ? (float)bint/128.0f : towerA[r][c]/30.0f);
+	float f3 = 0.5f;
+	int b, v;
+
+	for(b = 0; b < 6; b++) {
+		float *pkt = (float*)towerBlocks[b];
+		float s = b == 0 ? f12 : f12*f3;
+		for(v = 0; v < 4; v++) {
+			/* vertex z = word 2 of the vertex qword at
+			 * +0x10 + v*16 */
+			pkt[(0x18 + v*16)/4] = towerSignFlags[b][v] ? f0 : -f0;
+			/* colours at +0x90 + v*16 */
+			pkt[(0x90 + v*16)/4 + 0] = f0 <= 0.0f ? 0.0f : s;
+			pkt[(0x90 + v*16)/4 + 1] = f0 <= 0.0f ? 0.0f : s;
+			pkt[(0x90 + v*16)/4 + 2] = f0 <= 0.0f ? 0.0f : s;
+			pkt[(0x90 + v*16)/4 + 3] = 128.0f;
+		}
+	}
+}
+
+/* patch the st texture coords into the 6 packets (real: tower_2184d0):
+ * a UNIT quad {u,u},{u+1,u},{u,u+1},{u+1,u+1} with u = a0/256, z=1, w=0,
+ * into all 6 packets at +0xd0.  PRIM is 0x304e4000 = 0x9c (TRISTRIP,
+ * IIP, TME, FST=0 - S,T are NORMALIZED fractions of the texture, which
+ * is why u=a0/256 lines up with TEXOWAL0's 256px width) sampling
+ * TEX0_1/TEX1_1 = TEXOWAL0 (the wall texture, set by vif1SetTextureMIP
+ * in DrawTowers).
+ *
+ * a0 traced to the caller (DrawTowers 0x218a08-0x218a3c): a0 = with
+ * plain r,c: (r+c+9)*(r+8)/(c+7) + (r+c+9)*(r+7)/(c+9), all integer
+ * division. */
+static void
+towerPatchST(int r, int c)
+{
+	int a0 = (r+c+9)*(r+8)/(c+7) + (r+c+9)*(r+7)/(c+9);
+	float u = (float)a0/256.0f;
+	static const float st[4][2] = {
+		{ 0.0f, 0.0f }, { 1.0f, 0.0f }, { 0.0f, 1.0f }, { 1.0f, 1.0f }
+	};
+	int b, v;
+
+	for(b = 0; b < 6; b++) {
+		float *pkt = (float*)towerBlocks[b];
+		for(v = 0; v < 4; v++) {
+			pkt[(0xd0 + v*16)/4 + 0] = u + st[v][0];
+			pkt[(0xd0 + v*16)/4 + 1] = u + st[v][1];
+			pkt[(0xd0 + v*16)/4 + 2] = 1.0f;
+			pkt[(0xd0 + v*16)/4 + 3] = 0.0f;
+		}
+	}
+}
+
 static void
 InitTowersFog(void)
 {
-	// ...
+	/* real OpeningInitTowersFog (0x218e00, 276 insns) has 8 steps
+	 * (docs/towers-analysis.md); status of each here:
+	 *   1. memset(towerFlags)                    - ported, below
+	 *   2. parse memcard boot history into the    - NOT ported. We
+	 *      field (bootHistory[] @0x1f0138,          generate a field with
+	 *      21x22B entries) into towerC/D/          the same statistical
+	 *      towerFlags + the SOURCE position         shape instead
+	 *      table @0x28a670                          (RandomizeTowerField).
+	 *   3. VU1 upload (sendDma/vu1Wait equivalent) - ported, below
+	 *   4. transform 0x28a670 source positions    - NOT ported at all.
+	 *      into towerPos: {(x+0.85)*4, (y-6.5)*4,   Only matters once
+	 *      (z+4)*12+150} per cell                   step 2 is real -
+	 *                                                RandomizeTowerField
+	 *                                                writes already-final
+	 *                                                towerPos, bypassing
+	 *                                                this transform.
+	 *   5. alpha/halo tables (towerA/B/towerPos.z) - ported, below
+	 *   6. HeightGrid()                            - ported, below
+	 *   7. InitFog()                               - ported, below
+	 *   8. tail: j DrawToExtraBuf2                 - stubbed (empty), below
+	 */
+	int r, c;
+
+	memset(towerFlags, 0, sizeof(towerFlags));
+
+	/* the base matrix = identity (real: spr+0x000, initialized when the
+	 * spr struct is allocated).  The RotMatrix helpers rotate FROM it;
+	 * with a zero base the whole model matrix collapses to zero and the
+	 * tower quads degenerate to a point. */
+	memset(&towerStruct.base, 0, sizeof(towerStruct.base));
+	towerStruct.base[0][0] = 1.0f;
+	towerStruct.base[1][1] = 1.0f;
+	towerStruct.base[2][2] = 1.0f;
+	towerStruct.base[3][3] = 1.0f;
+
+	/* the 4 light vectors (real spr+0x200 source matrix, transformed by
+	 * the per-tower rotation into the light matrix).  The tower quads'
+	 * normals are {0,0,1,1}. */
+	towerStruct.quad[0][0] = 0.0f;  towerStruct.quad[0][1] = 0.0f;
+	towerStruct.quad[0][2] = 1.0f;  towerStruct.quad[0][3] = 0.0f;
+	towerStruct.quad[1][0] = 0.5f;  towerStruct.quad[1][1] = 0.5f;
+	towerStruct.quad[1][2] = 0.0f;  towerStruct.quad[1][3] = 0.0f;
+	towerStruct.quad[2][0] = -0.5f; towerStruct.quad[2][1] = -0.5f;
+	towerStruct.quad[2][2] = 0.0f;  towerStruct.quad[2][3] = 0.0f;
+	towerStruct.quad[3][0] = 0.0f;  towerStruct.quad[3][1] = 0.0f;
+	towerStruct.quad[3][2] = 0.0f;  towerStruct.quad[3][3] = 1.0f;
+
+	/* real OSDSYS: parse the memcard boot history (bootHistory[])
+	 * into the tower field.  The memcard cell table + float tables
+	 * are not implemented yet, so for now generate a field with the
+	 * same statistical shape as a real one (RandomizeTowerField). */
+	RandomizeTowerField();
+
+	/* real step 5: alpha/halo tables */
+	for(r = 0; r < 14; r++)
+		for(c = 0; c < 9; c++) {
+			float f0 = towerD[r][c]*30.0f;
+			float f3;
+			if(f0 < 3.0f)
+				f0 = 3.0f;
+			towerA[r][c] = f0;
+			f3 = towerC[r][c];
+			towerPos[r][c][2] += f3*30.0f - f0;
+			if(1.0f <= f3) {
+				towerC[r][c] = 1.0f;
+				towerB[r][c] = 0.0f;
+			} else
+				towerB[r][c] = (float)(int)((1.0f - f3)*128.0f);
+		}
+
+	/* real: upload vucode_1 (the tower renderer): the CNT tag at the
+	 * blob head (0x2678e0) pulls MPG(229 words) + 1832 bytes of
+	 * microcode into VU1 code memory.  Real sequence after the kick is
+	 * sceDmaSync(...) THEN sceGsSyncPath(0,0) (0x21904c/0x219058,
+	 * disasm-verified 2026-08-24) - vu1Wait() stands in for the former,
+	 * the explicit call below for the latter (previously missing). */
+	sendDma(&TowerUpload);
+	vu1Wait();
+	sceGsSyncPath(0, 0);
+
+	/* real: VU1 prepass on the height grid (D1 kick + wait), then RPC.
+	 * Unconditional regardless of the toggles above: fog depends on
+	 * this. */
+	HeightGrid();
 	InitFog();
-	// ...
+
+	DrawToExtraBuf2();	/* real: tail call, j not jal (see step 8 above) */
+}
+
+static void
+DrawTowers(void)
+{
+	int r, c;
+
+	vif1SetZWrite(1);
+	vif1SetZTest(1);
+
+	/* real 0x218728: vif1SetTextureMIP(&OpeningTexList[
+	 * *(0x27aeb0)], 1, 5, -65).  towerWallTexID = 6 -> OpeningTexList[6]
+	 * = resid 0x1c = TEXOWAL0, the 256x256 mipmapped wall texture
+	 * (mxl=2, so mipmap=1 / mmin=5 = LINEAR_MIP_LINEAR make sense).
+	 * The towers draw with PRIM 0x9c: TRISTRIP, IIP, TME, FST=0
+	 * (S,T are normalized STQ fractions, scaled by the texture's
+	 * width/height - NOT direct texel coords), CTXT=0 - so they
+	 * sample this TEX0_1/TEX1_1 in context 1. */
+	vif1SetTextureMIP(&textures[TEXID_WAL0], 1, 5, -65);
+
+	/* real: the view (param matrix A) = the opening scene camera
+	 * matrix, updated per frame by Process() */
+	memcpy(&towerStruct.view, &sprMatrices->cameraScreenMatrix, 64);
+
+	/* real: a "shadow walk" over the field rows exists here in the ROM
+	 * (0x218650-0x2186f4) but fully traced 2026-08-25 and confirmed to be
+	 * a mathematical no-op: it computes a per-cell camera displacement,
+	 * but the gate it feeds always reads back cell (0,0)'s value (a fixed
+	 * pointer, never reassigned) as |dx|+|dy| - a sum of absolute values,
+	 * so always >= 0, so its "skip if <= 0" gate never actually skips
+	 * anything for any real camera position. Intentionally not ported -
+	 * see docs/towers-analysis.md for the full trace. */
+
+	/* real: a SINGLE per-frame sway angle, computed once (loop-
+	 * invariant across all towers this frame, NOT per-tower):
+	 * f23 = sinf(((frameCount%360)-180) * DEG2RAD) * 10.0 * DEG2RAD */
+	towerSway = sinf((float)((frameCount % 360) - 180) * DEG2RAD)
+			* 10.0f * DEG2RAD;
+
+	for(r = 0; r < 14; r++) {
+		for(c = 0; c < 9; c++) {
+			float angles[4];
+			float pos[4];
+			float term;
+			int q;
+			int k;
+
+			if(!towerFlags[r][c])
+				continue;
+			/* real: towerGrid[r+3][c+6], see towerPatchVertices */
+			if(towerGrid[r+3][c+6] <= 0.0f)
+				continue;
+
+			/* special path when towerC == 1.0 (real: grid cell
+			 * set to -1.0) */
+			if(towerC[r][c] == 1.0f)
+				towerGrid[r+3][c+6] = -1.0f;
+
+			/* per-cell Z rotation term (disasm-verified, DrawTowers
+			 * 0x218830-0x218920, both towerC branches): q = (row+
+			 * col+9)*(row+3) / 7 (integer div); term = (q mod 4) *
+			 * PI/2, a quantized 90-degree-step rotation per cell.
+			 * Real ROM behaviour, correctly ported - but per aap's
+			 * testing and a "null-result proof" in towers-analysis.md,
+			 * it's mathematically invisible for this geometry (a
+			 * rigid co-rotation of a square, uniformly-textured box
+			 * at exactly 90-degree steps), so don't expect a visual
+			 * change from this term alone. */
+			q = (r+c+9)*(r+3)/7;
+			term = (float)(q % 4) * PI_2;
+			angles[0] = towerAngleTab[0];
+			angles[1] = towerAngleTab[1];
+			angles[2] = towerAngleTab[2] + term
+					+ (towerC[r][c] == 1.0f ? 0.0f : towerSway);
+			angles[3] = towerAngleTab[3];
+
+			/* real helpers 0x267370 / 0x2676b0 / 0x267860 - IN IDA
+			 * these are ONE call each (sceVu0RotMatrix/TransMatrix/
+			 * MulMatrix), not the several calls below - disassembled
+			 * libvu0.a directly (2026-08-24) to confirm this expansion
+			 * is exact, not just "close enough":
+			 *   sceVu0RotMatrix(m0,m1,rotVec) body IS literally
+			 *     RotMatrixZ(m0,m1,rotVec.z); RotMatrixY(m0,m0,rotVec.y);
+			 *     RotMatrixX(m0,m0,rotVec.x);  <- exactly the 3 calls below
+			 *   sceVu0TransMatrix(m0,m1,tv) body IS literally
+			 *     copy m1's rows 0-2 to m0; m0.row3.xyz = m1.row3.xyz+tv;
+			 *     row3.w untouched  <- exactly CopyMatrix + the row-3 add
+			 *   sceVu0MulMatrix(m0,m1,m2) body IS, per row i:
+			 *     m0.row[i] = m2.row[i] applied through m1 (same vmulax/
+			 *     vmadday/vmaddaz/vmaddw as sceVu0ApplyMatrix)  <- exactly
+			 *     the 4x sceVu0ApplyMatrix loop below
+			 * So this block is a verified-exact, just manually-inlined,
+			 * expansion of those 3 SDK calls - not a mismatch. */
+			sceVu0RotMatrixZ(towerStruct.rotated, towerStruct.base, angles[2]);
+			sceVu0RotMatrixY(towerStruct.rotated, towerStruct.rotated, angles[1]);
+			sceVu0RotMatrixX(towerStruct.rotated, towerStruct.rotated, angles[0]);
+
+			pos[0] = towerPos[r][c][0] + towerPosTab[0];
+			pos[1] = towerPos[r][c][1] + towerPosTab[1];
+			pos[2] = towerPos[r][c][2] + towerPosTab[2];
+			pos[3] = towerPos[r][c][3] + towerPosTab[3];
+			sceVu0CopyMatrix(towerStruct.translated, towerStruct.rotated);
+			/* real 0x2676b0: out = rotation with the position added to
+			 * ROW 3 (vadd.xyz rot-row3 += pos).  The VU program applies
+			 * the model matrix TRANSPOSED (MulMatrix computes A x B^T,
+			 * so the vertex gets p.R + t.w).  A column-3 translation
+			 * lands in the w channel as pos.p + w and blows up the
+			 * perspective divide (big scaling/flickering artefacts). */
+			towerStruct.translated[3][0] += pos[0];
+			towerStruct.translated[3][1] += pos[1];
+			towerStruct.translated[3][2] += pos[2];
+			for(k = 0; k < 4; k++)
+				sceVu0ApplyMatrix(towerStruct.transformed[k],
+						towerStruct.rotated, towerStruct.quad[k]);
+
+			/* real per-tower sequence: giftag (params window),
+			 * block NOPs, 218318 (vertex z + colours), 2184d0
+			 * (st coords), params, ONE chain kick at the head */
+			towerPatchGifTag();
+			towerPatchTags();
+			towerPatchVertices(r, c);
+			towerPatchST(r, c);
+			towerPatchParams();
+			/* real: sync BEFORE the kick, no wait after - pipelined,
+			 * not serialized per-tower (see towerKick's comment) */
+			towerKick(&TowerChain);
+		}
+	}
+	/* real: ONE sceGsSyncPath(0,0) after the whole field, not per-tower
+	 * (0x218ad8, disasm-verified 2026-08-24) */
+	towerSyncEnd();
+}
+
+/* ==== NOT PORTED: the "flare and illegal stuff" init chain ====
+ * real InitOpening calls sub_219f08 here, between OpeningInitTowersFog and
+ * StartFrame (surveyed 2026-08-24). sub_21b690 is ALSO called once from
+ * OpeningInitLightsCubes (shared helper) - not wired in there since that
+ * function is otherwise fully verified/ported and this session didn't
+ * trace sub_21b690 itself, so no confident call site to add for the
+ * light-cube side yet. */
+
+/* real: sub_21a438 (0x21a438, 168 insns) - real callees are just cosf/sinf
+ * (no stub needed), not investigated further. */
+static void
+sub_21a438(void)
+{
+}
+
+/* real: sub_215798 (0x215798, 161 insns) - makes 4 unconditional rand()
+ * calls (disasm-verified 2026-08-24, see docs/towers-analysis.md): this is
+ * the actual real function the earlier placeholder comment described.
+ * lightsSeed's phase depends on rand() call COUNT, so keep these 4 calls
+ * even though the rest of the function isn't traced. */
+static void
+sub_215798(void)
+{
+	rand(); rand(); rand(); rand();
+}
+
+/* real: sub_21b690 (0x21b690, 65 insns) - shared with OpeningInitLightsCubes
+ * (see comment above), not investigated. */
+static void
+sub_21b690(void)
+{
+}
+
+/* real: sub_219cb8 (0x219cb8, 123 insns) - real callee is sub_21b690 above. */
+static void
+sub_219cb8(void)
+{
+	sub_21b690();
+}
+
+/* real: sub_219f08 (0x219f08, 14 insns) - InitOpening's real call, wraps
+ * the three functions above. */
+static void
+sub_219f08(void)
+{
+	sub_21a438();
+	sub_215798();
+	sub_219cb8();
+}
+
+/* real: initTextShit (0x214f20, 13 insns) - IDA's own name (leaf, no
+ * calls out), InitOpening's real call right before StartFrame. */
+static void
+initTextShit(void)
+{
 }
 
 static void
@@ -1287,12 +2446,14 @@ Init(void)
 {
 	openingType = nextOpeningType = fooOpeningType;
 
+	/* real InitOpening order: OpeningInitRender, OpeningInitAnimation,
+	 * OpeningInitTowersFog, sub_219f08, initTextShit, StartFrame -
+	 * confirmed complete 2026-08-24, nothing else in between. */
 	InitRender();
-	// ...
 	InitAnimation();
 	InitTowersFog();
-	// ??? flare and illegal stuff?
-	// InitText();
+	sub_219f08();
+	initTextShit();
 	StartFrame();
 
 	frameCount = evenOddFrame;

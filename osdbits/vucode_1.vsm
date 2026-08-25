@@ -72,7 +72,7 @@ LOOP0:
 	MADDAz ACC, VF07, VF21                   NOP
 	MADDw VF13, VF08, VF21                   DIV Q, VF00w, VF24w
 
-	MULq.xyz VF24, VF25, Q                   WAITQ				; perspective division
+	MULq.xyz VF24, VF24, Q                   WAITQ				; perspective division
 	MULq VF27, VF22, Q                       NOP				; also divide st
 	NOP                                      LQI VF22, (VI06++)		; next st
 	MAXx VF13, VF13, VF00                    LQI VF21, (VI04++)		; clamp light factors - next normal

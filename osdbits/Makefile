@@ -9,6 +9,7 @@ TARGET      = main
 OBJS        = crt0.o \
               res.o \
               opening.o \
+              towerchain.o \
               $(TARGET).o
 
 LCFILE      = $(LIBDIR)/app.cmd
