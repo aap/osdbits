@@ -1,0 +1,4 @@
+# name  va  size (bytes, hex) - bounds from osdsys_dump.idb
+initTextShit  0x214f20 0x34
+DoSCEText     0x214c20 0x8c
+DoText        0x214f58 0x1c

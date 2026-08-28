@@ -29,3 +29,6 @@ osdbits/gsdump-archive/
 # extracted Sony data - regenerate with tools/extract-res.py
 osdbits/res/
 vucode_[0-9]
+
+# matching workspace build output
+matching/build/
