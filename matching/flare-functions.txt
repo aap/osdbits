@@ -1,0 +1,18 @@
+# the red-flare / illegal-disc module (0x219cb8..0x21b798) - bounds
+# from osdsys_dump.idb via idautils.Functions() (get_func() alone is
+# unreliable in this idb for several of these - see notes.txt/session)
+sub_219cb8      0x219cb8 0x1ec
+DrawIllegalCubes 0x219ea8 0x60
+sub_219f08      0x219f08 0x38
+DrawIllegalDisc 0x219f40 0x70
+DrawFlareSprite 0x219fb0 0x34c
+FlareThing      0x21a300 0x138
+sub_21a438      0x21a438 0x2a0
+flare_21A6D8    0x21a6d8 0x374
+flare_21AA50    0x21aa50 0x4c8
+flare_21AF18    0x21af18 0x47c
+fades           0x21b398 0x130
+DrawRedFlare    0x21b4c8 0xa4
+InitIllegalScene 0x21b570 0xd8
+DrawIllegalScene 0x21b648 0x48
+sub_21b690      0x21b690 0x104

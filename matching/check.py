@@ -2,11 +2,12 @@
 # check.py - compare functions in a compiled .o against the real OSDSYS
 # image, masking relocation-affected bit fields.
 #
-#     python3 check.py build/text.o path/to/expanded-osdsys.bin
+#     python3 check.py build/text.o path/to/expanded-osdsys.bin [functions.txt]
 #
 # Function addresses come from functions.txt ("name va size" per line,
-# hex).  The toolchain (ee-nm/ee-objcopy/ee-objdump) is taken from
-# $EETOOLS or /usr/local/sce/ee/gcc/bin.
+# hex) or the table named as the third argument.  The toolchain
+# (ee-nm/ee-objcopy/ee-objdump) is taken from $EETOOLS or
+# /usr/local/sce/ee/gcc/bin.
 
 import os
 import re
@@ -27,7 +28,9 @@ def main():
     img = open(image, "rb").read()
 
     funcs = {}
-    with open(os.path.join(os.path.dirname(__file__) or ".", "functions.txt")) as f:
+    ftab = sys.argv[3] if len(sys.argv) > 3 else \
+        os.path.join(os.path.dirname(__file__) or ".", "functions.txt")
+    with open(ftab) as f:
         for line in f:
             line = line.split("#")[0].split()
             if len(line) == 3:
@@ -40,11 +43,18 @@ def main():
         if m:
             syms[m.group(2)] = int(m.group(1), 16)
 
-    # relocation offsets -> type
+    # relocation offsets -> type; ONLY the .text section's records (a
+    # .rodata jump table's R_MIPS_32 entries alias low .text offsets
+    # and would silently mask real instructions)
     relocs = {}
+    sec = None
     for line in tool("ee-objdump", "-r", obj).splitlines():
-        m = re.match(r"([0-9a-f]+) (R_MIPS_\w+)", line)
+        m = re.match(r"RELOCATION RECORDS FOR \[(\S+)\]", line)
         if m:
+            sec = m.group(1)
+            continue
+        m = re.match(r"([0-9a-f]+) (R_MIPS_\w+)", line)
+        if m and sec == ".text":
             relocs[int(m.group(1), 16)] = m.group(2)
 
     with tempfile.NamedTemporaryFile(suffix=".bin") as tf:
@@ -70,6 +80,11 @@ def main():
         good = bad = 0
         lines = []
         for i in range(0, size, 4):
+            if soff + i + 4 > len(text):
+                bad += 1
+                lines.append("  %06x: real %08x  ours (past end of .text)"
+                    % (va + i, struct.unpack_from("<I", img, va - BASE + i)[0]))
+                continue
             m = mask(soff + i)
             mine, = struct.unpack_from("<I", text, soff + i)
             real, = struct.unpack_from("<I", img, va - BASE + i)

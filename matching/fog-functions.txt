@@ -1,0 +1,5 @@
+# name  va  size (bytes, hex) - bounds from osdsys_dump.idb
+InitFog        0x214f78 0x2c0
+DrawFog        0x215238 0x55c
+sub_215798     0x215798 0x284
+DrawIllegalFog 0x215a20 0x4f4

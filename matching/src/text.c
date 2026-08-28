@@ -13,12 +13,14 @@ int illegalTextAlpha;
 extern void DrawSCEText(int x, int y, int alpha);
 extern void DoIllegalText(void);
 
-/* 0x214c20 - MATCHES except two source-shape deltas (the alpha
- * register a1 vs a3, the min() slt/movz idiom) */
+/* 0x214c20 - MATCHES.  The min is a named limit variable conditionally
+ * overwritten - every ternary/min() phrasing canonicalizes to
+ * slti+movn instead of the ROM's li/slt/movz. */
 void
 DoSCEText(void)
 {
 	int alpha;
+	int lim;
 
 	if(openingPosition[2] > 18.0f) {
 		if(sceTextState == 0)
@@ -34,7 +36,10 @@ DoSCEText(void)
 		sceTextStep = 4;
 		sceTextState = -1;
 	}
-	DrawSCEText(0, 0, 112 < alpha ? 112 : alpha);
+	lim = 112;
+	if(alpha <= lim)
+		lim = alpha;
+	DrawSCEText(0, 0, lim);
 }
 
 /* 0x214f20 - MATCHES */
