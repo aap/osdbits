@@ -2137,20 +2137,178 @@ static float redFlareIntensity;	/* real: 0x2a7f98 */
 static int illegalSceneWarm;	/* real: 0x2a77e4, cleared by sub_219f08 */
 static int illegalFadeCounter;	/* real: 0x2a77e8 */
 
-/* real: flare_21A6D8 / flare_21AA50 / flare_21AF18 (with helpers
- * 0x219fb0 and FlareThing 0x21a300) - the pulsing red flare passes.
- * Not ported yet. */
+/* ==== the red flare: 7 spinning glow discs orbiting a centre at the
+ * top of the illegal scene (height 1160 - what the camera climbs
+ * toward), each drawn as two additive tri-fans (a small bright core
+ * and a large dim halo, coloured centre fading to black rim), plus
+ * billboard lens sprites (FLAR texture) at the innermost disc. ==== */
+static sceVu0FVECTOR flareRingSmall[7][17];	/* real: 0x327e00 - centre + 16-gon r 8 */
+static sceVu0FVECTOR flareRingLarge[7][17];	/* real: 0x328570 - r 28+i*8 */
+static sceVu0FVECTOR flareRot[7];		/* real: 0x328d20 - spin angles */
+static sceVu0FVECTOR flarePos[7];		/* real: 0x328d90 - disc centres */
+/* real: 0x328ce0/0x328d00, filled by sub_21a438: {centre r,g,b, ?,
+ * rim r,g,b, 128}, scaled by the flare intensity /64 at draw time */
+static int flareColorSmall[8] = { 128, 16, 40, 2056, 0, 0, 0, 128 };
+static int flareColorLarge[8] = { 48, 8, 12, 128, 0, 0, 0, 128 };
+
+/* real: flare_21A6D8 (0x21a6d8) - per-frame update: spin each disc
+ * (rates {0.2, 0.27, 0.35}*(i+1) on x/y/z, wrapped to +-pi) and orbit
+ * its centre with radius/phase (7-i)^2*pi/32 offset by a 201-frame
+ * global cycle. */
 static void
 flare_21A6D8(void)
 {
+	float phase, f, r;
+	int i;
+
+	phase = (float)(frameCount % 201)*0.03125f - PI;
+	for(i = 0; i < 7; i++) {
+		flareRot[i][0] += (i+1)*0.2f;	/* real: 0x2a7210 */
+		flareRot[i][2] += (i+1)*0.35f;	/* real: 0x2a7214 */
+		flareRot[i][1] += (i+1)*0.27f;	/* real: 0x2a7218 */
+		while(flareRot[i][0] > PI) flareRot[i][0] -= TAU;
+		while(flareRot[i][0] < -PI) flareRot[i][0] += TAU;
+		while(flareRot[i][1] > PI) flareRot[i][1] -= TAU;
+		while(flareRot[i][1] < -PI) flareRot[i][1] += TAU;
+		while(flareRot[i][2] > PI) flareRot[i][2] -= TAU;
+		while(flareRot[i][2] < -PI) flareRot[i][2] += TAU;
+		r = (float)((7-i)*(7-i))*PI*2.0f/64.0f;
+		f = r + phase;
+		while(f > PI) f -= TAU;
+		while(f < -PI) f += TAU;
+		flarePos[i][0] = cosf(f)*r*0.5f;
+		flarePos[i][1] = sinf(f)*r*0.5f;
+	}
 }
+
+/* real: 0x219fb0 - one billboard lens sprite: project disc 0's centre
+ * (with its own small 32-frame wobble written into flarePos[0]), pull
+ * it toward the screen centre by 'scale', draw a size*2 x size rect of
+ * the FLAR texture, additive with FIX alpha.  (The real leaves the
+ * rect colour's alpha byte uninitialized - FIX blending ignores it.) */
+static void
+DrawFlareSprite(int size, int alpha, int r, int g, int b, float scale)
+{
+	Rect rect, uv;
+	Color col;
+	float ph, q;
+	float *v;
+	int x, y;
+
+	vif1SetAlphaBlend(1, 0, alpha);
+	ph = (float)(49 + (frameCount & 0x1f))*0.1f;
+	while(ph > PI) ph -= TAU;
+	while(ph < -PI) ph += TAU;
+	flarePos[0][0] = cosf(ph)*49.0f*0.004f;
+	flarePos[0][1] = sinf(ph)*49.0f*0.004f;
+	sceVu0RotMatrix(sprMatrices->m9, sprMatrices->unit, flareRot[0]);
+	sceVu0TransMatrix(sprMatrices->worldMatrix, sprMatrices->m9, flarePos[0]);
+	sceVu0MulMatrix(sprMatrices->worldScreenMatrix,
+		sprMatrices->cameraScreenMatrix, sprMatrices->worldMatrix);
+	v = sprVertices->verts1[0];
+	sceVu0ApplyMatrix(v, sprMatrices->worldScreenMatrix, flareRingSmall[0][0]);
+	q = 1.0f/v[3];
+	x = (int)((v[0]*q - 2048.0f)*scale + screenW/2);
+	y = (int)((v[1]*q - 2048.0f)*scale + screenH/2);
+	rect.x = x - size;
+	rect.y = y - size/2;
+	rect.w = size*2;
+	rect.h = size;
+	uv.x = uv.y = 0;
+	uv.w = uv.h = 128;
+	col.r = r;
+	col.g = g;
+	col.b = b;
+	col.a = 128;
+	vif1SetTexRect(&rect, &uv, &col, 1, 0xFFFFFF);
+}
+
+/* real: FlareThing (0x21a300) - IDA's name: the lens-flare sprite
+ * stack: four dim haloes (sizes 112/170/256/448, reddish) and the big
+ * near-centred glow (size ~420+, alpha up to 255, scale 0.1). */
+static void
+FlareThing(int n)
+{
+	int m, a, size;
+
+	if(n > 8)
+		n = 8;
+	vif1SetTexture(&textures[TEXID_FLAR]);
+	m = n + 2;
+	DrawFlareSprite(112, m, 128, 64, 64, 1.0f);
+	DrawFlareSprite(170, m, 128, 64, 64, 1.0f);
+	DrawFlareSprite(256, m, 128, 64, 64, 1.0f);
+	DrawFlareSprite(448, m, 128, 64, 64, 1.0f);
+	a = n*3 + (int)(redFlareIntensity*0.5f);
+	if(a > 255) a = 255;
+	if(a < 0) a = 0;
+	size = redFlareIntensity*0.125f + 420.0f;
+	DrawFlareSprite(size, a, 128, 112, 96, 0.1f);
+}
+
+/* the shared body of flare_21AA50/flare_21AF18: 7 tri-fan discs
+ * (centre vertex in the centre colour, 16 rim vertices + closing wrap
+ * in the rim colour - black, so the discs fade out radially), additive
+ * FIX 128, colours scaled by intensity/64 and clamped to 255. */
+static void
+DrawFlareFans(sceVu0FVECTOR rings[7][17], int *colblk)
+{
+	int center[3], rim[3];
+	int i, k, c, vi;
+	float q;
+	u32 *v;
+
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 0, 128);
+	for(c = 0; c < 3; c++) {
+		center[c] = colblk[c]*redFlareIntensity*0.015625f;
+		if(center[c] > 255) center[c] = 255;
+		if(center[c] < 0) center[c] = 0;
+		rim[c] = colblk[4+c]*redFlareIntensity*0.015625f;
+		if(rim[c] > 255) rim[c] = 255;
+		if(rim[c] < 0) rim[c] = 0;
+	}
+	for(i = 0; i < 7; i++) {
+		vif1Begin();
+		sceVu0RotMatrix(sprMatrices->m9, sprMatrices->unit, flareRot[i]);
+		sceVu0TransMatrix(sprMatrices->worldMatrix, sprMatrices->m9, flarePos[i]);
+		sceVu0MulMatrix(sprMatrices->worldScreenMatrix,
+			sprMatrices->cameraScreenMatrix, sprMatrices->worldMatrix);
+		if(sceVu0ClipAll(clipMin, clipMax, sprMatrices->worldScreenMatrix, rings[i], 17)) {
+			vif1End();
+			continue;
+		}
+		pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRIFAN, 1, 0, 0, 1, 0, 1, 0, 0));
+		for(k = 0; k <= 17; k++) {
+			int *col = k == 0 ? center : rim;
+			vi = k == 17 ? 1 : k;
+			q = sprTransformVertex(sprVertices->verts2[2], rings[i][vi],
+				sprMatrices->worldScreenMatrix);
+			v = (u32*)sprVertices->verts2[2];
+			pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], 128, *(u32*)&q));
+			pktSetAD(SCE_GS_XYZF2, SCE_GS_SET_XYZF(v[0], v[1], v[2], 0));
+		}
+		vif1End();
+	}
+	/* Z-test restore is the callers' (the sprites draw with it off) */
+}
+
+/* real: flare_21AA50 - the small bright cores */
 static void
 flare_21AA50(void)
 {
+	DrawFlareFans(flareRingSmall, flareColorSmall);
+	vif1SetZTest(1);
 }
+
+/* real: flare_21AF18 - the large dim haloes, then the lens sprites at
+ * intensity/16 */
 static void
 flare_21AF18(void)
 {
+	DrawFlareFans(flareRingLarge, flareColorLarge);
+	FlareThing((int)(redFlareIntensity*0.0625f));
+	vif1SetZTest(1);
 }
 
 /* the illegal-disc fog: 128 red cloud particles, each an instance of
@@ -2391,7 +2549,7 @@ DoIllegalDisc(void)
 {
 	switch(sceneState) {
 	case 0:
-		InitIllegalScene();	// TODO: unused argument
+		InitIllegalScene();	/* real arg (fooOpeningType) is unused */
 		sceneState++;
 		// fall through
 	case 1:
@@ -3792,11 +3950,45 @@ DrawTowers(void)
  * and StartFrame.  sub_21b690 is ALSO called once from
  * OpeningInitLightsCubes (shared helper) - not wired in there yet. */
 
-/* real: sub_21a438 (0x21a438, 168 insns) - real callees are just cosf/sinf
- * (no stub needed), not investigated further. */
+/* real: sub_21a438 (0x21a438) - build the flare rings: for each of the
+ * 7 discs a 16-gon of radius 8 (flareRingSmall) and one of radius
+ * 28+i*8 (flareRingLarge), spin phase i*0.925*2pi/7, centre at
+ * {0,0,1160}.  (The colour blocks it also fills are the port's
+ * flareColorSmall/Large initializers.) */
 static void
 sub_21a438(void)
 {
+	int i, k;
+	float a, r;
+
+	for(i = 0; i < 7; i++) {
+		flareRingSmall[i][0][0] = 0.0f;
+		flareRingSmall[i][0][1] = 0.0f;
+		flareRingSmall[i][0][2] = 0.0f;
+		flareRingSmall[i][0][3] = 1.0f;
+		flareRingLarge[i][0][0] = 0.0f;
+		flareRingLarge[i][0][1] = 0.0f;
+		flareRingLarge[i][0][2] = 0.0f;
+		flareRingLarge[i][0][3] = 1.0f;
+		r = (float)(i*8) + 28.0f;
+		for(k = 0; k < 16; k++) {
+			a = k*PI*2.0f*0.0625f;
+			flareRingSmall[i][1+k][0] = cosf(a)*8.0f;
+			flareRingSmall[i][1+k][1] = sinf(a)*8.0f;
+			flareRingSmall[i][1+k][2] = 0.0f;
+			flareRingSmall[i][1+k][3] = 1.0f;
+			flareRingLarge[i][1+k][0] = cosf(a)*r;
+			flareRingLarge[i][1+k][1] = sinf(a)*r;
+			flareRingLarge[i][1+k][2] = 0.0f;
+			flareRingLarge[i][1+k][3] = 1.0f;
+		}
+		flarePos[i][0] = 0.0f;
+		flarePos[i][1] = 0.0f;
+		flarePos[i][2] = 1160.0f;
+		flareRot[i][0] = 0.0f;
+		flareRot[i][1] = 0.0f;
+		flareRot[i][2] = i*0.925f*PI*2.0f/7.0f;	/* real: *(0x2a7208) */
+	}
 }
 
 /* real: sub_215798 (0x215798) - init the illegal-disc fog: the shared

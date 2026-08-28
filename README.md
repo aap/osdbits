@@ -42,7 +42,7 @@ The ELF also runs under PCSX2.  Optional arguments
 - `mode` — `boot` (default): the real boot sequence — camera drift,
   fly-up, "Sony Computer Entertainment" text, scene end; `idle`: stay
   over the tower field forever; `illegal`: the illegal-disc scene
-  (work in progress, currently mostly dark).
+  (red clouds, flare, cubes, "please insert a ... disc" text).
 - the numeric args control the simulated memory-card boot history the
   tower field is generated from (`ngames 0` lights up the whole field;
   `framelimit` exits after N frames for scripted screenshots).
@@ -53,6 +53,7 @@ The ELF also runs under PCSX2.  Optional arguments
   camera state machine (fly-up and scene end) and the "Sony Computer
   Entertainment" text overlay — done and verified.  A few small init
   helpers remain stubs (see `osdbits/opening.c`).
-- Illegal-disc screen (red fog + cubes): camera path ported, scene
-  rendering not started.
+- Illegal-disc screen: ported (red cloud particles, the flare discs and
+  lens sprites, the red glass cubes, localized text, screen fades) —
+  not yet verified against the real ROM.
 - Menu/browser: notes only, see `docs/menu-rendering-reverse.md`.
