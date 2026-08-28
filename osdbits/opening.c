@@ -1290,17 +1290,24 @@ static struct {
 
 /* real 0x27b3f0: the base colour table is per-INSTANCE, not per-face -
  * cube_21BF88 slices it by its instance argument, so all six faces of
- * one cube share one colour.  Written by OpeningInitLightsCubes via
- * sub_21b690(1.8, -16, -16, 24) = {112,112,152} for every instance;
- * cube_21BC90 then copies it through sceVu0ClampVector(.., 0.0, 127.0),
- * so the blue the colour formulas actually see is 127 - the clamp is
- * folded into the constant here. */
-static const float cubeBaseColor[3] = { 112.0f, 112.0f, 127.0f };
+ * one cube share one colour.  Written by sub_21b690 (each caller's
+ * {x,y,z}+128: the opening's (1.8,-16,-16,24) gives {112,112,152}, the
+ * illegal init's (1.2,0,0,0) gives {128,128,128}); cube_21BC90 then
+ * copies it through sceVu0ClampVector(.., 0.0, 127.0) - that clamp is
+ * folded into the values sub_21b690 stores here. */
+static float cubeBaseColor[3] = { 112.0f, 112.0f, 127.0f };
+
+static void sub_21b690(float half, float x, float y, float z);
 
 static void
 InitCubes(void)
 {
 	int i;
+
+	/* real: OpeningInitLightsCubes' own sub_21b690 call - rebuilds the
+	 * corner table and base colour (the init-time sub_219cb8 leaves the
+	 * ILLEGAL values in them) */
+	sub_21b690(1.8f, -16.0f, -16.0f, 24.0f);
 
 	memset(&cubeStruct.base, 0, sizeof(cubeStruct.base));
 	cubeStruct.base[0][0] = 1.0f;
@@ -1542,6 +1549,28 @@ static CubePass cubePasses[10] = {
 	{ 0, TEXID_REF,  1, 8,  64, 0, 0, 3, 2, 0.5f,      0,    0 },
 };
 
+/* DrawIllegalCube's pass stack (real: same builder code with the
+ * constant pool at 0x2a71b8 instead of 0x2a7138 and the 0x2192c0
+ * colour/ST callback): B798 zoom scale 0.8 instead of 1.0, the
+ * env-map offsets (passes 2/4/7/9) zero, colour mode 4 (the red
+ * variant), everything else identical. */
+static CubePass illegalCubePasses[10] = {
+	{ 1, -2,         0, 4, 122, 1, 1, 2, 0, 0.0f,      0.8f, 1 },
+	{ 1, TEXID_BLPR, 1, 5, 128, 0, 0, 0, 1, -0.00375f, 0,    1 },
+	{ 1, TEXID_REF,  1, 8,  42, 0, 0, 4, 2, 0.0f,      0,    1 },
+	{ 1, TEXID_BLP,  1, 5, 128, 0, 0, 0, 1, 0.00375f,  0,    1 },
+	{ 1, TEXID_REF,  1, 8,  42, 0, 0, 4, 2, 0.0f,      0,    1 },
+	{ 0, -3,         0, 4, 240, 1, 1, 2, 0, -0.084f,   0.8f, 0 },
+	{ 0, TEXID_BLPR, 1, 5, 128, 0, 0, 0, 1, -0.0075f,  0,    0 },
+	{ 0, TEXID_REF,  1, 8,  64, 0, 0, 4, 2, 0.0f,      0,    0 },
+	{ 0, TEXID_BLP,  1, 5, 128, 0, 0, 0, 1, 0.0075f,   0,    0 },
+	{ 0, TEXID_REF,  1, 8,  64, 0, 0, 4, 2, 0.0f,      0,    0 },
+};
+
+/* set while DrawIllegalCube runs - the only behavioural switch not in
+ * the pass structs (the ST clamp) */
+static int illegalCubeDraw;
+
 /* real: CubeTextureFuckery (0x21c400) - set the pass's render target,
  * texture source and blend. */
 static void
@@ -1641,6 +1670,16 @@ CubeVertexColor(CubePass *p, int face, int k, int rgb[3])
 		b = cubeBaseColor[2]*t*s;
 		break;
 	}
+	case 4: {
+		/* the illegal cube's case-3 variant (real callback 0x2192c0,
+		 * coefs 0x2a71a0..0x2a71b4): per-channel e*0.6 + 0.2 with no
+		 * 0.4 scale, and green/blue divided by 3 - the red tint */
+		float t = e*0.6f + 0.2f;
+		r = cubeBaseColor[0]*t*s;
+		g = cubeBaseColor[1]*t*s/3.0f;
+		b = cubeBaseColor[2]*t*s/3.0f;
+		break;
+	}
 	}
 	rgb[0] = (int)clamp(r, 0.0f, 128.0f);
 	rgb[1] = (int)clamp(g, 0.0f, 128.0f);
@@ -1678,8 +1717,12 @@ DrawCubePass(CubePass *p)
 				float half = (p->group == 0 && stableEvenOddField) ? 0.5f : 0.0f;
 				s = uv[k][0]/(float)(1<<GetTexExponent(screenW));
 				t = (uv[k][1] - half)/(float)(1<<GetTexExponent(screenH));
-				s = clamp(s, 0.0f, (float)screenW/(float)(1<<GetTexExponent(screenW)));
-				t = clamp(t, 0.0f, (float)screenH/(float)(1<<GetTexExponent(screenH)));
+				/* the illegal cube's callback (0x2192c0) has no
+				 * clamp here; the opening's (0x216f88) does */
+				if(!illegalCubeDraw) {
+					s = clamp(s, 0.0f, (float)screenW/(float)(1<<GetTexExponent(screenW)));
+					t = clamp(t, 0.0f, (float)screenH/(float)(1<<GetTexExponent(screenH)));
+				}
 				qf = 1.0f;
 			} else {
 				qf = cubeStruct.cornerQ[vi];
@@ -1891,12 +1934,13 @@ DrawToExtraBuf2(void)
  * this frame's save), temporarily disables Z-test and Z-write,
  * stretches the HALF-WIDTH capture back out to a FULL-WIDTH dest rect
  * (the exact inverse of DrawToExtraBuf2's squeeze), and blends it onto
- * the screen via vif1SetAlphaBlend(1,2,80) - a deliberate translucent
+ * the screen via vif1SetAlphaBlend(1,2,fix) - a deliberate translucent
  * composite that reintroduces a fading copy of recent frames every
  * frame: the radial-brightness-falloff mechanism.  Z-test/write
- * restored before returning. */
+ * restored before returning.  The real signature carries the blend
+ * parameters; the opening passes fix 80, the illegal scene 112. */
 static void
-DrawExtraBuf2(void)
+DrawExtraBuf2(int fix)
 {
 #if EXTRABUF_FEEDBACK
 	Rect full, half;
@@ -1922,7 +1966,7 @@ DrawExtraBuf2(void)
 	vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(src, screenW/64, SCE_GS_PSMCT24,
 			tw, th, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
 	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
-	vif1SetAlphaBlend(1, 2, 80);
+	vif1SetAlphaBlend(1, 2, fix);
 	vif1SetTexRect(&full, &half, &gray, 1, 0xFFFFFF);
 
 	vif1SetZWrite(1);
@@ -1930,46 +1974,118 @@ DrawExtraBuf2(void)
 #endif
 }
 
-/* real: sub_2144c0 (0x2144c0, 179 insns) - real callees are all
- * already-ported vif1Set* primitives (XYOffset/ZWrite/ZTest/AlphaBlend/
- * AD/Framebuffer/TexRect) - looks like another buffer-blit, not
- * investigated which one. */
+/* real: sub_2144c0 (0x2144c0) - the fly-up motion blur: n feedback
+ * passes bouncing the frame between the screen and the cube working
+ * buffer (extraBuf2/0x279f10): screen -> buffer squeezed to 7/8 (minus
+ * i*(n-1) more pixels, anchored at the XYOFFSET(0) origin), buffer ->
+ * screen stretched back.  Blend is PABE-gated (vif1SetAlphaBlend(0,0,0):
+ * pixels with the framebuffer-alpha MSB - the FBA-marked cube pixels -
+ * keep Cd, all others take the copy).  The real screen TBP comes from
+ * the frame parity (0 -> w*h/64 blocks, else 0); the port uses its
+ * draw-env idiom.  n=0 (the illegal text's call) only sets up and
+ * restores state. */
 static void
-sub_2144c0(void)
+sub_2144c0(int n, int frame, int field)
 {
+	Rect full, shrink;
+	Color gray = { 128, 128, 128, 128 };	/* real: 0x2a42d8 */
+	u32 screenTbp;
+	int i, tw, th;
+
+	full.x = full.y = 0;
+	full.w = screenW;
+	full.h = screenH;
+	screenTbp = (frame == 0 ? &db.draw0 : &db.draw1)->frame1.FBP*32;
+	tw = GetTexExponent(screenW);	/* real: hardcoded 10/8 in TEX0 */
+	th = GetTexExponent(screenH);
+
+	vif1SetXYOffset(0, field);
+	vif1SetZWrite(0);
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(0, 0, 0);
+	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	for(i = 0; i < n; i++) {
+		shrink.x = shrink.y = 0;
+		shrink.w = screenW*7/8 - 1 - i*(n-1);
+		shrink.h = screenH*7/8 - 1 - i*(n-1);
+		/* screen -> working buffer, squeezed */
+		vif1SetFramebuffer(extraBuf2/32, SCE_GS_PSMCT32, screenW, screenH, 1);
+		vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(screenTbp, screenW/64, SCE_GS_PSMCT32,
+				tw, th, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+		vif1SetTexRect(&shrink, &full, &gray, 0, 0xFFFFFF);
+		/* working buffer -> screen, stretched back out */
+		vif1SetFramebuffer(screenTbp/32, SCE_GS_PSMCT32, screenW, screenH, 1);
+		vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf2, screenW/64, SCE_GS_PSMCT32,
+				tw, th, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+		vif1SetTexRect(&full, &shrink, &gray, 0, 0xFFFFFF);
+	}
+	vif1SetZTest(1);
+	vif1SetZWrite(1);
+	vif1SetXYOffset(1, field);
 }
 
-/* real: sub_218b20 (0x218b20, 43 insns) - one of the two "trail functions"
- * at the end of DrawOpeningScene, not investigated beyond its one real
- * callee. */
+/* real: sub_218b20 (0x218b20) - drive the fly-up motion blur: strength
+ * (z-56)/12 clamped to 3. */
 static void
 sub_218b20(void)
 {
-	sub_2144c0();
+	int n;
+
+	n = 0;
+	if(position[2] > 56.0f) {
+		n = (position[2] - 56.0f)/12.0f;
+		if(n > 3) n = 3;
+		if(n < 0) n = 0;
+	}
+	if(n != 0)
+		sub_2144c0(n, stableEvenOddFrame, stableEvenOddField);
 }
 
-/* real: DrawSomeSprite2 (0x214918, 82 insns) - IDA's own name. Real
- * callees are memset + already-ported vif1SetZTest/ZWrite/AlphaBlend/
- * FlatRect. */
+/* real: DrawSomeSprite2 (0x214918) - IDA's name; really the full-screen
+ * fade overlay: a screen-size flat rect ('B' = black, 'W' = white -
+ * colour block 0x2a4308, rect template 0x2a42f8) source-alpha-blended
+ * at the given alpha, clamped to 128. */
 static void
-DrawSomeSprite2(void)
+DrawSomeSprite2(const char *mode, int alpha)
 {
+	Rect r;
+	Color col;
+
+	r.x = r.y = 0;
+	r.w = screenW;
+	r.h = screenH;
+	vif1SetZTest(0);
+	vif1SetZWrite(0);
+	vif1SetAlphaBlend(1, 4, 0);
+	if(alpha > 128)
+		alpha = 128;
+	if(mode[0] == 'B') {
+		col.r = col.g = col.b = 0;
+		col.a = alpha;
+		vif1SetFlatRect(&r, &col, 1, 0xFFFFFF);
+	} else if(mode[0] == 'W') {
+		col.r = col.g = col.b = 255;
+		col.a = alpha;
+		vif1SetFlatRect(&r, &col, 1, 0xFFFFFF);
+	}
+	vif1SetZWrite(1);
+	vif1SetZTest(1);
 }
 
-/* real: fp_25A368 (0x25a368, 38 insns) - IDA's own name (looks float-
- * formatting-related, calls __unpack_f), not investigated. */
-static void
-fp_25A368(void)
-{
-}
-
-/* real: sub_218bd0 (0x218bd0, 46 insns) - the other "trail function",
- * DrawOpeningScene's real tail call. */
+/* real: sub_218bd0 (0x218bd0) - the opening's fade to black (string
+ * "B" at 0x2a77c8): full cover for the first two frames (boot-in),
+ * fade out at (z-72)*4 during the fly-up, full black from z 320.
+ * (0x25a368 in the real code is just float->int, not a callee of
+ * interest.) */
 static void
 sub_218bd0(void)
 {
-	DrawSomeSprite2();
-	fp_25A368();
+	if(frameCount < 2)
+		DrawSomeSprite2("B", 128);
+	if(position[2] > 72.0f)
+		DrawSomeSprite2("B", (position[2] - 72.0f)*128.0f*0.03125f);
+	if(position[2] >= 320.0f)
+		DrawSomeSprite2("B", 128);
 }
 
 static void
@@ -1984,7 +2100,7 @@ DrawOpeningScene(void)
 
 	DrawTowers();
 
-	DrawExtraBuf2();
+	DrawExtraBuf2(80);
 	DrawToExtraBuf2();
 
 	DrawFog();
@@ -2017,18 +2133,257 @@ DoOpening(void)
 	}
 }
 
-/* real: OpeningInitIllegalScene (retail ~0x21b570) - only the camera
- * part (InitIllegalDisc) is ported so far; the scene setup itself (red
- * fog, cube/texture init) is not. */
+static float redFlareIntensity;	/* real: 0x2a7f98 */
+static int illegalSceneWarm;	/* real: 0x2a77e4, cleared by sub_219f08 */
+static int illegalFadeCounter;	/* real: 0x2a77e8 */
+
+/* real: flare_21A6D8 / flare_21AA50 / flare_21AF18 (with helpers
+ * 0x219fb0 and FlareThing 0x21a300) - the pulsing red flare passes.
+ * Not ported yet. */
+static void
+flare_21A6D8(void)
+{
+}
+static void
+flare_21AA50(void)
+{
+}
+static void
+flare_21AF18(void)
+{
+}
+
+/* the illegal-disc fog: 128 red cloud particles, each an instance of
+ * one shared 3x3-vertex patch (30x30 units, only the centre vertex
+ * coloured - a soft blob), streaming down past the rising camera and
+ * respawning 805 above it.  Initialized by sub_215798. */
+static sceVu0FVECTOR illegalFogVerts[9];	/* real: 0x3227d0 */
+static sceVu0IVECTOR illegalFogColors[9];	/* real: 0x322860 */
+static sceVu0FVECTOR illegalFogPos[128];	/* real: 0x3228f0 */
+static sceVu0FVECTOR illegalFogRot[128];	/* real: 0x3230f0 */
+static int illegalFogState[128];		/* real: 0x3238f0, zeroed in
+						 * sub_215798, so far unseen
+						 * elsewhere */
+
+/* real: 0x27a050 - the patch's 4 tri-strips over the 3x3 vertices */
+static int fogStrips[4][4] = {
+	{ 0, 1, 3, 4 }, { 1, 2, 4, 5 }, { 3, 4, 6, 7 }, { 4, 5, 7, 8 }
+};
+/* real: 0x27a090 */
+static float fogUV[9][2] = {
+	{ 0.0f, 0.0f }, { 0.5f, 0.0f }, { 1.0f, 0.0f },
+	{ 0.0f, 0.5f }, { 0.5f, 0.5f }, { 1.0f, 0.5f },
+	{ 0.0f, 1.0f }, { 0.5f, 1.0f }, { 1.0f, 1.0f }
+};
+
+/* real: DrawIllegalFog (0x215a20).  Per particle and frame: jitter the
+ * roll by 0.0001*(i+1) (sign flips with the frame parity), fall
+ * trunc((i+1)*0.02 + 1.2) units, fade in over the first 192 units
+ * below the spawn plane and out over the last 192 above the camera
+ * (peak alpha 64), respawn 805 above the camera once fallen 32 below
+ * it.  Additive blend, FOG0 texture. */
+static void
+DrawIllegalFog(void)
+{
+	float globalAlpha, af, d, rj, q, s, t;
+	int i, j, k, vi, alpha;
+	int *col;
+
+	/* global fade-in below height 672 (the scene starts there, so
+	 * full in practice; real constant 550 at 0x2a7098) */
+	if(position[2] < 672.0f) {
+		globalAlpha = (550.0f - (672.0f - position[2]))*128.0f/550.0f*4.0f;
+		if(globalAlpha > 128.0f)
+			globalAlpha = 128.0f;
+	} else
+		globalAlpha = 128.0f;
+
+	vif1SetZTest(0);
+	vif1SetZWrite(0);
+	vif1SetTexture(&textures[TEXID_FOG0]);
+
+	for(i = 0; i < 128; i++) {
+		rj = (i+1)*0.0001f;
+		if((frameCount & 1) == 0)
+			rj = -rj;
+		illegalFogRot[i][2] += rj;
+		while(illegalFogRot[i][2] > PI)
+			illegalFogRot[i][2] -= TAU;
+		while(illegalFogRot[i][2] < -PI)
+			illegalFogRot[i][2] += TAU;
+
+		illegalFogPos[i][2] -= (int)((i+1)*0.02f + 1.2f);
+		d = (position[2] + 805.0f) - illegalFogPos[i][2];
+		if(d < 192.0f) {
+			if(d < 0.0f)
+				continue;
+			af = d*64.0f/192.0f;
+		} else {
+			d = illegalFogPos[i][2] - position[2] - 32.0f;
+			if(d < 192.0f) {
+				if(d < 0.0f) {
+					illegalFogPos[i][2] = position[2] + 805.0f;
+					continue;
+				}
+				af = d*64.0f/192.0f;
+			} else
+				af = 64.0f;
+		}
+		alpha = af*globalAlpha*0.0078125f;
+
+		sceVu0RotMatrix(sprMatrices->m9, sprMatrices->unit, illegalFogRot[i]);
+		sceVu0TransMatrix(sprMatrices->worldMatrix, sprMatrices->m9, illegalFogPos[i]);
+		sceVu0MulMatrix(sprMatrices->worldScreenMatrix,
+			sprMatrices->cameraScreenMatrix, sprMatrices->worldMatrix);
+		if(sceVu0ClipAll(clipMin, clipMax, sprMatrices->worldScreenMatrix, illegalFogVerts, 8))
+			continue;
+
+		vif1Begin();
+		pktSetAlphaBlend(1, 0, alpha);
+		for(j = 0; j < 4; j++) {
+			pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 1, 1, 0, 1, 0, 0, 0, 0));
+			for(k = 0; k < 4; k++) {
+				vi = fogStrips[j][k];
+				q = sprTransformVertex(sprVertices->verts2[0], illegalFogVerts[vi], sprMatrices->worldScreenMatrix);
+				col = illegalFogColors[vi];
+				pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], 128, *(u32*)&q));
+				s = fogUV[vi][0]*q;
+				t = fogUV[vi][1]*q;
+				pktSetAD(SCE_GS_ST, SCE_GS_SET_ST(*(u32*)&s, *(u32*)&t));
+				pktSetAD(SCE_GS_XYZF2, SCE_GS_SET_XYZF(sprVertices->verts2[0][0],
+					sprVertices->verts2[0][1], sprVertices->verts2[0][2], 0));
+			}
+		}
+		vif1End();
+	}
+	vif1SetZWrite(1);
+	vif1SetZTest(1);
+}
+
+/* real: DrawIllegalCube (0x219748) - DrawCube with the illegal pass
+ * stack, Z-WRITE ON (the opening sets the interlace XYOffset here
+ * instead), and no per-cube Z-test restore (DrawIllegalCubes does it
+ * once after the loop). */
+static void
+DrawIllegalCube(int instance)
+{
+	int k;
+
+	if(CubeTransformAndClip(instance))
+		return;
+
+	CubeCaptureBuffer();
+
+	vif1SetZWrite(1);
+	vif1SetZTest(0);
+
+	illegalCubeDraw = 1;
+	for(k = 0; k < 10; k++)
+		DrawCubePass(&illegalCubePasses[k]);
+	illegalCubeDraw = 0;
+}
+
+/* real: DrawIllegalCubes (0x219ea8) - 5 cube instances with Z-test off
+ * (no DrawLights, no CLAMP change, unlike the opening's cube pass). */
+static void
+DrawIllegalCubes(void)
+{
+	int i;
+
+	sceVu0Normalize(sprVertices->verts1[3], fwdDir);
+	vif1SetZTest(0);
+	for(i = 0; i < 5; i++)
+		DrawIllegalCube(i);
+	vif1SetZTest(1);
+}
+
+/* real: DrawRedFlare (0x21b4c8) - flare intensity from the camera
+ * height ((z-420)*128/740 * 0.6, constant at 0x2a7258), the three
+ * flare passes with Z-write off, then the same frame-feedback
+ * composite as the opening but at blend fix 112. */
+static void
+DrawRedFlare(void)
+{
+	redFlareIntensity = (740.0f - (1160.0f - position[2]))*128.0f/740.0f*0.6f;
+	vif1SetZWrite(0);
+	flare_21A6D8();
+	flare_21AA50();
+	flare_21AF18();
+	vif1SetZWrite(1);
+	DrawExtraBuf2(112);	/* real: (1, 2, 112, 0xffffff, 128, field) */
+	DrawToExtraBuf2();
+}
+
+/* real: 0x21b398 (tail of DrawIllegalScene) - the scene's screen fades
+ * via the DrawSomeSprite2 black overlay: fade from black rising
+ * 672->800, fade to black 1128->1160, and a +1/frame fade-out once
+ * openingEndFlag is set. */
+static void
+DrawIllegalFades(void)
+{
+	float z, f;
+
+	z = position[2];
+	if(z < 800.0f) {
+		DrawSomeSprite2("B", 128 - (int)(z - 672.0f));
+		illegalFadeCounter = 0;
+	} else if(z > 1128.0f) {
+		f = (32.0f - (1160.0f - z))*4.0f;
+		if(f < 0.0f)
+			f = 0.0f;
+		else if(f > 128.0f)
+			f = 128.0f;
+		DrawSomeSprite2("B", f);
+		illegalFadeCounter = 0;
+	}
+	if(openingEndFlag) {
+		illegalFadeCounter++;
+		if(illegalFadeCounter > 128)
+			illegalFadeCounter = 128;
+		DrawSomeSprite2("B", illegalFadeCounter);
+	}
+}
+
+/* real: InitIllegalScene (0x21b570, arg fooOpeningType unused) -
+ * camera and lights for the red scene, then prime the frame-save
+ * buffer.  InitIllegalDisc puts the camera at height 672 (the 320
+ * written first is overridden, real does the same). */
 static void
 InitIllegalScene(void)
 {
+	position[0] = 0.0f;
+	position[1] = 0.0f;
+	position[2] = 320.0f;
+	position[3] = 0.0f;
+	fwdDir[0] = 0.0f;
+	fwdDir[1] = -0.03f;	/* real: *(0x2a725c) */
+	fwdDir[2] = 1.0f;
+	fwdDir[3] = 1.0f;
+	upDir[0] = 0.0f;
+	upDir[1] = 1.0f;
+	upDir[2] = 0.0f;
+	upDir[3] = 1.0f;
+	rotation = 0.0f;
 	InitIllegalDisc();
+	light1[0] = 0.0f;  light1[1] = 0.0f;  light1[2] = -1.0f; light1[3] = 0.0f;
+	light2[0] = 0.5f;  light2[1] = 0.5f;  light2[2] = 0.0f;  light2[3] = 0.0f;
+	light3[0] = -0.5f; light3[1] = -0.5f; light3[2] = 0.0f;  light3[3] = 0.0f;
+	DrawToExtraBuf2();
 }
 
+/* real: DrawIllegalScene (0x21b648) - skip the very first frame (lets
+ * the init's buffer stamp settle), then flare, red fog, cubes, fades. */
 static void
 DrawIllegalScene(void)
 {
+	if(illegalSceneWarm == 0) {
+		illegalSceneWarm = 1;
+		return;
+	}
+	DrawRedFlare();
+	DrawIllegalFog();
+	DrawIllegalCubes();
+	DrawIllegalFades();
 }
 
 static void
@@ -2121,13 +2476,65 @@ DoSCEText(void)
 	DrawSCEText(min(alpha, 112));
 }
 
-/* real: DoIllegalText (0x214e60) - the illegal-disc counterpart: arms
- * past height 800, drives DrawIllegalText (0x214cb0) and the
- * sub_2144c0 blit.  Not ported yet; inert in the normal opening
- * (initTextShit leaves it disarmed). */
+/* real: DrawIllegalText (0x214cb0, args (0,0,0,alpha)) - the localized
+ * "Please insert a PlayStation or PlayStation 2 format disc" texture
+ * (TEXOPNG* by GetLanguage()), additive blend (mode 5) with RGB =
+ * fade level, at {64,88,512,64} (real: 0x2a4578), uv {0,0,512,128}
+ * (0x2a4588); PAL scales y/h by the screenAY ratio (real doubles at
+ * 0x2a4598/0x2a45a0). */
+static void
+DrawIllegalText(int alpha)
+{
+	Rect xy, uv;
+	Color col;
+
+	xy.x = 64;
+	xy.y = 88;
+	xy.w = 512;
+	xy.h = 64;
+	uv.x = 0;
+	uv.y = 0;
+	uv.w = 512;
+	uv.h = 128;
+	col.r = col.g = col.b = alpha;
+	col.a = 128;
+	if(openingType != 1)
+		return;
+	vif1SetXYOffset(1, stableEvenOddField);
+	vif1SetTexture(&textures[TEXID_PNG + GetLanguage()]);
+	if(IsPAL()) {
+		xy.y = xy.y * 0.52627105 / 0.457627;
+		xy.h = xy.h * 0.52627105 / 0.457627;
+	}
+	vif1SetAlphaBlend(1, 5, alpha);
+	vif1Begin();
+	pktSetTexRect(&xy, &uv, &col, 1, 0xFFFFFF);
+	vif1End();
+}
+
+/* real: DoIllegalText (0x214e60) - arm past height 800; the fade level
+ * ramps +1/frame, then -1/frame once openingEndFlag is set, drawn
+ * clamped to 112.  Also ticks the n=0 sub_2144c0 state churn.  Inert
+ * in the normal opening (initTextShit leaves it disarmed). */
 static void
 DoIllegalText(void)
 {
+	int alpha;
+
+	if(position[2] > 800.0f)
+		if(illegalTextState == 0)
+			illegalTextState = 1;
+	if(illegalTextState != 1)
+		return;
+	sub_2144c0(0, frameCount & 1, stableEvenOddField);
+	alpha = illegalTextAlpha;
+	if(openingEndFlag == 0)
+		illegalTextAlpha = ++alpha;
+	else if(alpha > 0)
+		illegalTextAlpha = --alpha;
+	alpha = min(alpha, 112);
+	illegalTextAlpha = alpha;
+	DrawIllegalText(alpha);
 }
 
 /* real: DoText (0x214f58) */
@@ -3392,27 +3799,104 @@ sub_21a438(void)
 {
 }
 
-/* real: sub_215798 (0x215798, 161 insns) - makes 4 unconditional rand()
- * calls; lightsSeed's phase depends on rand() call COUNT, so keep them
- * even though the rest of the function isn't traced. */
+/* real: sub_215798 (0x215798) - init the illegal-disc fog: the shared
+ * 3x3 patch (30x30 units; only the centre vertex is lit, with a random
+ * warm red - r = 64+rand%64, g = b = r*96/128) and the 128 particles
+ * (x,y = (rand%4800-2400)*0.01, z = rand%805+477, rotation zeroed).
+ * Runs for BOTH opening types.  (An earlier note said "4 rand calls" -
+ * that was the call SITES; 3 of them are in the particle loop, so the
+ * real stream advance is 1+3*128.) */
 static void
 sub_215798(void)
 {
-	rand(); rand(); rand(); rand();
+	int i, j, c;
+	float *v;
+	int *col;
+
+	for(j = 0; j < 3; j++)
+		for(i = 0; i < 3; i++) {
+			v = illegalFogVerts[j*3+i];
+			v[0] = (i-1)*15.0f;
+			v[1] = (j-1)*15.0f;
+			v[2] = 0.0f;
+			v[3] = 1.0f;
+		}
+	for(j = 0; j < 3; j++)
+		for(i = 0; i < 3; i++) {
+			col = illegalFogColors[j*3+i];
+			c = 0;
+			if(j == 1 && i == 1)
+				c = rand()%64 + 64;
+			col[0] = c;
+			col[3] = 128;
+			col[1] = col[2] = c*96/128;
+		}
+	for(i = 0; i < 128; i++) {
+		illegalFogPos[i][0] = (rand()%4800 - 2400)*0.01f;
+		illegalFogPos[i][1] = (rand()%4800 - 2400)*0.01f;
+		illegalFogPos[i][3] = 0.0f;
+		illegalFogRot[i][0] = 0.0f;
+		illegalFogRot[i][1] = 0.0f;
+		illegalFogRot[i][2] = 0.0f;
+		illegalFogRot[i][3] = 1.0f;
+		illegalFogState[i] = 0;
+		illegalFogPos[i][2] = rand()%805 + 477;
+	}
 }
 
-/* real: sub_21b690 (0x21b690, 65 insns) - shared with OpeningInitLightsCubes
- * (see comment above), not investigated. */
+/* real: sub_21b690 (0x21b690) - build the cube corner table (0x27b370)
+ * with the given half-extent and set all five instances' base colour
+ * (0x27b3f0) to {x,y,z}+128 (stored here with cube_21BC90's 0..127
+ * clamp folded in, see cubeBaseColor). */
 static void
-sub_21b690(void)
+sub_21b690(float half, float x, float y, float z)
 {
+	int i;
+
+	for(i = 0; i < 8; i++) {
+		cubeCorners[i][0] = i & 1 ? half : -half;
+		cubeCorners[i][1] = i & 2 ? half : -half;
+		cubeCorners[i][2] = i & 4 ? half : -half;
+		cubeCorners[i][3] = 1.0f;
+	}
+	cubeBaseColor[0] = clamp(x + 128.0f, 0.0f, 127.0f);
+	cubeBaseColor[1] = clamp(y + 128.0f, 0.0f, 127.0f);
+	cubeBaseColor[2] = clamp(z + 128.0f, 0.0f, 127.0f);
 }
 
-/* real: sub_219cb8 (0x219cb8, 123 insns) - real callee is sub_21b690 above. */
+/* real: sub_219cb8 (0x219cb8) - place the five cubes for the ILLEGAL
+ * scene (runs at init for both opening types; the normal scene then
+ * overwrites everything in InitLightsCubes): corners/colour from
+ * sub_21b690(1.2, 0,0,0), anchors from the shared seed table hanging
+ * in the 823..1113 height band the camera climbs through, rates and
+ * start angles from small index-derived factors (constants at
+ * 0x2a71d4..0x2a71e4).  The real also selects the illegal colour/ST
+ * callback (0x2192c0 into 0x2a7808) - the port keys that off the
+ * illegal pass table instead. */
 static void
 sub_219cb8(void)
 {
-	sub_21b690();
+	int i;
+	float f;
+
+	sub_21b690(1.2f, 0.0f, 0.0f, 0.0f);
+	for(i = 0; i < 5; i++) {
+		f = (i-2)*0.8f;
+		if(f == 0.0f)
+			f = 0.9f;
+		cubeAnchor[i][0] = cubeSeedTable[i][0];
+		cubeAnchor[i][1] = cubeSeedTable[i][1];
+		cubeAnchor[i][2] = (cubeSeedTable[i][2] - 2.5f)*128.0f + 800.0f - 12.0f;
+		cubeAnchor[i][3] = 0.0f;
+		cubeRate[i][0] = f*((i*2)%9)*0.25f;
+		cubeRate[i][1] = f*((i*2)&7)/5.0f;
+		cubeRate[i][2] = f*((i*2)%7)/6.0f;
+		cubeRate[i][3] = f*((i*2)%9)*0.25f;
+		cubeOutB[i][0] = 0.004f/f;
+		cubeOutB[i][1] = f*0.003f;
+		cubeOutB[i][2] = f/800.0f + 0.002f;
+		cubeOutB[i][3] = 0.0f;
+	}
 }
 
 /* real: sub_219f08 (0x219f08, 14 insns) - InitOpening's real call, wraps
@@ -3423,8 +3907,7 @@ sub_219f08(void)
 	sub_21a438();
 	sub_215798();
 	sub_219cb8();
-	/* the real tail also clears these (and gp-30860 = 0x2a77e4,
-	 * purpose unknown) */
+	illegalSceneWarm = 0;
 	openingEndFlag = 0;
 	openingEndFrame = 0;
 }
