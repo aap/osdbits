@@ -1272,7 +1272,6 @@ static sceVu0FVECTOR cubeColor2 = { 0.5f, 0.5f, 0.5f, 0.0f };
 static sceVu0FVECTOR cubeColorBase = { 0.2f, 0.2f, 0.2f, 1.0f };
 
 static struct {
-	sceVu0FMATRIX base;
 	sceVu0FMATRIX rotated;
 	sceVu0FMATRIX translated;
 	sceVu0FMATRIX transformed;
@@ -1308,12 +1307,6 @@ InitCubes(void)
 	 * corner table and base colour (the init-time sub_219cb8 leaves the
 	 * ILLEGAL values in them) */
 	sub_21b690(1.8f, -16.0f, -16.0f, 24.0f);
-
-	memset(&cubeStruct.base, 0, sizeof(cubeStruct.base));
-	cubeStruct.base[0][0] = 1.0f;
-	cubeStruct.base[1][1] = 1.0f;
-	cubeStruct.base[2][2] = 1.0f;
-	cubeStruct.base[3][3] = 1.0f;
 
 	sceVu0LightColorMatrix(cubeStruct.lightColor,
 			cubeColorAmbient, cubeColor1, cubeColor2, cubeColorBase);
@@ -1466,7 +1459,9 @@ CubeTransformAndClip(int instance)
 			cubeOutB[instance][k] += TAU;
 	}
 
-	sceVu0RotMatrix(cubeStruct.rotated, cubeStruct.base, cubeOutB[instance]);
+	/* real cube_21BF88 rotates from sprMatrices->unit (always valid) -
+	 * the illegal scene never runs InitCubes, so no per-scene base */
+	sceVu0RotMatrix(cubeStruct.rotated, sprMatrices->unit, cubeOutB[instance]);
 	sceVu0TransMatrix(cubeStruct.translated, cubeStruct.rotated, cubeAnchor[instance]);
 	sceVu0MulMatrix(cubeStruct.transformed, sprMatrices->cameraScreenMatrix, cubeStruct.translated);
 
@@ -4130,6 +4125,13 @@ Init(void)
 	/* the real fooOpeningType comes from systemState (0x1f05e8) == 4 =
 	 * illegal disc, set at 0x211f90 */
 	fooOpeningType = openingMode == MODE_ILLEGAL ? 1 : 0;
+	if(openingMode == MODE_ILLEGAL)
+		/* a boot param in state 6's "do nothing" set: the real illegal
+		 * screen idles forever with no end fade (confirmed against a
+		 * real GS dump - no endFlag activity); which exact param an
+		 * illegal boot carries is unverified, any of 101-105/113/116
+		 * behaves this way */
+		osdBootParam = 101;
 	openingType = nextOpeningType = fooOpeningType;
 
 	/* real InitOpening order: OpeningInitRender, OpeningInitAnimation,
