@@ -53,6 +53,13 @@ SwapBuffers(void)
 		2048, 2048, evenOddField);
 	sceGsSwapDBuff(UNCACHED(&db), evenOddFrame);
 	sceGsPutDrawEnv(evenOddFrame==0 ? UNCACHED(&db.giftag0) : UNCACHED(&db.giftag1));
+	/* drain the draw env + CLEAR before drawStartSema lets the frame
+	 * draw: PutDrawEnv goes down PATH3, the LOWEST-priority GIF path,
+	 * which yields at packet boundaries - on real hardware the frame's
+	 * first chains (PATH1/2) overtake it, so the clear lands late and
+	 * erases early draws.  (Emulators that complete DMA synchronously
+	 * never show this.) */
+	sceGsSyncPath(0, 0);
 }
 
 void
@@ -107,20 +114,43 @@ StartFrame(void)
 	evenOddField = !((DGET_GS_CSR() >> GS_CSR_FIELD_O) & 1);
 	sceGsSetHalfOffset(evenOddFrame==0 ? &db.draw0 : &db.draw1, 2048, 2048, evenOddField);
 	sceGsPutDrawEnv(evenOddFrame==0 ? &db.giftag0 : &db.giftag1);
+	sceGsSyncPath(0, 0);	/* same PATH3 drain as SwapBuffers */
 }
 
 void
 WaitNextFrame(void)
 {
+	/* drain PATH1/2/3 before declaring the frame done: the vblank-side
+	 * SwapBuffers kicks the next draw environment (FRAME/ZBUF + CLEAR)
+	 * via PATH3, and on real hardware the frame's rendering is
+	 * otherwise still in flight at that point - late primitives land
+	 * in the swapped buffer and the clear races the render. */
+	sceGsSyncPath(0, 0);
 	SignalSema(drawEndSema);
 	WaitSema(drawStartSema);
 }
 
+/* ELF launch arguments (crt0 passes the loader's _args block through) -
+ * consumed by opening.c's SimulateBootHistory: argv[1] = seed,
+ * argv[2] = number of games, argv[3] = number of boots. */
+int gameArgc;
+char **gameArgv;
+
 int
-main()
+main(int argc, char *argv[])
 {
 	struct ThreadParam tparam;
 	struct SemaParam sparam;
+
+	gameArgc = argc;
+	gameArgv = argv;
+
+	{
+		int i;
+		printf("osdsys: argc = %d\n", argc);
+		for(i = 0; i < argc && i < 16; i++)
+			printf("osdsys: argv[%d] = \"%s\"\n", i, argv[i] ? argv[i] : "(null)");
+	}
 
 	LoadResources();
 
