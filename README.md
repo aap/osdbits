@@ -4,6 +4,8 @@ Reverse engineering of the PS2 OSDSYS — the boot ROM's on-screen display
 (boot animation, browser, system configuration) — from a retail OSDSYS
 image.
 
+![the reconstructed opening animation](docs/opening.png)
+
 ## Layout
 
 - `osdbits/` — buildable reconstruction of the opening ("towers") boot

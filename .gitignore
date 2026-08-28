@@ -21,6 +21,7 @@ core*
 *.orig
 *.ai-reference
 *.png
+!docs/opening.png
 osdsys_re/
 osdbits/gsdump/
 osdbits/gsdump-archive/
