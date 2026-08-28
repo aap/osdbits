@@ -4075,14 +4075,16 @@ sub_219cb8(void)
 		cubeAnchor[i][1] = cubeSeedTable[i][1];
 		cubeAnchor[i][2] = (cubeSeedTable[i][2] - 2.5f)*128.0f + 800.0f - 12.0f;
 		cubeAnchor[i][3] = 0.0f;
-		cubeRate[i][0] = f*((i*2)%9)*0.25f;
-		cubeRate[i][1] = f*((i*2)&7)/5.0f;
-		cubeRate[i][2] = f*((i*2)%7)/6.0f;
-		cubeRate[i][3] = f*((i*2)%9)*0.25f;
-		cubeOutB[i][0] = 0.004f/f;
-		cubeOutB[i][1] = f*0.003f;
-		cubeOutB[i][2] = f/800.0f + 0.002f;
-		cubeOutB[i][3] = 0.0f;
+		/* start ANGLES (0x27b140) from index-derived factors, tiny
+		 * tumble RATES (0x27b190) */
+		cubeOutB[i][0] = f*((i*2)%9)*0.25f;
+		cubeOutB[i][1] = f*((i*2)&7)/5.0f;
+		cubeOutB[i][2] = f*((i*2)%7)/6.0f;
+		cubeOutB[i][3] = f*((i*2)%9)*0.25f;
+		cubeRate[i][0] = 0.004f/f;
+		cubeRate[i][1] = f*0.003f;
+		cubeRate[i][2] = f/800.0f + 0.002f;
+		cubeRate[i][3] = 0.0f;
 	}
 }
 
