@@ -12,6 +12,7 @@ core*
 
 # local reference material, not for the repo
 *.p2s
+*.idb
 *.id0
 *.id1
 *.nam
@@ -19,7 +20,11 @@ core*
 *.annotated
 *.orig
 *.ai-reference
-full_opening_yt.png
+*.png
 osdsys_re/
 osdbits/gsdump/
 osdbits/gsdump-archive/
+
+# extracted Sony data - regenerate with tools/extract-res.py
+osdbits/res/
+vucode_[0-9]

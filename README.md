@@ -15,14 +15,20 @@ image.
   tower/cube pipeline (the lab notes behind the code), plus a structure
   report, menu rendering notes, and a cross-reference to the osdsys_re
   symbol database.
-- `vucode_*` — VU microcode extracted from the image: raw blobs,
-  disassembly (`.vu`) and reconstructed dvp-as source (`.vsm`).
-- `OSDSYS.idb`, `osdsys_dump.idb` — IDA databases.
+- `vucode_*` — the image's VU microcode: disassembly (`.vu`) and
+  reconstructed dvp-as source (`.vsm`).
+- `tools/` — resource extraction (see below).
 
 ## Building osdbits
 
-Requires the SCE PS2 EE toolchain (`ee-gcc`, `ee-dvp-as`) with the SDK at
-`/usr/local/sce/ee`:
+The repo contains none of Sony's data.  The textures are extracted from
+a PS2 BIOS image you dumped from your own console (the same file PCSX2
+uses):
+
+    python3 tools/extract-res.py path/to/bios.bin osdbits/res
+
+Building requires the SCE PS2 EE toolchain (`ee-gcc`, `ee-dvp-as`) with
+the SDK at `/usr/local/sce/ee`:
 
     cd osdbits
     make        # produces main.elf
