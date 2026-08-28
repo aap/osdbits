@@ -53,6 +53,19 @@ struct Color
 int IsPAL(void);
 int GetLanguage(void);
 
+/* OSD glue stubs (see main.c) */
+extern int discReady;
+extern int discType;
+extern int bootLatch;
+extern int osdBootParam;
+extern int osdBootParamC;
+extern int osdBootParam2;
+int HasDisc(void);
+int GetDiscType(void);
+int BootLatchClear(void);
+void OSDDispatch(int msg, int a, int b, int c);
+void OSDDispatch2(int x, int msg, int a, int b, int c);
+
 extern sceGsDBuff db;
 extern int evenOddFrame;
 extern int evenOddField;

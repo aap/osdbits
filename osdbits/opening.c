@@ -342,7 +342,7 @@ gsAllocBuffer(u32 psm, Rect *r)
 u32 extraBuf1, extraBuf2;
 
 /* once-per-frame snapshots of evenOddFrame/evenOddField, captured at the
- * top of Process().  SwapBuffers() flips the globals on the swap thread,
+ * top of ProcessOpening().  SwapBuffers() flips the globals on the swap thread,
  * only loosely synchronized with the render thread, so a mid-frame read
  * can already see the NEXT frame's values; all buffer-identity decisions
  * use these snapshots instead.  (Harness-specific, not in the real ROM.) */
@@ -426,21 +426,21 @@ void pktSetAlphaBlend(u32 type, u32 mode, u32 fix)
 	pktSetAD(SCE_GS_PABE, !type);
 	pktSetAD(SCE_GS_ALPHA_1, SCE_GS_SET_ALPHA(bm->a, bm->b, bm->c, bm->d, fix));
 }
-void pktSetFlatRect(Rect *r, Color *col, u32 abe)
+void pktSetFlatRect(Rect *r, Color *col, u32 abe, u32 z)
 {
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 0, 0, abe, 0, 0, 0, 0));
 	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col->r, col->g, col->b, col->a, 0x3f800000));
-	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((r->x+2048-screenW/2)<<4, (r->y+2048-screenH/2)<<4, 0));
-	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(((r->x+r->w+2048-screenW/2)<<4)-1, ((r->y+r->h+2048-screenH/2)<<4)-1, 0));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((r->x+2048-screenW/2)<<4, (r->y+2048-screenH/2)<<4, z));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(((r->x+r->w+2048-screenW/2)<<4)-1, ((r->y+r->h+2048-screenH/2)<<4)-1, z));
 }
-void pktSetTexRect(Rect *r, Rect *tr, Color *col, u32 abe)
+void pktSetTexRect(Rect *r, Rect *tr, Color *col, u32 abe, u32 z)
 {
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 1, 0, abe, 0, 1, 0, 0));
 	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col->r, col->g, col->b, col->a, 0x3f800000));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV((tr->x<<4)+8, (tr->y<<4)+8));
-	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((r->x+2048-screenW/2)<<4, (r->y+2048-screenH/2)<<4, 0));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((r->x+2048-screenW/2)<<4, (r->y+2048-screenH/2)<<4, z));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(((tr->x+tr->w)<<4)+8, ((tr->y+tr->h)<<4)+8));
-	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(((r->x+r->w+2048-screenW/2)<<4)-1, ((r->y+r->h+2048-screenH/2)<<4)-1, 0));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(((r->x+r->w+2048-screenW/2)<<4)-1, ((r->y+r->h+2048-screenH/2)<<4)-1, z));
 }
 
 
@@ -495,10 +495,10 @@ void vif1SetSCISSOR_1(u32 scax0, u32 scax1, u32 scay0, u32 scay1)
 { vif1Begin(); pktSetSCISSOR_1(scax0, scax1, scay0, scay1); vif1End(); }
 void vif1SetAlphaBlend(u32 type, u32 mode, u32 fix)
 { vif1Begin(); pktSetAlphaBlend(type, mode, fix); vif1End(); }
-void vif1SetFlatRect(Rect *r, Color *col, u32 abe)
-{ vif1Begin(); pktSetFlatRect(r, col, abe); vif1End(); }
-void vif1SetTexRect(Rect *r, Rect *tr, Color *col, u32 abe)
-{ vif1Begin(); pktSetTexRect(r, tr, col, abe); vif1End(); }
+void vif1SetFlatRect(Rect *r, Color *col, u32 abe, u32 z)
+{ vif1Begin(); pktSetFlatRect(r, col, abe, z); vif1End(); }
+void vif1SetTexRect(Rect *r, Rect *tr, Color *col, u32 abe, u32 z)
+{ vif1Begin(); pktSetTexRect(r, tr, col, abe, z); vif1End(); }
 
 void
 vif1SetFramebuffer(u32 fbp, u16 psm, int width, int height, int clear)
@@ -592,6 +592,32 @@ int hwFrameLimit = -1;	/* argv[4]: run N frames then exit (for scripted
 			 * screenshots) */
 int openingType, nextOpeningType, fooOpeningType;
 int sceneState;
+
+/* NOT original: run mode from the command line.
+ * boot    - the real boot sequence: fly-up, SCE text, scene end
+ * idle    - stay over the tower field forever (no forward motion, so
+ *           the state machine and text never trigger)
+ * illegal - the illegal-disc scene (openingType 1) */
+enum { MODE_BOOT, MODE_IDLE, MODE_ILLEGAL };
+static int openingMode = MODE_BOOT;
+static int argBase;	/* first numeric arg, set by ParseArgs */
+
+/* camera state machine support (real addresses):
+ * openingGo (0x2a7794) - "the main acceleration may start";
+ * bootRequest (0x2a7790) - initialized 1 in the real data segment, the
+ *   state-2 boot dispatch runs once and sets it -1;
+ * lastBootParam (0x2a77a0);
+ * openingEndFlag (0x2a77f4) / openingEndFrame (0x2a7800) - state 6's
+ *   "request scene end 128 frames from now" latch (the end flag also
+ *   flips the illegal text's fade direction);
+ * drawBlackBars (0x2a7714) - letterbox bars, set at opening start when
+ *   the system config's screen size is Letterbox (0x211f90/0x203690) */
+static int openingGo;
+static int bootRequest = 1;
+static int lastBootParam;
+static int openingEndFlag;
+static int openingEndFrame;
+static int drawBlackBars;
 
 #define TMPDATA ((u32*)0x800000)	// TODO: might want to be careful with this
 
@@ -838,12 +864,17 @@ static float fogAnimation[6];
 static sceVu0FVECTOR fogVertices[17][17];
 static sceVu0IVECTOR fogColors[17][17];
 
+/* real: OpeningInitAnimation (0x215f18) - initial drift across the
+ * field: 0.04/frame forward, 0.001/frame roll. */
 static void
 InitAnimation(void)
 {
 	openingState = 0;
 
-	positionAccel1[0] = 0.0f;
+	positionSpeed[2] = 0.04f;	/* real: *(0x2a70bc) */
+	rotationSpeed[2] = 0.001f;	/* real: *(0x2a70c0) */
+
+	positionAccel1[2] = 0.0f;
 
 	positionAccel2[0] = 0.0f;
 	positionAccel2[1] = 0.0f;
@@ -851,7 +882,6 @@ InitAnimation(void)
 
 	positionSpeed[0] = 0.0f;
 	positionSpeed[1] = 0.0f;
-//	positionSpeed[2] = 0.004f;
 
 	rotationAccel[0] = 0.0f;
 	rotationAccel[1] = 0.0f;
@@ -859,9 +889,36 @@ InitAnimation(void)
 
 	rotationSpeed[0] = 0.0f;
 	rotationSpeed[1] = 0.0f;
-	rotationSpeed[2] = 0.001f;
 
-	// TODO: one unknown
+	openingGo = 0;
+}
+
+/* real: InitIllegalDisc (0x215f68) - start the illegal-disc scene's
+ * camera: state 4 at height 672, moving up fast and braking. */
+static void
+InitIllegalDisc(void)
+{
+	position[2] = 672.0f;
+	openingState = 4;
+
+	positionAccel2[2] = -0.0178f;	/* real: *(0x2a70c4) */
+	positionSpeed[2] = 2.1599939f;	/* real: *(0x2a70c8) */
+	rotationSpeed[2] = 0.00462f;	/* real: *(0x2a70cc) */
+
+	positionAccel2[0] = 0.0f;
+	positionAccel2[1] = 0.0f;
+
+	positionSpeed[0] = 0.0f;
+	positionSpeed[1] = 0.0f;
+
+	rotationAccel[0] = 0.0f;
+	rotationAccel[1] = 0.0f;
+	rotationAccel[2] = 0.0f;
+
+	rotationSpeed[0] = 0.0f;
+	rotationSpeed[1] = 0.0f;
+
+	openingGo = 0;
 }
 
 static void
@@ -1309,7 +1366,7 @@ CubeCaptureBuffer(void)
 			1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
 	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
 	vif1SetAD(SCE_GS_TEXA, SCE_GS_SET_TEXA(0x7f, 1, 0));
-	vif1SetTexRect(&full, &full, &col, 0);
+	vif1SetTexRect(&full, &full, &col, 0, 0);
 
 	/* real 21c7a8's tail: restore the init TEXA (TA1=129) and CLEAR
 	 * FBA_1.  Init sets FBA=1 (real 0x218d64, see InitOpeningScene) and
@@ -1707,7 +1764,7 @@ DrawLightsAndCubes(void)
 		r.y = screenH/2 - 50;
 		r.w = 200;
 		r.h = 100;
-		vif1SetFlatRect(&r, &red, 0);
+		vif1SetFlatRect(&r, &red, 0, 0);
 	}
 #endif
 
@@ -1816,7 +1873,7 @@ DrawToExtraBuf2(void)
 	vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(src, screenW/64, SCE_GS_PSMCT32,
 			tw, th, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
 	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
-	vif1SetTexRect(&half, &full, &gray, 0);
+	vif1SetTexRect(&half, &full, &gray, 0, 0xFFFFFF);
 
 	/* point FRAME_1/SCISSOR_1 back at the real screen */
 	{
@@ -1866,7 +1923,7 @@ DrawExtraBuf2(void)
 			tw, th, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
 	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
 	vif1SetAlphaBlend(1, 2, 80);
-	vif1SetTexRect(&full, &half, &gray, 1);
+	vif1SetTexRect(&full, &half, &gray, 1, 0xFFFFFF);
 
 	vif1SetZWrite(1);
 	vif1SetZTest(1);
@@ -1934,8 +1991,10 @@ DrawOpeningScene(void)
 
 	DrawLightsAndCubes();
 
-	/* these two draw the "Sony Computer Entertainment" text in front of
-	 * everything - at least one of them does */
+	/* NOT the SCE text (that's DoText, called from DrawEnd) - these two
+	 * look like a dormant debug overlay: sub_218b20 wraps the
+	 * sub_2144c0 blit, sub_218bd0 wraps DrawSomeSprite2 ('B'/'W'
+	 * letter sprites) + a float formatter. */
 	sub_218b20();
 	sub_218bd0();
 }
@@ -1958,9 +2017,13 @@ DoOpening(void)
 	}
 }
 
+/* real: OpeningInitIllegalScene (retail ~0x21b570) - only the camera
+ * part (InitIllegalDisc) is ported so far; the scene setup itself (red
+ * fog, cube/texture init) is not. */
 static void
 InitIllegalScene(void)
 {
+	InitIllegalDisc();
 }
 
 static void
@@ -1986,22 +2049,236 @@ DoIllegalDisc(void)
 	}
 }
 
+/* "Sony Computer Entertainment" overlay state (real: 0x2a7f84 state,
+ * 0x2a7f88 alpha, 0x2a7788 step) and the illegal-disc text counterpart
+ * (0x2a7f8c state, 0x2a7f90 alpha).  state: -1 disarmed, 0 armed,
+ * 1 fading.  initTextShit arms one of the two per opening type. */
+static int sceTextState;
+static int sceTextAlpha;
+static int sceTextStep;
+static int illegalTextState;
+static int illegalTextAlpha;
+
+/* real: 0x2a4318 - screen rectangles for the two text strips,
+ * NTSC and PAL rows */
+static Rect sceTextRect[2][2] = {
+	{ { 120, 105, 256, 16 }, { 326, 105, 256, 16 } },
+	{ { 120, 120, 256, 18 }, { 326, 120, 256, 18 } }
+};
+
+/* real: DrawSCEText (0x214a60, args (0, 0, alpha) - the first two are
+ * unused) - the "Sony Computer Entertainment" text: the 256x64 SCE
+ * texture holds the logo as two 256-texel strips (rows 1-31 = left
+ * half, 33-63 = right half), drawn side by side around the screen
+ * centre, blended by FIX alpha. */
 static void
-DoText(void)
+DrawSCEText(int alpha)
+{
+	Rect xy, uv;
+	Color col;
+	int pal;
+
+	pal = IsPAL();
+	uv.x = 0;	/* real: 0x2a4568 */
+	uv.y = 1;
+	uv.w = 256;
+	uv.h = 30;
+	col.r = col.g = col.b = 128;
+	col.a = alpha;
+	vif1SetXYOffset(1, stableEvenOddField);
+	vif1SetTexture(&textures[TEXID_SCE]);
+	xy = sceTextRect[pal][0];
+	vif1Begin();
+	pktSetAlphaBlend(1, 4, alpha);
+	pktSetTexRect(&xy, &uv, &col, 1, 0xFFFFFE);
+	xy = sceTextRect[pal][1];
+	uv.y += 32;
+	pktSetTexRect(&xy, &uv, &col, 1, 0xFFFFFE);
+	vif1End();
+}
+
+/* real: DoSCEText (0x214c20) - arm once the camera has climbed past
+ * height 18, then ramp alpha 0->240->0 in steps of 4, drawing at
+ * min(alpha, 112): fade in, hold, fade out, disarm. */
+static void
+DoSCEText(void)
+{
+	int alpha;
+
+	if(position[2] > 18.0f)
+		if(sceTextState == 0)
+			sceTextState = 1;
+	if(sceTextState != 1)
+		return;
+	alpha = sceTextAlpha + sceTextStep;
+	sceTextAlpha = alpha;
+	if(alpha == 240)
+		sceTextStep = -4;
+	if(alpha == 0) {
+		sceTextStep = 4;
+		sceTextState = -1;
+	}
+	DrawSCEText(min(alpha, 112));
+}
+
+/* real: DoIllegalText (0x214e60) - the illegal-disc counterpart: arms
+ * past height 800, drives DrawIllegalText (0x214cb0) and the
+ * sub_2144c0 blit.  Not ported yet; inert in the normal opening
+ * (initTextShit leaves it disarmed). */
+static void
+DoIllegalText(void)
 {
 }
 
+/* real: DoText (0x214f58) */
 static void
-Process(void)
+DoText(void)
+{
+	DoSCEText();
+	DoIllegalText();
+}
+
+/* real: 0x27a0d8 - camera heights at which openingState advances */
+static int openingStateLevels[8] = { 16, 56, 104, 320, 672, 800, 1160, 1160 };
+
+/* real: ProcessOpeningAnimation (0x215fd0) - the opening's camera state
+ * machine + motion integration.  openingState advances when the camera
+ * passes openingStateLevels[openingState] (the handlers also advance it
+ * directly); the function returns the opening type the scene should
+ * switch to (ProcessOpening turns a change into a sceneState bump,
+ * which ends the current scene).  States:
+ *   0    drift across the field (initial speed from InitAnimation)
+ *   1    (z>16) disc present: adjust accel, go once the disc type is
+ *        known; no disc: creep and go after 2 seconds
+ *   2    (z>56, usually entered by state 1's go) dispatch the boot
+ *        messages once (bootRequest) and apply the fly-up acceleration
+ *   3    (z>104) request the next opening type (= end this scene)
+ *   4,5  cruise (the illegal scene enters at state 4: InitIllegalDisc)
+ *   6    (z>800) kill all motion; once the end condition holds,
+ *        request type 2 128 frames later
+ *   7    (z>1160) reset the animation, request type 2 */
+static int
+ProcessOpeningAnimation(void)
 {
 	float timestep;
-
-	stableEvenOddFrame = evenOddFrame;
-	stableEvenOddField = evenOddField;
+	int type;
+	int fps;
 
 	timestep = IsPAL() ? 1.2f : 1.0f;
+	fps = IsPAL() ? 50 : 60;
 
-	// TODO: big switch to handle state
+	if((float)openingStateLevels[openingState] < position[2])
+		openingState++;
+	type = openingType;
+
+	switch(openingState) {
+	case 1:
+		if(HasDisc()) {
+			rotationSpeed[2] = 0.0004f;
+			if(frameCount < fps*20/6)
+				positionAccel2[2] = -0.00014f;
+			else
+				positionAccel2[2] = 0.000025f;
+			if(GetDiscType() != 0) {
+				positionAccel2[2] = 0.003f;
+				openingGo = 1;
+				openingState++;
+			} else if(frameCount > fps*20)
+				discReady = 0;	/* give up on the disc */
+		} else {
+			positionAccel1[2] = 0.0000004f;
+			switch(osdBootParam) {
+			case 100: case 106: case 107: case 108: case 109:
+			case 110: case 111: case 112: case 114: case 115:
+			case 116:
+				if(frameCount > fps*2) {
+					openingGo = 1;
+					openingState++;
+				}
+				break;
+			}
+		}
+		break;
+	case 2:
+		if(frameCount > fps*10)
+			openingGo = 1;
+		if(openingGo) {
+			if(bootRequest == 1) {
+				if(BootLatchClear())
+					OSDDispatch(20500, 1, 0, 0);
+				else if(HasDisc() && GetDiscType() == 1)
+					OSDDispatch(20501, 0, 0, 15);
+				else {
+					lastBootParam = osdBootParam;
+					switch(osdBootParam) {
+					case 106: case 107: case 114: case 115:
+						OSDDispatch(20501, 0, 0, 15);
+						break;
+					case 108: case 109: case 110:
+						OSDDispatch(20500, 7, 0, 0);
+						OSDDispatch(20501, 0, 0, 17);
+						break;
+					default:  /* 111-113 and out of range */
+						OSDDispatch(20500, 1, 0, 0);
+						break;
+					}
+				}
+				bootRequest = -1;
+			}
+			if(HasDisc() || GetDiscType() != 0) {
+				positionAccel1[2] = 0.0004f;
+				rotationAccel[2] = 0.00008f;
+			} else {
+				positionAccel2[2] = 0.0099f;
+				rotationAccel[2] = 0.000195f;
+			}
+			positionAccel2[0] = 0.0f;
+			positionAccel2[1] = 0.0f;
+			rotationAccel[0] = 0.0f;
+			rotationAccel[1] = 0.0f;
+		}
+		break;
+	case 3:
+		type++;
+		break;
+	case 6:
+		positionAccel1[0] = positionAccel1[1] = positionAccel1[2] = 0.0f;
+		positionAccel2[0] = positionAccel2[1] = positionAccel2[2] = 0.0f;
+		positionSpeed[0] = positionSpeed[1] = positionSpeed[2] = 0.0f;
+		rotationAccel[0] = rotationAccel[1] = rotationAccel[2] = 0.0f;
+		if(osdBootParamC == 0) {
+			lastBootParam = osdBootParam;
+			switch(osdBootParam) {
+			case 100: case 106: case 107: case 108: case 109:
+			case 110: case 111: case 112: case 115:
+				openingEndFlag = 1;
+				if(openingEndFrame == 0) {
+					OSDDispatch2(1, 20501, 6, 0, 15);
+					openingEndFrame = frameCount;
+				} else if(frameCount > openingEndFrame+128)
+					type = 2;
+				break;
+			case 114:
+				if(osdBootParam2 > 0) {
+					openingEndFlag = 1;
+					if(openingEndFrame == 0)
+						openingEndFrame = frameCount;
+					else if(frameCount > openingEndFrame+128)
+						type = 2;
+				}
+				break;
+			default:  /* 101-105, 113, 116 and out of range */
+				if(openingEndFlag && frameCount > openingEndFrame+128)
+					type = 2;
+				break;
+			}
+		}
+		break;
+	case 7:
+		InitAnimation();
+		type = 2;
+		break;
+	}
 
 	rotationSpeed[0] += (2.0f*rotationAccel[0] + 0.0f)*0.5f*timestep;
 	rotationSpeed[1] += (2.0f*rotationAccel[1] + 0.0f)*0.5f*timestep;
@@ -2013,14 +2290,14 @@ Process(void)
 
 	positionAccel2[2] += positionAccel1[2]*timestep;
 
-	rotation += (2.0f*rotationSpeed[2] + positionAccel2[2])*0.5f*timestep;
+	rotation += (2.0f*rotationSpeed[2] + rotationAccel[2])*0.5f*timestep;
 
 	position[0] += (2.0f*positionSpeed[0] + positionAccel2[0])*0.5f*timestep;
 	position[1] += (2.0f*positionSpeed[1] + positionAccel2[1])*0.5f*timestep;
 	position[2] += (2.0f*positionSpeed[2] + positionAccel2[2])*0.5f*timestep;
 
 	if(rotation > PI) rotation -= TAU;
-	if(rotation < PI) rotation += TAU;
+	if(rotation < -PI) rotation += TAU;
 
 	upDir[0] = sinf(rotation);
 	upDir[1] = cosf(rotation);
@@ -2032,13 +2309,64 @@ Process(void)
 		1.0f, 16777215.0f, 1.0f, 65536.0f);
 	sceVu0MulMatrix(sprMatrices->cameraScreenMatrix,
 		sprMatrices->viewScreenMatrix, sprMatrices->cameraMatrix);
+
+	return type;
 }
 
+/* real: ProcessOpening (0x211e38) - run the state machine, turn a
+ * requested type change into a sceneState bump (DoOpening/DoIllegalDisc
+ * end their scene from case 2), and set the frame's one-pixel-inset
+ * scissor. */
+static void
+ProcessOpening(void)
+{
+	int type;
+
+	stableEvenOddFrame = evenOddFrame;
+	stableEvenOddField = evenOddField;
+
+	type = ProcessOpeningAnimation();
+	if(type != openingType)
+		sceneState++;
+	vif1SetSCISSOR_1(1, screenW-2, 1, screenH-2);
+}
+
+/* real: DrawBlackBars (0x214790) - letterbox bars for the "Screen Size:
+ * Letterbox" system config: compute the 16:9 image height from the
+ * aspect factors and draw white rects with subtractive blend (Cd - Cs,
+ * mode 1) over the top and bottom - i.e. black bars.  Colour is the
+ * real qword at 0x2a42e8. */
+static void
+DrawBlackBars(void)
+{
+	Rect r1, r2;
+	Color col = { 255, 255, 255, 128 };
+	int imgh, bar;
+
+	imgh = (float)screenW * 9.0f * screenAY / (screenAX * 16.0f);
+	bar = (screenH - imgh + 1)/2;
+	r1.x = 0; r1.y = 0;
+	r1.w = screenW; r1.h = bar;
+	r2.x = 0; r2.y = bar + imgh;
+	r2.w = screenW; r2.h = bar;
+
+	vif1SetXYOffset(1, stableEvenOddField);
+	vif1SetZTest(0);
+	vif1SetZWrite(0);
+	vif1SetAlphaBlend(1, 1, 128);
+	vif1SetFlatRect(&r1, &col, 1, 0xFFFFFF);
+	vif1SetFlatRect(&r2, &col, 1, 0xFFFFFF);
+	vif1SetZWrite(1);
+	vif1SetZTest(1);
+}
+
+/* real: DrawEnd equivalent at 0x211eb8 */
 static void
 DrawEnd(void)
 {
 	DoText();
-	// TODO: unknown func
+	if(drawBlackBars)
+		DrawBlackBars();
 	WaitNextFrame();
 	frameCount++;
 	if(hwFrameLimit > 0 && frameCount >= hwFrameLimit) {
@@ -2053,7 +2381,7 @@ DoOpeningIllegal(void)
 {
 	sceneState = 0;
 	while(openingType != 2) {
-		Process();
+		ProcessOpening();
 		switch(openingType) {
 		case 0:
 			DoOpening();
@@ -2332,9 +2660,10 @@ struct HistEntry {
 };
 static HistEntry simHistory[21];
 
-/* ELF launch args (see main.c): argv[1] = seed, argv[2] = number of
- * games, argv[3] = number of boots (the cycle-counter seed alone
- * repeats under an emulator's deterministic boot timing) */
+/* ELF launch args (see main.c): [mode] [seed [ngames [nboots
+ * [framelimit]]]] - mode is 'boot' (default), 'idle' or 'illegal';
+ * the cycle-counter seed alone repeats under an emulator's
+ * deterministic boot timing, hence the explicit seed arg */
 extern int gameArgc;
 extern char **gameArgv;
 
@@ -2351,6 +2680,30 @@ argInt(int n, int def)
 	return s == gameArgv[n] ? def : v;
 }
 
+static void
+ParseArgs(void)
+{
+	static const char *modeNames[] = { "boot", "idle", "illegal" };
+	int i, m;
+
+	/* arg base: PCSX2's -gameargs passes user args starting at argv[0]
+	 * (no ELF path); other loaders put the path in argv[0].  If argv[0]
+	 * is a pure number, the user args start there.  An optional mode
+	 * word comes before the numeric args. */
+	argBase = argInt(0, -1) >= 0 ? 0 : 1;
+	for(i = 0; i < 2 && i < gameArgc; i++) {
+		if(gameArgv[i] == nil)
+			continue;
+		for(m = 0; m < 3; m++)
+			if(strcmp(gameArgv[i], modeNames[m]) == 0) {
+				openingMode = m;
+				argBase = i+1;
+				break;
+			}
+	}
+	printf("osdsys: mode %s\n", modeNames[openingMode]);
+}
+
 /* simulate a memory card's life with the REAL updater rules: a library
  * of titles booted with a favourites-skewed distribution, so some
  * titles appear once and the favourites grow big towers (and
@@ -2363,10 +2716,8 @@ SimulateBootHistory(void)
 	int i, b, nboots, ngames;
 	u32 cycles;
 
-	/* arg base: PCSX2's -gameargs passes user args starting at argv[0]
-	 * (no ELF path); other loaders put the path in argv[0]. If argv[0]
-	 * is a pure number, the user args start there. */
-	int base = argInt(0, -1) >= 0 ? 0 : 1;
+	/* numeric args start after the optional mode word (ParseArgs) */
+	int base = argBase;
 
 	/* argv seed if given; else per-boot-ish variety from the cycle
 	 * counter (deterministic emulators may repeat, real HW won't) */
@@ -3072,18 +3423,38 @@ sub_219f08(void)
 	sub_21a438();
 	sub_215798();
 	sub_219cb8();
+	/* the real tail also clears these (and gp-30860 = 0x2a77e4,
+	 * purpose unknown) */
+	openingEndFlag = 0;
+	openingEndFrame = 0;
 }
 
-/* real: initTextShit (0x214f20, 13 insns) - IDA's own name (leaf, no
- * calls out), InitOpening's real call right before StartFrame. */
+/* real: initTextShit (0x214f20) - IDA's own name.  Arm the text
+ * overlay matching the opening type (SCE text for the normal opening,
+ * the "insert a PlayStation disc" text for the illegal one) and reset
+ * the fade. */
 static void
 initTextShit(void)
 {
+	if(fooOpeningType == 0) {
+		sceTextState = 0;
+		illegalTextState = -1;
+	} else {
+		illegalTextState = 0;
+		sceTextState = -1;
+	}
+	sceTextAlpha = 0;
+	sceTextStep = 4;
+	illegalTextAlpha = 0;
 }
 
 static void
 Init(void)
 {
+	ParseArgs();
+	/* the real fooOpeningType comes from systemState (0x1f05e8) == 4 =
+	 * illegal disc, set at 0x211f90 */
+	fooOpeningType = openingMode == MODE_ILLEGAL ? 1 : 0;
 	openingType = nextOpeningType = fooOpeningType;
 
 	/* real InitOpening order: OpeningInitRender, OpeningInitAnimation,
@@ -3091,6 +3462,9 @@ Init(void)
 	 * complete, nothing else in between. */
 	InitRender();
 	InitAnimation();
+	if(openingMode == MODE_IDLE)
+		positionSpeed[2] = 0.0f;	/* stay put: the state machine and
+						 * text never trigger */
 	InitTowersFog();
 	sub_219f08();
 	initTextShit();

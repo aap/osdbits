@@ -37,15 +37,22 @@ the SDK at `/usr/local/sce/ee`:
     make run    # runs on a TOOL via dsedb
 
 The ELF also runs under PCSX2.  Optional arguments
-`main.elf [seed [ngames [nboots [framelimit]]]]` control the simulated
-memory-card boot history the tower field is generated from (`ngames 0`
-lights up the whole field; `framelimit` exits after N frames for scripted
-screenshots).
+`main.elf [mode] [seed [ngames [nboots [framelimit]]]]`:
+
+- `mode` — `boot` (default): the real boot sequence — camera drift,
+  fly-up, "Sony Computer Entertainment" text, scene end; `idle`: stay
+  over the tower field forever; `illegal`: the illegal-disc scene
+  (work in progress, currently mostly dark).
+- the numeric args control the simulated memory-card boot history the
+  tower field is generated from (`ngames 0` lights up the whole field;
+  `framelimit` exits after N frames for scripted screenshots).
 
 ## Status
 
-- Opening scene: towers, fog, light streaks, refractive cubes — done and
-  verified.  Missing: the "Sony Computer Entertainment" text overlay and
-  a few small init helpers (see the stubs in `osdbits/opening.c`).
-- Illegal-disc screen (red fog + cubes): not started.
+- Opening scene: towers, fog, light streaks, refractive cubes, the
+  camera state machine (fly-up and scene end) and the "Sony Computer
+  Entertainment" text overlay — done and verified.  A few small init
+  helpers remain stubs (see `osdbits/opening.c`).
+- Illegal-disc screen (red fog + cubes): camera path ported, scene
+  rendering not started.
 - Menu/browser: notes only, see `docs/menu-rendering-reverse.md`.

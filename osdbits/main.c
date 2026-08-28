@@ -17,6 +17,33 @@
 int IsPAL(void) { return 0; }
 int GetLanguage(void) { return 1; } // english
 
+/* OSD-side glue the opening calls into, stubbed for the standalone
+ * build (the real ones live in the OSD system module):
+ * - discReady/discType (real 0x26ecf0/0x26ecf4, accessors 0x2043a8/
+ *   0x2043b8): CDVD detection state, written by the disc-poll thread.
+ * - bootLatch (real 0x26ecec; 0x204378 tests it for 0, set at
+ *   0x224614, detailed meaning unknown).
+ * - osdBootParam (real *(0x1f0010)): why OSDSYS was launched, values
+ *   100..116 - steers the opening's boot messages and end conditions.
+ *   osdBootParamC = *(0x1f000c), osdBootParam2 = *(0x1f0cf8) (the
+ *   latter only checked for boot param 114).
+ * - OSDDispatch (real 0x200b80) / OSDDispatch2 (real 0x261738):
+ *   message dispatch to the OSD proper ("opening done, boot X" -
+ *   messages 20500/20501). */
+int discReady = 0;
+int discType = 0;
+int bootLatch = 0;
+int osdBootParam = 100;
+int osdBootParamC = 0;
+int osdBootParam2 = 0;
+int HasDisc(void) { return discReady != 0; }
+int GetDiscType(void) { return discType; }
+int BootLatchClear(void) { return bootLatch == 0; }
+void OSDDispatch(int msg, int a, int b, int c)
+{ printf("osd: dispatch(%d, %d, %d, %d)\n", msg, a, b, c); }
+void OSDDispatch2(int x, int msg, int a, int b, int c)
+{ printf("osd: dispatch2(%d, %d, %d, %d, %d)\n", x, msg, a, b, c); }
+
 sceGsDBuff db;
 int evenOddFrame;
 int evenOddField;
