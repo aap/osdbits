@@ -530,3 +530,333 @@ Module U function to compile and diff. Writing speculative C against
 would risk a source shape that can't be correctness-checked even if it
 happened to byte-match by luck. Left for a follow-up pass once the
 indirect-call sites are resolved.
+
+---
+
+## 10. The orb scene, decoded and ported (2026-08-30)
+
+This section supersedes §§5-8's "labelled gaps" for the always-on part
+of the background: the seven glowing orbs. Everything below is
+disassembly-derived and is implemented in `osdbits/menu.c` (run it with
+`main.elf menu`). Confidence **[ok]** unless marked.
+
+### 10.1 The scene is a clock
+
+The orbit is driven entirely by the **real-time clock**, not by a frame
+counter. `0x2261B8` reads two of the clock accessors that live next to
+the config-model getters (§2.1's `0x22B720/790/7A0/7B0` family), and
+they are literal clock hands over the block at `0x352980`:
+
+| address | field |
+|---|---|
+| `0x352980` | milliseconds (float) |
+| `0x352984` | seconds |
+| `0x352988` | minutes |
+| `0x35298C` | hours |
+| `0x352990/4/8` | day / month / year (the leap-year code at `0x22B7C0` confirms) |
+
+* `0x22B5E8` (= `0x22B590`, a duplicate) → `sec + ms/1000`
+* `0x22B6B0` (= `0x22B640`) → `min + sec/60`
+* `0x22B720` → `hour + min/60`
+
+`0x22BB30` (per-frame, from `0x21CF20`) integrates the milliseconds at
+`*(gp-30324)` = 1000/59.94 per frame and resyncs against the low-block
+RTC copy at `0x1F0CB8` whenever the two drift more than 3 s apart.
+
+### 10.2 `0x2261B8` - the orbit, fully decoded
+
+```
+rateX = clockSeconds() * 65536/60      ; a full turn per minute
+rateY = clockMinutes() * 65536/60      ; a full turn per hour
+t      = *(float*)(gp-28848)           ; the entry ease, 0 at module entry
+radius = (t*7.25 + 10.0) * *(float*)0x27B440
+*(gp-28848) = t + ((1.0 - *(gp-28852)) - t) * *(gp-32152)      ; 0.005/frame
+for i = 0..6:
+    identity
+    RotZ(*(short*)(gp-28854))          ; the hour hand, see 10.3
+    RotY(*(short*)(gp-28856))          ; the second hand at entry
+    RotZ(-32768)                       ; 180 degrees
+    RotY(trunc(rateY * *(gp-32156)))   ; *(gp-32156) = 1100.0, a CONSTANT
+    RotX(trunc((i+21) * rateX))
+    Translatef(0, radius, 0)
+    RotY(8192)                         ; 90 degrees
+    copy top -> 0x27E970 ; 0x225ED0(0x27E950, i)
+```
+
+The three floats an earlier draft left unidentified are plain constants
+in .data: `gp-32156` = **1100.0** (not a frame counter), `gp-32152` =
+**0.005** (the ease rate), `gp-32148` = **0.05** (the carousel gate in
+`0x2268F0`). So the radius eases 10 -> 17.25 over ~600 frames.
+
+Consequences worth noting for the look: `rateY*1100` turns the ring
+about once every 3.3 s, and each orb takes a *different* multiple
+(21..27) of the second hand, so the seven shear along the ring instead
+of moving rigidly - they bunch up and spread out again on a one-minute
+cycle. The ease target is `1 - *(gp-28852)`, so the browser transition
+can pull the cloud back in by driving that global up.
+
+**Matrix order matters**: `mdRotX/Y/Z` (0x230198/0x230260/0x230328) do
+`sceVu0MulMatrix(top, top, R)` - **post**-multiply - whereas the camera
+builder `0x22ED20` uses `sceVu0RotMatrix{X,Y,Z}(m, m, a)`, which
+**pre**-multiplies (`m = R x m`). Swapping the two silently mirrors the
+scene.
+
+### 10.3 `0x225998` - the one-shot init
+
+```
+*(int*)0x27EB00 = *(gp-30372)          ; the carousel timer's duration
+0x225420()                             ; the clock-seeded angles, below
+0x225978() -> 0x225628(), 0x225878()
+[the 12-slot carousel ring at 0x34E6C0 is rebuilt here]
+for i = 0..6:  0x34E960[i] = rand() % 65536      ; rand() = 0x25B478
+                                                ; (the shared LCG, so the
+                                                ;  phases depend on how many
+                                                ;  times the OSD called rand()
+                                                ;  before the menu started -
+                                                ;  same caveat as the
+                                                ;  opening's lightsSeed)
+0x22FE88()                             ; zero ten 1616-byte orb structs
+0x22EE98()                             ; the trail timer, below
+```
+
+`0x225420` seeds the cloud's orientation from the clock:
+
+```
+*(int*)0x34E6C0     = (int)clockHours() % 12                 ; carousel offset
+*(short*)(gp-28854) = clockHours()   * 65536/12              ; the hour hand
+*(short*)(gp-28856) = clockSeconds() * 65536/60              ; the second hand
+*(short*)0x34E6C6   = (carouselOffset << 16) / 12
+*(short*)0x34E6C4   = clockSeconds() * 65536/60
+```
+
+`0x22EE98` (tail-called from `0x225998`) sets the timer at `0x27F900` to
+`(fps<<8)/60` frames (256 on NTSC) and opens it; `0x22EFF0` steps it
+once **per orb**, so it actually fills in ~37 frames.
+
+`0x21CE58`'s tail sets `*(gp-28880) = -100.0` - the camera's fly-in.
+
+### 10.4 The camera (closes §6)
+
+Fixed, not drifting. `0x21CFD8` per frame:
+
+```
+sceVu0ViewScreenMatrix(m1, scrz=512, ax=*(0x27B44C), ay=*(0x27B450),
+                       cx=2048, cy=2048, zmin=1, zmax=16777215,
+                       nearz=1, farz=65536)
+0x22ED20(m0, pos, 0x27B470, 0x27B480, 0x27B490)
+*(gp-28880) *= *(gp-32224)             ; 0.97 - the fly-in decay
+```
+
+with `ax/ay` from `0x21C9D0` (1.0 and **0.47** on NTSC / 0.5405 PAL -
+note the opening uses 0.457627 for the same aspect) and
+
+| address | value | role |
+|---|---|---|
+| `0x27B460` | `{10.436, 0, -103, 0}` | rest position (z += `*(gp-28880)`) |
+| `0x27B470` | `{0, 0, 1, 1}` | forward |
+| `0x27B480` | `{0, 1, 0, 1}` | up |
+| `0x27B490` | `{0.031, 0.145, 0, 0}` | fixed Euler angles |
+
+`0x22ED20` = unit; `RotMatrixX(0.031)`; `RotMatrixY(0.145)`;
+`RotMatrixZ(0)`; rotate all three vectors by it; `sceVu0CameraMatrix`.
+`sceVu0CameraMatrix`'s `zd` argument is a **direction** (0x267298
+normalises it and crosses it with `yd`), not a look-at point - so the
+camera sits ~203 units back at module entry, eases to 103, and looks
+along a fixed axis that passes ~10 units to the right of the origin.
+
+The scene struct at `0x27E950` keeps `m1` (viewscreen) at **+0x60** and
+`m0` (camera) at **+0x64** - that ordering is easy to get backwards.
+`0x225D18`'s sort key is `(camera x world)[3][2]`, i.e. camera-space Z.
+`0x225D40` walks on while the new key is *smaller* than the node's, so
+the list comes out **descending** - farthest first, which is the right
+order for the depth test the flush uses.
+
+### 10.5 `0x22FEC0` and the 1616-byte orb struct at `0x27F950`
+
+Ten structs, seven used, zeroed by `0x22FE88`:
+
+| offset | field |
+|---|---|
+| +0x00 | `head` - trail write index, 0..49 |
+| +0x04 | `sub` - 0..2 subframe counter |
+| +0x08 | `wrapped` - set once the ring has filled |
+| +0x10 + i*0x20 | screen position (4 floats) for trail sample i |
+| +0x20 + i*0x20 | colour (4 ints) for trail sample i |
+
+`0x22FEC0(i, pos, col)` - note the **third argument is passed in a2 and
+is invisible at the call site** (`0x226360` leaves `sp+16` there from
+the colour block above it) - writes the current sample, then advances
+`head` only every third call, copying the sample into the new slot too.
+So a full trail spans 150 frames (2.5 s).
+
+### 10.6 `0x22EFF0` - the orb renderer
+
+Not "the menu navigation icons" (§10 of `menu-draw.md`): the two TEXC
+slots it binds are the two halves of one glowing dot. Both decode to
+white-with-alpha (decoder `0x22A790`, the same expansion `opening.c`
+calls format 3); TEXCBLUR is a soft radial falloff and TEXCNAVI a solid
+disc.
+
+Per orb, everything additive, and the whole sequence run **twice** -
+once into the visible buffer, once into the offscreen buffer the
+zoom-blur composite samples:
+
+1. **the trail** - `PRIM = 0x82` = LINE_STRIP with AA1, ABE and IIP off
+   (the same "weird setting" `opening.c`'s `DrawLights` uses for its
+   light trails - the AA1 edge blend is what draws it), then 49
+   `(RGBAQ, XYZF2)` pairs in one REGLIST GIF packet. Sample `k` reads
+   ring index `(head + 100 - k) % 50` with a fade `f = max(128-3k, 0)`
+   and colour
+   `B = b*f/128`, `G = g*f^2/2^14`, `R = (((r*f^2/128)*f/128)*f)/2^14`,
+   `A = f/2` - so red dies fastest and the tail fades to blue. When the
+   ring has not filled yet the age index is stretched: `f = 128 - 3*(k*50/(head-1))`.
+2. **the halo** - `0x22AB90(7,1,1)` (TEXCBLUR, additive, ZTST ALWAYS)
+   then one sprite of half-width `depth * 6.5e-06 * 30.0`, half-height
+   half of that (one NTSC field line = two source rows), coloured from
+   the trail head's stored colour.
+3. **the core** - `0x22AB90(6,1,1)` (TEXCNAVI) and the same sprite at
+   `4.5` instead of `30.0`, coloured `{128,128,128,128}` (`0x27F930`).
+
+`depth` is `0x22CFA8`'s third output: the projected Z **after** the w
+divide, i.e. `A + B/z` over `z`. At the menu's camera distance that is
+~150000, which makes the halo about 60x30 px and the core about 9x5.
+
+The trail's base RGBAQ is `0x22AC20(0x27F900, 128) << 24 | Q`, where the
+`Q` field is built as `0xFE00 << 42` = `0x03F80000` - that is `1.0f`
+shifted right by four bits, a ROM quirk that is invisible because the
+line strip is untextured.
+
+### 10.7 The colour tables
+
+* `0x27EB30` = `{0x30, 0x62, 0x80, 0x3C}` - the colour **every** orb has
+  in the idle menu (a dim blue at alpha 60).
+* `0x27EB40`, 7 x 4 ints - the per-orb colours: blue, green, cyan, red,
+  magenta, orange, white, all at alpha 60.
+
+`0x226360`'s lerp runs per-orb -> base as the fade alpha goes 0 -> 128;
+with no fade running it multiplies the per-orb table by **0** and the
+base table by 128, so all seven orbs are the same blue. The individual
+colours are only visible while a fade is in progress.
+
+### 10.7a The entry animation is the screen fade
+
+The two words `0x226360` keys on are **not** a browser transition -
+`0x22AD30`/`0x22AD28` are `getFadeMode`/`getFadeAlpha` over `gp-28828`
+and `gp-28824` (`menu-logic.md` 2 names them). `0x22ADD8(mode)` arms
+them, `0x22B058` runs the counter, `0x22AFB8` paints the curtain from
+the record at `0x27F630` at `A = 128 - alpha`:
+
+| mode | colour | alpha | meaning |
+|---|---|---|---|
+| 1 | white | 0 -> 128 | flash |
+| 2 | black | 0 -> 128, then mode = 0 | **fade UP from black** |
+| 3 | black | 128 -> 0 | fade DOWN, then leave the module |
+| 4 | black | 0 | instant |
+
+**The module's one-shot init `0x21CE58` ends with `0x22ADD8(2)`.** So
+mode 2 runs for the first 128 frames (~2.1 s) of every menu entry, and
+during it `0x226360` throws each orb out along its random phase angle
+by half a screen, pulling it back as `1 - sin(alpha*128)` closes, while
+the colour lerps from the orb's own colour to the shared blue. That is
+the menu's entry fly-in - the seven-orb version only when
+`*(int*)0x1F05EC == 1` ("the module we came from was the opening"),
+otherwise orb 0 alone. Mode 3 is the mirror image on the way out, orb 0
+only, with the extra `sp = sp*alpha/128 + offset*1.5` zoom.
+
+An earlier reading of this section called it a browser hand-off; it is
+not - it is the always-on entry animation, and `osdbits/menu.c` ports
+it (`FadeArm`/`FadeStep`/`DrawFadeCurtain`).
+
+### 10.8 A freesce SDK bug that breaks this (and the opening)
+
+While bringing the port up, `sceVu0ViewScreenMatrix` and the rotations
+returned garbage. Cause: **freesce's `libvu0.a` has lost the
+instruction out of several branch delay slots**, checked instruction by
+instruction against the retail image's copies:
+
+| function | ROM | freesce |
+|---|---|---|
+| `sceVu0MulMatrix` (0x267860) | `bne ...; addi a0,a0,16` | `bne ...; nop` then `addi` after the loop |
+| `sceVu0RotMatrixX/Y/Z` | same loop, plus `j ...; li a3,1` | same loop bug; `li a3,1` unreachable |
+| `sceVu0ViewScreenMatrix` | `jal MulMatrix; swc1 f20,56(sp)` | `jal; nop` then the `swc1` after |
+| `sceVu0NormalLightMatrix`, `sceVu0LightColorMatrix` | args set in the `jal` delay slots | `nop`, args set after the call |
+| `sceVu0RotTransPers/N`, `sceVu0Normalize` | - | same class of difference |
+
+`sceVu0MulMatrix` alone is fatal: without the `addi` all four result
+columns are written to column 0, so **every** matrix product is wrong.
+`sceVu0ApplyMatrix`, `UnitMatrix`, `CopyMatrix`, `TransMatrix`,
+`ScaleVector`, `OuterProduct`, `InversMatrix`, `TransposeMatrix`,
+`ClampVector`, `AddVector`, `SubVector` and `ScaleVectorXYZ` are
+byte-identical to the ROM.
+
+The original SDK's copy is fine: `/usr/local/sce_24/ee/lib/libvu0.a`
+has the `addi` in the `bne` delay slot and the `li a3,1` in the `j`
+delay slot, exactly like the ROM. So the two ways out are (a) take
+`libvu0.a` from `$(SCETOP)/lib` in `osdbits/Makefile` instead of
+`$(LIBDIR)`, or (b) put the instructions back in freesce's assembly.
+
+`osdbits/menu.c` sidesteps it by doing its matrix arithmetic in plain C.
+This is very likely also why the opening looks wrong in freesce-linked
+builds - `opening.c` calls `sceVu0MulMatrix` from `DrawLights`,
+`DrawCube` and the flare/fog code, and with the broken version every
+one of those transforms collapses onto column 0.
+
+Method, if the same audit is wanted for `libgraph`/`libdma`: disassemble
+the freesce archive, locate each function in the retail image by its
+first four instruction words (the SDK code in the ROM is the same
+build), and diff word by word. Only `libvu0` is hand-written assembly,
+so nop delay slots in the compiled-C libraries are normal and not by
+themselves evidence of anything.
+
+### 10.9 Neighbours worth naming (not ported)
+
+* **The backdrop mesh** - `0x21D0A0` calls `0x229358(m0, m1)`, which
+  steps timer `0x27F190` and, **only while the transition state is 0**,
+  tail-calls `0x2292D0`: bind TEXCKABE (`0x22AB90(1,1,2)`), then sixteen
+  `0x229130(m0, m1, a, a+0x1000)` calls sweeping a full 16-bit turn.
+  That is the deep-blue "smoke" wall behind the orbs, and it is the
+  single biggest thing still missing from `osdbits`' menu mode.
+* **The composite** - `0x21D0A0`'s tail: two `0x22A4C8` clears, two
+  `0x22C190(0)` full-screen blits, `0x22A198`/`0x22A290` to make the
+  offscreen target sampleable, then `0x2299C0(0x27B4B0)` - a full-screen
+  additive blit at RGB `{0x37,0x28,0x3C}`, alpha 0x80. This is what
+  gives the menu its motion-blurred wash; `0x2267E8`'s two-pass flush
+  and `0x226768(30)` feed the same buffer.
+* **The carousel** - the 12-entry ring at `0x34E6C0` (stride 48,
+  rotation offset at `0x34E6C0` seeded from the hour) driven by
+  `0x225BF8` from timer `0x27EB00`; when its progress passes
+  `*(gp-32148)` = 0.05, `0x226028` appends the non-orb records that
+  `0x2266E0` -> `0x22D920` and `0x22E428` draw. These are the fly-in
+  objects, and the only part of the scene that needs VU1 (`vucode_2`,
+  uploaded by `0x22EE88` -> `0x22EE00` from the chain at `0x268860`).
+  The orbs need no VU1 at all - `0x22EFF0` emits GIF packets directly.
+
+### 10.10 What the port renders, and how it was checked headless
+
+`osdbits/menu.c` (mode `menu`) draws the seven orbs with their trails,
+halos and cores, the entry fly-in and the fade-up curtain. Verified in
+PCSX2 with no window: the EE prints each orb's projected screen
+position, depth and colour for the first two frames, and
+`DumpFrameAscii()` reads the drawn buffer back with
+`sceGsExecStoreImage` and prints it as an 8x8-block luminance map (the
+`debugFrame` argument). Two checks passed:
+
+* the per-orb depths the EE printed (80345, 81859, 83526, 85056, 86152,
+  86585, 86260 at 12:34:56, frame 1) reproduce a host-side model of the
+  same arithmetic to the digit, so the camera, the orbit chain and the
+  projection all agree with the disassembly;
+* the readback shows the orb cluster and its trails exactly where those
+  coordinates put them - at frame 50 with the entry skipped, and at
+  frame 120 with the entry running, where the seven orbs have converged
+  from their scattered start into the ring.
+
+Performance note: with PCSX2's **software** renderer (`Renderer = 13`)
+the scene runs at about **1 fps**, against 60 fps for the opening in the
+same build. It is not a hang and it is not a coordinate blow-up - the
+settled scene, whose vertices all sit well inside the screen, is just as
+slow as the fly-in. The cost is 7 x 49 = 343 AA1 line segments per
+frame, which the software rasteriser draws with per-pixel coverage
+blending; the opening's light trails are the same idiom but only ~64
+segments. Worth a check on a hardware renderer and on real hardware
+before treating it as a problem - the ROM does twice this work, drawing
+every orb into two buffers.
