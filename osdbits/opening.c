@@ -1052,6 +1052,21 @@ static sceVu0FVECTOR origin = { 0.0f, 0.0f, 0.0f, 1.0f };
 
 static int lightsSeed;
 
+/* the ROM's own rand(): newlib-1999 32-bit LCG at 0x25b478, seed cell
+ * starts at 1 and srand() provably never runs before the opening
+ * (verified against two real savestates: the seed cell sits exactly N
+ * LCG steps from 1).  The SDK libc's rand() is the modern 64-bit
+ * newlib LCG - a DIFFERENT stream - so the port must roll its own to
+ * reproduce the real boot's values (lightsSeed = draw #386 = 4002,
+ * savestate-verified). */
+static u32 osdRandSeed = 1;
+static int
+osdRand(void)
+{
+	osdRandSeed = osdRandSeed*1103515245 + 12345;
+	return osdRandSeed & 0x7FFFFFFF;
+}
+
 static void InitCubes(void);
 
 static void
@@ -1081,7 +1096,7 @@ InitLightsCubes(void)
 	}
 	lightTrailStart = 0;
 	lightTrailEnd = 0;
-	lightsSeed = rand()%2345 + 3456;	/* real: 0x217d80 */
+	lightsSeed = osdRand()%2345 + 3456;	/* real: 0x217d80 */
 }
 
 static void
@@ -1124,7 +1139,7 @@ DrawLights(void)
 					float q = sprTransformVertex(sprVertices->verts2[0], lightVertices[j*4+k], sprMatrices->worldScreenMatrix);
 					float s = lightTexCoords[k][0]*q;
 					float t = lightTexCoords[k][1]*q;
-					rand();	/* real call at 0x216a54, result
+					osdRand();	/* real call at 0x216a54, result
 						 * unused - kept for rand() phase */
 
 					int r, g, b, a;
@@ -3136,8 +3151,8 @@ HeightGrid(void)
 #define TOWER_FIELD_CAPTURED 0
 
 #if !TOWER_FIELD_CAPTURED
-/* private LCG so field generation never touches libc rand() (lightsSeed
- * is tuned to be the boot's 5th rand() call) */
+/* private LCG so field generation never touches the opening's osdRand()
+ * stream (lightsSeed must stay draw #386, matching the real boot) */
 static u32 towerRandState = 0x2b992ddf;
 static int
 towerRand(void)
@@ -4026,21 +4041,21 @@ sub_215798(void)
 			col = illegalFogColors[j*3+i];
 			c = 0;
 			if(j == 1 && i == 1)
-				c = rand()%64 + 64;
+				c = osdRand()%64 + 64;
 			col[0] = c;
 			col[3] = 128;
 			col[1] = col[2] = c*96/128;
 		}
 	for(i = 0; i < 128; i++) {
-		illegalFogPos[i][0] = (rand()%4800 - 2400)*0.01f;
-		illegalFogPos[i][1] = (rand()%4800 - 2400)*0.01f;
+		illegalFogPos[i][0] = (osdRand()%4800 - 2400)*0.01f;
+		illegalFogPos[i][1] = (osdRand()%4800 - 2400)*0.01f;
 		illegalFogPos[i][3] = 0.0f;
 		illegalFogRot[i][0] = 0.0f;
 		illegalFogRot[i][1] = 0.0f;
 		illegalFogRot[i][2] = 0.0f;
 		illegalFogRot[i][3] = 1.0f;
 		illegalFogState[i] = 0;
-		illegalFogPos[i][2] = rand()%805 + 477;
+		illegalFogPos[i][2] = osdRand()%805 + 477;
 	}
 }
 
