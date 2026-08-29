@@ -47,6 +47,43 @@ does `lw a0,-4896(v0)` with `v0 = lui 0x27`, i.e. 0x270000 − 0x1320 =
 0x26ECE0. 0x26EDE0 is inside the resource table (§4.3), so the idc name
 lands on unrelated data.
 
+### 0.1 Errata from the Module U deep dive (2026-08-29)
+
+The dedicated Module U passes (`menu-logic.md`, `menu-draw.md`,
+`menu-scene.md`) superseded several claims below; the sections are left
+as written, so read them with these corrections:
+
+* **§3.2's "screen ids" 106–116 are CDVD disc types, not UI screens**
+  (0x00 NODISC→100 … 0x12 PS2CD→108, 0x14 PS2DVD→110, 0xFF illegal→116).
+  `0x1F0010` is written only by the ThreadA disc poller (0x20B9F8, and
+  0x20B7C0 forcing 116) and by `main` (101) — never by Module U. Module
+  switching goes through `0x1F05E8` indexing the thread table at
+  0x2B92E0; `0x1F0014` is a boot request consumed via 0x202E88. There
+  are THREE dispatch tables (0x2A46C0/0x2A46F0/0x2A4720), not one.
+* **The frame loop lives INSIDE `0x21CA38`** (backedge 0x21CC70 →
+  0x21CA98): `0x21CE58` is one-shot module init (VU1 program arm, TEXC
+  texture upload, font, config→UI-model), NOT a per-frame sub-renderer
+  chain; `0x21CF20` is the real per-frame body (its 16-call order is the
+  draw order) and `0x2283F0` is per-frame UI drawing, not a screen-init
+  hub. §3.1/§3.2 have these roles wrong.
+* **Nothing in Module U calls opening-module code, and the §2 "shared
+  renderer core" is not shared**: 0x230478–0x230FC8 (setScreenMatrix
+  etc.) is Module-V-only; Module U uses its own 0x230000–0x230440 slice
+  and its own packet layer (no `sceVif1Pk*` at all — that library is
+  Module V's).
+* **`menuElemVertTable` 0x284100 is Module-V-only** (all ten referencing
+  sites), contra §5.2. **`0x1F0A10` is the `sceGsDBuff`**, not a message
+  ring. The §3.6 UI model has **+0 = screenType, +4 = spdifMode**
+  (swapped below).
+* The unxref'd record table at **0x2A4380 belongs to the opening** (part
+  of the NTSC/PAL rect array at 0x2A4318 consumed by 0x214A60 /
+  DoSCEText) — not a config-menu table. `0x21EF00` is dead code, one of
+  sixteen dead functions in Module U.
+* There are no per-setting callbacks: config items bind to the UI model
+  purely by word index (HDDOSD's `clock_config_change_cb_*` names have
+  no retail counterpart). HDDOSD drift in Module U is ≈ +0x8F78
+  (e.g. `draw_menu_item` = retail 0x21DC88).
+
 ---
 
 ## 1. Top-level program anatomy
