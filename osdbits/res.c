@@ -1,6 +1,8 @@
 #include "inc.h"
 #include "res.h"
 
+#include "res/TEXCBLUR_EXP.inc"
+#include "res/TEXCNAVI_EXP.inc"
 #include "res/TEXOBLPR_EXP.inc"
 #include "res/TEXOBLP_EXP.inc"
 #include "res/TEXOCRBL_EXP.inc"
@@ -168,6 +170,11 @@ LoadResources(void)
 	resources[RESID_TEXOFOG0].size = TEXOFOG0_EXP_len;
 	resources[RESID_TEXOFOG3].data = TEXOFOG3_EXP;
 	resources[RESID_TEXOFOG3].size = TEXOFOG3_EXP_len;
+	/* the menu background scene's orb sprites (menu.c) */
+	resources[RESID_TEXCBLUR].data = TEXCBLUR_EXP;
+	resources[RESID_TEXCBLUR].size = TEXCBLUR_EXP_len;
+	resources[RESID_TEXCNAVI].data = TEXCNAVI_EXP;
+	resources[RESID_TEXCNAVI].size = TEXCNAVI_EXP_len;
 }
 
 u8*

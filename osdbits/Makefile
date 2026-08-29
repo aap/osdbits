@@ -16,14 +16,18 @@ TARGET      = main
 OBJS        = crt0.o \
               res.o \
               opening.o \
+              menu.o \
               towerchain.o \
               $(TARGET).o
 
 LCFILE      = $(LIBDIR)/app.cmd
 # libpkt and libdev come from the original SDK until freesce has them
-# (freesce's libdev is missing the vif1/vu1/gif resets)
+# (freesce's libdev is missing the vif1/vu1/gif resets).  libvu0 too:
+# freesce's libvu0.c loses the branch-delay-slot instructions (no .set
+# noreorder around the asm blocks), so e.g. sceVu0MulMatrix writes all
+# four columns to column 0 - flip back to $(LIBDIR) once that's fixed.
 LIBS        = $(LIBDIR)/libgraph.a \
-              $(LIBDIR)/libvu0.a \
+              $(SCETOP)/lib/libvu0.a \
               $(LIBDIR)/libdma.a \
               $(SCETOP)/lib/libpkt.a \
               $(SCETOP)/lib/libdev.a

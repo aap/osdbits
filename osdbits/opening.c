@@ -17,34 +17,8 @@ dumpMat(float *m)
 }
 
 
-typedef struct GSTex GSTex;
-struct GSTex
-{
-	u32 mxl;
-	u32 unk1[3];
-	u32 psm;
-	u32 unk2[3];
-	u32 cbp;
-	u32 unk3[3];
-	u32 tbp[7];
-	Rect dim[7];
-	u32 unk4;
-};
-
-typedef struct Texture Texture;
-struct Texture
-{
-	u8 *data;
-	i32 resourceID;
-	u32 *clut;
-	i32 usage;
-	Rect dim;
-	i32 maxLevel;
-	i32 dataOffset;
-	u32 format;	// extended PSM
-	u32 unk2;
-	GSTex gstex;
-};
+/* GSTex/Texture now live in inc.h - menu.c uploads its own textures
+ * through the same InitTexture()/vif1SetTexture() path. */
 
 u32 clut[16] = {
 	0x00000000,
@@ -597,8 +571,9 @@ int sceneState;
  * boot    - the real boot sequence: fly-up, SCE text, scene end
  * idle    - stay over the tower field forever (no forward motion, so
  *           the state machine and text never trigger)
- * illegal - the illegal-disc scene (openingType 1) */
-enum { MODE_BOOT, MODE_IDLE, MODE_ILLEGAL };
+ * illegal - the illegal-disc scene (openingType 1)
+ * menu    - the main-menu 3D background scene (Module U, menu.c) */
+enum { MODE_BOOT, MODE_IDLE, MODE_ILLEGAL, MODE_MENU };
 static int openingMode = MODE_BOOT;
 static int argBase;	/* first numeric arg, set by ParseArgs */
 
@@ -655,7 +630,7 @@ UploadImage(void *data, u32 gsAddr, u32 psm, Rect *r)
 	return gsAddr;
 }
 
-static void
+void
 InitTexture(Texture *tex)
 {
 	int i, x, y;
@@ -822,7 +797,7 @@ InitTextures(void)
 	}
 }
 
-static void
+void
 InitRender(void)
 {
 	sceDevVif0Reset();
@@ -3271,7 +3246,7 @@ argInt(int n, int def)
 static void
 ParseArgs(void)
 {
-	static const char *modeNames[] = { "boot", "idle", "illegal" };
+	static const char *modeNames[] = { "boot", "idle", "illegal", "menu" };
 	int i, m;
 
 	/* arg base: PCSX2's -gameargs passes user args starting at argv[0]
@@ -3282,7 +3257,7 @@ ParseArgs(void)
 	for(i = 0; i < 2 && i < gameArgc; i++) {
 		if(gameArgv[i] == nil)
 			continue;
-		for(m = 0; m < 3; m++)
+		for(m = 0; m < 4; m++)
 			if(strcmp(gameArgv[i], modeNames[m]) == 0) {
 				openingMode = m;
 				argBase = i+1;
@@ -3291,6 +3266,10 @@ ParseArgs(void)
 	}
 	printf("osdsys: mode %s\n", modeNames[openingMode]);
 }
+
+/* the numeric-argument accessors, for modes that parse their own args
+ * (menu.c) instead of going through SimulateBootHistory */
+int OsdArgInt(int n, int def) { return argInt(argBase + n, def); }
 
 /* simulate a memory card's life with the REAL updater rules: a library
  * of titles booted with a favourites-skewed distribution, so some
@@ -4169,6 +4148,18 @@ Init(void)
 	 * OpeningInitTowersFog, sub_219f08, initTextShit, StartFrame -
 	 * complete, nothing else in between. */
 	InitRender();
+
+	/* NOT original: the menu background scene is a different module
+	 * (Module U, 0x21C910-0x230000) with its own one-shot init
+	 * (0x21CE58) and its own frame body (0x21CF20) - none of the
+	 * opening's animation/tower/text state applies. */
+	if(openingMode == MODE_MENU) {
+		InitMenuScene();
+		StartFrame();
+		frameCount = evenOddFrame;
+		return;
+	}
+
 	InitAnimation();
 	if(openingMode == MODE_IDLE)
 		positionSpeed[2] = 0.0f;	/* stay put: the state machine and
@@ -4186,7 +4177,10 @@ OpeningThread(void *arg)
 {
 	Init();
 	// ...
-	DoOpeningIllegal();
+	if(openingMode == MODE_MENU)
+		DoMenuScene();
+	else
+		DoOpeningIllegal();
 	// ...
 }
 
