@@ -5,16 +5,10 @@
  *	ee-gcc -O2 -c src/anim.c -o build/anim.o
  *	python3 check.py build/anim.o <expanded.bin> anim-functions.txt
  *
- * Status: 9/11 functions match instruction for instruction.
- *   OpeningThread            30/32 - openingType's temp lands in v1,
- *                                    the ROM has v0 (allocation tie)
- *   ProcessOpeningAnimation 442/446 - the position[1]/position[2]
- *                                    mul.s pairs are scheduled in the
- *                                    other order (equal-priority tie
- *                                    in sched2); everything else,
- *                                    including all three jump tables
- *                                    and the whole matrix tail, is
- *                                    identical.
+ * Status: 11/11 functions match instruction for instruction (the last
+ * two ties fell 2026-08-29: see the per-function comments - one was
+ * found by automated statement-permutation search, one by a missing
+ * prototype).
  *
  * DATA MODEL (all of this was *derived* from the codegen, not assumed):
  *
@@ -184,6 +178,7 @@ void InitOpeningType(void);
 void sub_211fd8(void);
 void sub_212010(void);
 int ProcessOpeningAnimation(void);
+void InitOpening(void);
 
 
 /* 0x215f18 - MATCHES.  Note the store order: the LAST store of a group
@@ -244,10 +239,13 @@ InitIllegalDisc(void)
 	openingGo = 0;
 }
 
-/* 0x215fd0 - 442/446.  Residual: the mul.s pairs for position[1] and
- * position[2] at 0x21655c/0x216560 and 0x216578/0x21657c come out
- * swapped - an equal-priority tie in the post-reload scheduler; the
- * arithmetic, the registers and every other instruction agree. */
+/* 0x215fd0 - MATCHES (446/446).  The last tie (two mul.s pairs
+ * seemingly swapped) was NOT the position[1]/position[2] line order -
+ * permuting those made it far worse.  The real lever, found by
+ * automated statement-permutation search (matching/campaign/): the
+ * `rotation +=` integration statement comes AFTER the three
+ * position[] integrations in the real source, not before.  Moving it
+ * realigns the whole schedule. */
 int
 ProcessOpeningAnimation(void)
 {
@@ -409,11 +407,11 @@ ProcessOpeningAnimation(void)
 
 	anim.accel2[2] += anim.accel1[2]*timestep;
 
-	rotation += (2.0f*anim.rotSpeed[2] + anim.rotAccel[2])*0.5f*timestep;
-
 	position[0] += (2.0f*anim.speed[0] + anim.accel2[0])*0.5f*timestep;
 	position[1] += (2.0f*anim.speed[1] + anim.accel2[1])*0.5f*timestep;
 	position[2] += (2.0f*anim.speed[2] + anim.accel2[2])*0.5f*timestep;
+
+	rotation += (2.0f*anim.rotSpeed[2] + anim.rotAccel[2])*0.5f*timestep;
 
 	if(rotation > 3.14159265f)
 		rotation -= 6.28318531f;
@@ -434,11 +432,12 @@ ProcessOpeningAnimation(void)
 	return type;
 }
 
-/* 0x211d30 - 30/32.  Residual: the openingType temp gets v1 where the
- * ROM has v0 (and the ROM then uses v1 for the thread-id address).
- * Everything else, delay slots included, is identical; sweeping the
- * signature, the if/else sense and the callees' return types did not
- * flip the pair. */
+/* 0x211d30 - MATCHES (32/32).  The v0/v1 "allocation tie" was no tie:
+ * InitOpening was called above its definition, hence implicitly
+ * declared as returning int - the discarded return reserved v0 across
+ * the call and pushed openingType's load into v1.  The prototype at
+ * the top of the file fixes it.  Moral: check the implicit-declaration
+ * warnings before hunting register ties. */
 void
 OpeningThread(void *arg)
 {

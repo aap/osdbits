@@ -1,0 +1,1 @@
+ProcessOpeningAnimation	0x215fd0 0x6f8
