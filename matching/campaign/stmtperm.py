@@ -64,7 +64,7 @@ def main():
         M = list(L)
         for slot, s in zip(sorted(idx), p):
             M[slot] = texts[s]
-        f = out / ("p" + "".join("%x" % x for x in p) + ".c")
+        f = out / ("p" + "-".join("%x" % x for x in p) + ".c")
         f.write_text("\n".join(M))
         o = f.with_suffix(".o")
         r = subprocess.run([GCC, "-O2", "-c", str(f), "-o", str(o)],
@@ -75,7 +75,11 @@ def main():
             s = score1.score(str(o), img, funcs)
         except Exception:
             return None
-        tot = sum(v["strict"] for v in s.values() if v)
+        # a variant that failed to produce every target function is not
+        # a match - it is garbage (guards the vacuous-EXACT hole)
+        if not s or any(v is None for v in s.values()):
+            return None
+        tot = sum(v["strict"] for v in s.values())
         return (tot, str(f), s)
 
     rows = []
