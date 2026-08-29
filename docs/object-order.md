@@ -9,7 +9,7 @@ gp-relative data references (2026-08-28).
 For each function (bounds from the IDB), collect every gp-relative
 access and split it into three classes:
 
-- **lit** — the float literal pool (0x2a7080..0x2a7280): every float
+- **lit** — the float literal pool (~0x2a7040..0x2a7280; the opening's entries start at 0x2a7088): every float
   constant a function loads gp-relative.
 - **sd** — initialized scalar data, `.sdata` (0x2a7700..0x2a7a00).
 - **sb** — zero-initialized scalars, `.sbss` (0x2a7f50..).
