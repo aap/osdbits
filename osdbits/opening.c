@@ -1229,6 +1229,17 @@ static sceVu0FVECTOR cubeSeedTable[CUBE_INSTANCES] = {
 	{ -3.7296f, -2.3677f, 4.3654f, 0.0f },
 	{ -3.1017f,  2.2409f, 4.5429f, 0.0f },
 };
+/* real 0x27af50: the ILLEGAL scene's own seed table - sub_219cb8 reads
+ * this one, NOT the opening's 0x27a210 table above (two cubes park
+ * right in front of the camera's rest position at z=800, two frame the
+ * shot far off-axis) */
+static sceVu0FVECTOR illegalCubeSeedTable[CUBE_INSTANCES] = {
+	{ -10.4068f,  4.1636f, 5.0429f, 0.0f },
+	{ -12.9184f, -4.2708f, 4.3654f, 0.0f },
+	{   2.7639f,  0.1509f, 4.1075f, 0.0f },
+	{   4.0958f, -1.3173f, 3.0952f, 0.0f },
+	{  -2.4321f,  0.5447f, 2.7732f, 0.0f },
+};
 static sceVu0FVECTOR cubeAnchor[CUBE_INSTANCES];	/* real 0x27b0f0: world position */
 static sceVu0FVECTOR cubeRate[CUBE_INSTANCES];		/* real 0x27b190: rotation rate/frame */
 /* real 0x27b140: the live rotation angle, integrated by cubeRate and
@@ -2238,7 +2249,9 @@ FlareThing(int n)
 	if(a > 255) a = 255;
 	if(a < 0) a = 0;
 	size = redFlareIntensity*0.125f + 420.0f;
-	DrawFlareSprite(size, a, 128, 112, 96, 0.1f);
+	/* real scale is 0.9f (.lit4 at 0x2a7200) - 0.1f was a misread that
+	 * check.py's reloc masking couldn't catch */
+	DrawFlareSprite(size, a, 128, 112, 96, 0.9f);
 }
 
 /* the shared body of flare_21AA50/flare_21AF18: 7 tri-fan discs
@@ -4054,12 +4067,13 @@ sub_21b690(float half, float x, float y, float z)
 /* real: sub_219cb8 (0x219cb8) - place the five cubes for the ILLEGAL
  * scene (runs at init for both opening types; the normal scene then
  * overwrites everything in InitLightsCubes): corners/colour from
- * sub_21b690(1.2, 0,0,0), anchors from the shared seed table hanging
- * in the 823..1113 height band the camera climbs through, rates and
- * start angles from small index-derived factors (constants at
- * 0x2a71d4..0x2a71e4).  The real also selects the illegal colour/ST
- * callback (0x2192c0 into 0x2a7808) - the port keys that off the
- * illegal pass table instead. */
+ * sub_21b690(1.2, 0,0,0), anchors from its OWN seed table (0x27af50,
+ * NOT the opening's 0x27a210) spanning the 823..1113 height band the
+ * camera climbs through, rates and start angles from small
+ * index-derived factors (constants at 0x2a71d4..0x2a71e4).  The real
+ * also selects the illegal colour/ST callback (sub_2192c0 into the
+ * 0x2a7808 quad-callback pointer read by DrawTexturedQuad) - the port
+ * keys that off the illegal pass table instead. */
 static void
 sub_219cb8(void)
 {
@@ -4071,9 +4085,9 @@ sub_219cb8(void)
 		f = (i-2)*0.8f;
 		if(f == 0.0f)
 			f = 0.9f;
-		cubeAnchor[i][0] = cubeSeedTable[i][0];
-		cubeAnchor[i][1] = cubeSeedTable[i][1];
-		cubeAnchor[i][2] = (cubeSeedTable[i][2] - 2.5f)*128.0f + 800.0f - 12.0f;
+		cubeAnchor[i][0] = illegalCubeSeedTable[i][0];
+		cubeAnchor[i][1] = illegalCubeSeedTable[i][1];
+		cubeAnchor[i][2] = (illegalCubeSeedTable[i][2] - 2.5f)*128.0f + 800.0f - 12.0f;
 		cubeAnchor[i][3] = 0.0f;
 		/* start ANGLES (0x27b140) from index-derived factors, tiny
 		 * tumble RATES (0x27b190) */
