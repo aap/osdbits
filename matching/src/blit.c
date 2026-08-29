@@ -1,13 +1,93 @@
 /* the framebuffer blits and text overlay (0x214050..0x214f20) -
- * compile with ee-gcc 2.9-ee-991111 -O2, -I<freesce>/ee/include for the
- * real SCE_GS_SET_* macros (eestruct.h/libgraph.h) - see README. */
-
-#include <eetypes.h>
-#include <eestruct.h>
-#include <libgraph.h>
+ * compile with ee-gcc 2.9-ee-991111 -O2 (self-contained, no -I needed).
+ *
+ * THE ONE IDIOM THAT DOMINATES THIS TU (found 2026-08-29):
+ * every "ldl/ldr + sdl/sdr" run in these functions is gcc 2.9 copying a
+ * 16-byte, 4-byte-aligned struct.  They are NOT hand-written struct
+ * assignments - they are LOCAL AGGREGATE INITIALIZERS with non-constant
+ * elements:
+ *
+ *	Rect half = { 0, 0, screenW/2, screenH };
+ *
+ * gcc 2.9 builds such an initializer field by field into a stack TEMP
+ * and then block-copies the temp onto the variable, and its temp-slot
+ * allocator happily parks the temp on the (not yet live) slot of the
+ * NEXT declared local - which is why the copies always run
+ * "sp+N+16 -> sp+N".  A plain "half.x = 0; ... half.h = screenH;"
+ * sequence stores straight into the variable and emits no copy at all,
+ * which is what the previous round did and why nothing lined up.
+ * Verified minimal repro: three initializers reproduce the real
+ * 0x214050 prologue instruction for instruction.
+ *
+ * SEMANTIC DELTAS vs osdbits/opening.c's port (flagged, NOT fixed
+ * there - opening.c is read-only from here; each is a candidate live
+ * bug):
+ *  1. DrawToExtraBuf2's source select is "frameCount & 1", read from
+ *     the SAME gp slot DoIllegalText's frameCount uses (-31088), not
+ *     from evenOddFrame (0x1f0c40) as the port assumes.
+ *  2. DrawToExtraBuf2's trailing vif1SetFramebuffer - the one the port
+ *     calls "role unclear - not ported" and replaces with a FRAME
+ *     restore at clear=0 - is the same "frameCount&1 ? 0 :
+ *     screenW*screenH/64" expression, PSMCT32, clear=1.  It re-points
+ *     FRAME at the screen buffer AND clears, exactly like the first
+ *     call.
+ *  3. TEX0 TH: 9 in DrawToExtraBuf2 but 8 in DrawExtraBuf2 and
+ *     sub_2144c0 (the port uses GetTexExponent(screenH)=8 in all
+ *     three).  TW is a literal 10 in all three.
+ *  4. TEX0 TBW is a compile-time 10 in DrawToExtraBuf2 and
+ *     DrawExtraBuf2 (only sub_2144c0 computes screenW/64).  Same value
+ *     at 640 wide, but hard-coded in the ROM.
+ *  5. TEX0 CLD is 0 in DrawToExtraBuf2; the port passes 1.
+ *  6. DrawToExtraBuf2/sub_2144c0 pass extraBuf1/extraBuf2 to
+ *     vif1SetFramebuffer RAW.  The port divides them by 32 there while
+ *     using them unshifted for TEX0, so the port's globals must hold a
+ *     different unit than the ROM's.  Only DrawExtraBuf2's ZBUF
+ *     address has a /32 in the ROM.
+ *  7. DrawExtraBuf2 really takes 5 arguments (abe, blendmode,
+ *     blendfix, z, gray) - there is no trailing "field" argument as
+ *     the port's call-site comment guesses.
+ *  8. DrawIllegalText's PAL rescale divides by the FLOAT 0.457627f
+ *     (stored as a float widened to double), and casts the int to
+ *     float first; the port divides by the double 0.457627.
+ *  9. DrawSomeSprite2's mode string is read with lbu -> unsigned char.
+ * 10. sub_2144c0 keeps its two buffer addresses in a 2-element int
+ *     ARRAY (that is why the ROM spills them to the stack instead of
+ *     giving them registers).
+ */
 
 typedef unsigned int u32;
-typedef u_long u64;
+typedef unsigned long u64;	/* SCE ee-gcc: long is 64-bit */
+
+/* the handful of GS macros this TU needs, from the SDK's eestruct.h */
+#define SCE_GS_TEX0_1	0x06
+#define SCE_GS_TEX1_1	0x14
+#define SCE_GS_ZBUF_1	0x4e
+
+#define SCE_GS_PSMCT32	0
+#define SCE_GS_PSMCT24	1
+#define SCE_GS_PSMZ24	49
+#define SCE_GS_MODULATE	0
+#define SCE_GS_LINEAR	1
+#define SCE_GS_DEPTH_ALWAYS	1
+#define SCE_GS_DEPTH_GEQUAL	2
+
+#define SCE_GS_SET_TEX0(tbp, tbw, psm, tw, th, tcc, tfx,		\
+			cbp, cpsm, csm, csa, cld)			\
+	((u64)(tbp)         | ((u64)(tbw) << 14) |			\
+	((u64)(psm) << 20)  | ((u64)(tw) << 26) |			\
+	((u64)(th) << 30)   | ((u64)(tcc) << 34) |			\
+	((u64)(tfx) << 35)  | ((u64)(cbp) << 37) |			\
+	((u64)(cpsm) << 51) | ((u64)(csm) << 55) |			\
+	((u64)(csa) << 56)  | ((u64)(cld) << 61))
+
+#define SCE_GS_SET_TEX1(lcm, mxl, mmag, mmin, mtba, l, k)		\
+	((u64)(lcm)         | ((u64)(mxl) << 2) |			\
+	((u64)(mmag) << 5)  | ((u64)(mmin) << 6) |			\
+	((u64)(mtba) << 9)  | ((u64)(l) << 19) |			\
+	((u64)(k) << 32))
+
+#define SCE_GS_SET_ZBUF(zbp, psm, zmsk)					\
+	((u64)(zbp) | ((u64)(psm) << 24) | ((u64)(zmsk) << 32))
 
 typedef struct Rect { int x, y, w, h; } Rect;
 typedef struct Color { u32 r, g, b, a; } Color;
@@ -17,29 +97,47 @@ typedef struct Color { u32 r, g, b, a; } Color;
  * relocatable extern symbols - a page-aligned struct pointer at
  * 0x1f0000 with the fields at their real byte offsets reproduces the
  * real "lui BASE,0x1f; lw x,0xc50(BASE); lw y,0xc54(BASE)" shared-page
- * addressing (a plain "extern int screenW,screenH;" pair would
- * materialise a pointer via an extra addiu instead, desyncing every
- * later instruction's address). */
+ * addressing, with one lui shared by every field access (an
+ * "extern struct" at 0x1f0c40 instead emits a separate lui per field,
+ * because gcc will not CSE %hi(sym+N) across different N - measured,
+ * it costs ~250 aligned words across this TU).
+ *
+ * evenOddField, and ONLY evenOddField, must additionally be VOLATILE.
+ * That is not cosmetic: for a non-volatile absolute address gcc emits
+ * the load as a single gas macro ("lw $5,2034756" -> lui $5 + lw
+ * $5,%lo($5)), which reuses the destination register and is also
+ * eligible for the following jal's delay slot; the ROM instead has the
+ * two-register form ("lui v0,0x1f; lw a1,3140(v0)") and, in
+ * DrawIllegalText, an UNFILLED delay slot after it - both of which are
+ * exactly what gcc emits for a volatile MEM.  Adding the qualifier
+ * turned DrawToExtraBuf2, DrawBlackBars and DoIllegalText from
+ * near-misses into exact matches in one step.  Semantically it is the
+ * vblank-updated field parity, so a volatile is what the original
+ * source would have had anyway. */
 struct DispRegs {
 	char pad[0xc40];
 	int evenOddFrame, evenOddField, pad0, pad1, screenW, screenH;
 };
-#define DISP ((struct DispRegs *)0x1f0000)
+#define DISP  ((struct DispRegs *)0x1f0000)
+#define VDISP ((volatile struct DispRegs *)0x1f0000)
 #define evenOddFrame DISP->evenOddFrame
-#define evenOddField DISP->evenOddField
+#define evenOddField VDISP->evenOddField
 #define screenW      DISP->screenW
 #define screenH      DISP->screenH
 
-/* small gp-resident state (offsets are masked by check.py, so exact
- * addresses don't matter, only that these are plain scalar externs). */
-extern int extraBufFrameFlag;	/* frame-parity flag read directly by
-				 * DrawToExtraBuf2/DrawExtraBuf2, distinct
-				 * from evenOddFrame */
-extern int openingType;
-extern int frameCount;
-extern int openingEndFlag;
-extern int illegalTextState;
-extern int illegalTextAlpha;
+/* small gp-resident state (the gp offsets are masked by check.py, so
+ * only "plain scalar extern" matters; addresses below are for the
+ * record, computed off gp = 0x2AF070).
+ *
+ * NOTE: DrawToExtraBuf2's frame-parity flag and DoIllegalText's
+ * frameCount are read from the SAME gp slot (-31088 in both), so the
+ * previous round's separate "extraBufFrameFlag" was a phantom - the
+ * TEX0 source select really is "frameCount & 1". */
+extern int frameCount;		/* 0x2a7700 */
+extern int openingType;		/* 0x2a7704 */
+extern int openingEndFlag;	/* 0x2a77f4 */
+extern int illegalTextState;	/* 0x2a7f8c */
+extern int illegalTextAlpha;	/* 0x2a7f90 */
 
 extern float openingPosition[4];
 
@@ -47,21 +145,41 @@ extern float openingPosition[4];
  * already block-address units by the time these functions read them (no
  * /32 shift at the use sites in the real code) - hence the wide "ld"
  * load, matching a u64-sized declaration. */
-extern u32 extraBuf1;	/* DrawToExtraBuf2 (write) / DrawExtraBuf2 (read) -
-			 * real loads this via "ld" (64-bit), residual */
-extern u32 extraBuf2;	/* sub_2144c0's scratch working buffer */
+/* extraBuf1 sits at 0x279f18 and is read with a 64-bit "ld", extraBuf2
+ * at 0x279f10 with a 32-bit "lw".  Both are addressed as ordinary
+ * symbols through a %hi/%lo pair in TWO registers ("lui v0,0x28;
+ * ld a0,-24808(v0)"), i.e. NOT gp-relative even though a scalar u64/u32
+ * would fall inside the default -G8 small-data window; declaring them
+ * as incomplete-size arrays is what keeps gcc out of .sdata and
+ * reproduces the two-register form (a cast-to-absolute-address instead
+ * folds the lui into the destination register). */
+extern u64 extraBuf1[];
+extern u32 extraBuf2[];
 
-extern Color grayTemplate;	/* 0x2a42d8 */
-extern Color barColTemplate;	/* 0x2a42e8 */
-extern Rect  spriteRectTemplate;	/* 0x2a42f8: {0,0,?,?} */
+extern Color grayTemplate;	/* 0x2a42d8: {128,128,128,128} */
+extern Color barColTemplate;	/* 0x2a42e8: {255,255,255,128} */
+extern Rect  spriteRectTemplate;	/* 0x2a42f8: {0,0,640,224} */
 extern Color whiteSpriteTemplate;	/* 0x2a4308: {255,255,255,0} */
-extern Rect  sceTextRect[2][2];	/* 0x2a4558.. */
-extern float screenAX, screenAY;
+extern float screenAX, screenAY;	/* 0x2a7730, 0x2a7734 */
 
-typedef struct Texture { int dim[2][2]; int pad[28]; } Texture;
-extern Texture textures[];		/* opaque texture table */
+/* 0x2a4318: the SCE-logo destination rectangles, {NTSC,PAL} x {line0,
+ * line1}.  The ROM indexes it as a flat 8-int row per TV mode (base+4,
+ * base+8, ... each separately added to the pal*32 byte offset), NOT as
+ * a Rect[2][2] - a struct-typed 2D array would emit one shared base
+ * pointer and an ldl/ldr block copy instead of the four lw/sw pairs the
+ * ROM has. */
+extern int sceTextRect[2][8];
+extern Rect sceTextXYTemplate;	/* 0x2a4558: {0,0,256,16} */
+extern Rect sceTextUVTemplate;	/* 0x2a4568: {0,1,256,30} */
+extern Rect illegalXYTemplate;	/* 0x2a4578: {64,88,512,64} */
+extern Rect illegalUVTemplate;	/* 0x2a4588: {0,0,512,128} */
+
+/* the texture descriptors are 240 bytes each (the ROM multiplies the
+ * language index by 240); the illegal-disc text starts at index 13. */
+typedef struct Texture { int pad[60]; } Texture;
+extern Texture textures[];
 #define TEXID_SCE 0
-#define TEXID_PNG 1
+#define TEXID_PNG 13
 
 extern void vif1SetZTest(int enb);
 extern void vif1SetZWrite(int enb);
@@ -69,7 +187,7 @@ extern void vif1SetXYOffset(int field, int halfpx);
 extern void vif1SetAlphaBlend(u32 type, u32 mode, u32 fix);
 extern void vif1SetFlatRect(Rect *r, Color *col, u32 abe, u32 z);
 extern void vif1SetTexRect(Rect *r, Rect *tr, Color *col, u32 abe, u32 z);
-extern void vif1SetFramebuffer(u32 fbp, u32 psm, int width, int height, int clear);
+extern void vif1SetFramebuffer(u64 fbp, u32 psm, int width, int height, int clear);
 extern void vif1SetAD(u32 a, u64 d);
 extern void vif1SetTexture(void *tex);
 
@@ -77,57 +195,50 @@ extern void *vif1Begin(void);
 extern void  vif1End(void);
 extern void *pktSetAD(void *pkt, u32 a, u64 d);
 extern void *pktSetTEST_1(void *pkt, u32 ate, u32 atst, u32 aref, u32 afail,
-	u32 date, u32 datm, u32 zte, u32 ztst);
+	u32 date, u32 datm, u32 zte, u64 ztst);
 extern void *pktSetAlphaBlend(void *pkt, u32 type, u32 mode, u32 fix);
 extern void *pktSetFlatRect(void *pkt, Rect *r, Color *col, u32 abe, u32 z);
 extern void *pktSetTexRect(void *pkt, Rect *r, Rect *tr, Color *col, u32 abe, u32 z);
 
-extern void *memset(void *s, int c, unsigned long n);
 extern int IsPAL(void);
 extern int GetLanguage(void);
 
 extern void sub_2144c0(int n, int frame, int field);
 
-/* 0x214050
- * RESIDUAL (3/123 insns matched): structure, call order and the
- * template/field-order details below are all confirmed correct (no
- * vif1SetZTest calls here - those are opening.c's own harness addition,
- * not in the real ROM). What's NOT reproduced: the real expands each
- * "flag ? 0 : screenW*screenH/64" ternary (there are two, one for the
- * TEX0 src and one for the FRAME restore) into ~25/~14 instructions
- * with a full duplicate computation in both arms; every C shape tried
- * here (ternary, if/else) collapses it to a tighter ~17/~12-instruction
- * branch-likely form instead, which desyncs every later fixed-offset
- * comparison even though the logic is identical. */
+/* 0x214050 - MATCHES.
+ * Source shapes recovered from the ROM:
+ *  - the three locals are aggregate INITIALIZERS (see the file header),
+ *    declared half, full, gray in that order;
+ *  - the tbp selector is written INLINE as the macro argument, not
+ *    hoisted into a local: gcc duplicates the whole SCE_GS_SET_TEX0 /
+ *    call-argument expression into both arms of the ternary (the
+ *    constant 0x668028000 is materialised twice, and the "or" with the
+ *    tbp only appears in the non-zero arm).  Hoisting it into a
+ *    variable, as the previous round did, collapses that to a single
+ *    tighter block;
+ *  - the condition is "flag & 1" (andi+bnez), not "flag != 0";
+ *  - TEX0's tbw is a compile-time 10 here, NOT screenW/64 (sub_2144c0
+ *    does use the runtime screenW/64, so this is a real source
+ *    difference, not folding), and TH is 9;
+ *  - both vif1SetFramebuffer calls pass clear=1 (see SEMANTIC note). */
 static void
 DrawToExtraBuf2(void)
 {
-	Rect half, full;
-	Color gray;
-	u32 src, dstFbp;
-
-	half.x = 0;
-	half.y = 0;
-	half.w = screenW/2;
-	half.h = screenH;
-	full.x = 0;
-	full.y = 0;
-	full.w = screenW;
-	full.h = screenH;
-	gray = grayTemplate;
+	Rect half = { 0, 0, screenW/2, screenH };
+	Rect full = { 0, 0, screenW, screenH };
+	Color gray = grayTemplate;
 
 	vif1SetXYOffset(0, evenOddField);
 	vif1SetZWrite(0);
-	vif1SetFramebuffer(extraBuf1, SCE_GS_PSMCT32, screenW, screenH, 1);
+	vif1SetFramebuffer(extraBuf1[0], SCE_GS_PSMCT32, screenW, screenH, 1);
 
-	src = extraBufFrameFlag ? 0 : screenW*screenH/64;
-	vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(src, screenW/64, SCE_GS_PSMCT32,
-			10, 9, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 0));
+	vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(frameCount & 1 ? 0 : screenW*screenH/64,
+			10, SCE_GS_PSMCT32, 10, 9, 1, SCE_GS_MODULATE, 0, 0, 0, 0, 0));
 	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
 	vif1SetTexRect(&half, &full, &gray, 0, 0xFFFFFF);
 
-	dstFbp = extraBufFrameFlag ? 0 : screenW*screenH/64;
-	vif1SetFramebuffer(dstFbp, SCE_GS_PSMCT32, screenW, screenH, 0);
+	vif1SetFramebuffer(frameCount & 1 ? 0 : screenW*screenH/64,
+		SCE_GS_PSMCT32, screenW, screenH, 1);
 	vif1SetZWrite(1);
 	vif1SetXYOffset(1, evenOddField);
 }
@@ -142,28 +253,35 @@ DrawToExtraBuf2(void)
  * takes and returns the packet pointer for chaining) instead of calling
  * the vif1Set* one-shot wrappers - confirmed by decoding the packed
  * SCE_GS_SET_ZBUF/TEST/TEX0 immediates directly out of the real bytes.
- * RESIDUAL (2/160 insns matched): extraBuf1 is really loaded via a
- * 64-bit "ld" in the real (see its declaration above); declaring it
- * u64 here produced far worse codegen (a spurious 32<->64 truncation
- * dance) than accepting this one load-width delta as-is. */
+ * full/half are aggregate initializers (the ldl/ldr idiom, see file
+ * header) but col is NOT - it is built by four plain field stores, so
+ * no block copy is emitted for it.  TEX0 here has TH=8 (DrawToExtraBuf2
+ * uses 9) and, like there, a compile-time TBW of 10.  pktSetTEST_1's
+ * 9th argument goes on the stack with "sd", not "sw", so that parameter
+ * is 64-bit.  The ZBUF address must be written "(X/64<<1)/32": spelled
+ * "X/64*2/32" fold() collapses it to X/1024 (one addiu 1023 + sra 10)
+ * and the ROM plainly has the three-step /64, *2, /32 sequence.
+ *
+ * RESIDUAL 141/160, 17 differ, all of them register NAMES: the seven
+ * callee-saved pseudos are allocated
+ *   ROM   s2=z s3=blendfix s4=&half s5=&col s6=abe s7=blendmode s8=&full
+ *   ours  s2=z s3=&col     s4=abe   s5=mode s6=fix s7=&full     s8=&half
+ * i.e. a pure allocation-order permutation with identical instruction
+ * text.  Levers tried with no effect: declaring pkt first, u32 vs int
+ * parameter types, casting z at the call, and moving vif1Begin() ahead
+ * of the col stores (that one is strictly worse, 112/160).  Left for a
+ * permuter pass. */
 static void
 DrawExtraBuf2(int abe, int blendmode, int blendfix, int z, int gray)
 {
-	Rect full, half;
+	Rect full = { 0, 0, screenW, screenH };
+	Rect half = { 0, 0, screenW/2, screenH };
 	Color col;
 	void *pkt;
 
 	if(gray < 0)
 		gray = 0;
 
-	full.x = 0;
-	full.y = 0;
-	full.w = screenW;
-	full.h = screenH;
-	half.x = 0;
-	half.y = 0;
-	half.w = screenW/2;
-	half.h = screenH;
 	col.r = gray;
 	col.g = gray;
 	col.b = gray;
@@ -171,37 +289,45 @@ DrawExtraBuf2(int abe, int blendmode, int blendfix, int z, int gray)
 
 	pkt = vif1Begin();
 	pkt = pktSetTEST_1(pkt, 0, 0, 0, 0, 0, 0, 1, SCE_GS_DEPTH_ALWAYS);
-	pkt = pktSetAD(pkt, SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF(screenW*screenH/64*2/32, SCE_GS_PSMZ24, 1));
-	pkt = pktSetAD(pkt, SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf1, screenW/64, SCE_GS_PSMCT24,
-			10, 9, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 0));
+	pkt = pktSetAD(pkt, SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF((screenW*screenH/64<<1)/32, SCE_GS_PSMZ24, 1));
+	pkt = pktSetAD(pkt, SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf1[0], 10, SCE_GS_PSMCT24,
+			10, 8, 1, SCE_GS_MODULATE, 0, 0, 0, 0, 0));
 	pkt = pktSetAD(pkt, SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
 	pkt = pktSetAlphaBlend(pkt, abe, blendmode, blendfix);
 	pkt = pktSetTexRect(pkt, &full, &half, &col, 1, z);
-	pkt = pktSetAD(pkt, SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF(screenW*screenH/64*2/32, SCE_GS_PSMZ24, 0));
+	pkt = pktSetAD(pkt, SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF((screenW*screenH/64<<1)/32, SCE_GS_PSMZ24, 0));
 	pkt = pktSetTEST_1(pkt, 0, 0, 0, 0, 0, 0, 1, SCE_GS_DEPTH_GEQUAL);
 	vif1End();
 }
 
-/* 0x2144c0 - the fly-up feedback blur.
- * RESIDUAL (5/179 insns matched): same class of issue as
- * DrawToExtraBuf2 - the "frame==0 ? screenW*screenH/64 : 0" screenTbp
- * ternary here (used identically in DrawToExtraBuf2) compiles tighter
- * than whatever branch expansion the real compiler chose, desyncing
- * the fixed-offset comparison for the rest of the function even though
- * the loop body and vif1Set* call sequence are structurally right. */
+/* 0x2144c0 - the fly-up feedback blur.  MATCHES.
+ * Source shapes recovered from the ROM's stack layout (gray at sp+0,
+ * full at sp+16, two ints at sp+32/36, shrink at sp+48, an aggregate
+ * temp at sp+64):
+ *  - gray is the FIRST declaration (a plain copy of the template, no
+ *    temp - copies from an lvalue need none), full the second (an
+ *    aggregate initializer, temp at sp+32);
+ *  - screenTbp and buf2 are two int locals that land in the 16 bytes
+ *    the (already freed) sp+32 temp gave back - which pins them as
+ *    declarations, not spills;
+ *  - buf2 MUST be a local: gcc cannot hoist the extraBuf2 load out of
+ *    the loop itself (the vif1Set* calls could clobber it), yet the ROM
+ *    loads it exactly once before the loop;
+ *  - shrink is declared INSIDE the loop body with an aggregate
+ *    initializer (that is what puts its temp at sp+64, above shrink,
+ *    instead of reusing the sp+32/36 hole);
+ *  - TEX0's TH is 8 here (DrawToExtraBuf2 uses 9) and TBW really is the
+ *    runtime screenW/64. */
 void
 sub_2144c0(int n, int frame, int field)
 {
-	Rect full, shrink;
 	Color gray = grayTemplate;
-	u32 screenTbp;
+	Rect full = { 0, 0, screenW, screenH };
+	int bufs[2];
 	int i;
 
-	full.x = 0;
-	full.y = 0;
-	full.w = screenW;
-	full.h = screenH;
-	screenTbp = frame == 0 ? screenW*screenH/64 : 0;
+	bufs[0] = frame == 0 ? screenW*screenH/64 : 0;
+	bufs[1] = extraBuf2[0];
 
 	vif1SetXYOffset(0, field);
 	vif1SetZWrite(0);
@@ -209,19 +335,17 @@ sub_2144c0(int n, int frame, int field)
 	vif1SetAlphaBlend(0, 0, 0);
 	vif1SetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(0, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
 	for(i = 0; i < n; i++) {
-		shrink.x = 0;
-		shrink.y = 0;
-		shrink.w = screenW*7/8 - 1 - i*(n-1);
-		shrink.h = screenH*7/8 - 1 - i*(n-1);
+		Rect shrink = { 0, 0, screenW*7/8 - (i*(n-1) + 1),
+				screenH*7/8 - (i*(n-1) + 1) };
 
-		vif1SetFramebuffer(extraBuf2, SCE_GS_PSMCT32, screenW, screenH, 1);
-		vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(screenTbp, screenW/64, SCE_GS_PSMCT32,
-				10, 9, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 0));
+		vif1SetFramebuffer(bufs[1], SCE_GS_PSMCT32, screenW, screenH, 1);
+		vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(bufs[0], screenW/64, SCE_GS_PSMCT32,
+				10, 8, 1, SCE_GS_MODULATE, 0, 0, 0, 0, 0));
 		vif1SetTexRect(&shrink, &full, &gray, 0, 0xFFFFFF);
 
-		vif1SetFramebuffer(screenTbp, SCE_GS_PSMCT32, screenW, screenH, 1);
-		vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf2, screenW/64, SCE_GS_PSMCT32,
-				10, 9, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 0));
+		vif1SetFramebuffer(bufs[0], SCE_GS_PSMCT32, screenW, screenH, 1);
+		vif1SetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(bufs[1], screenW/64, SCE_GS_PSMCT32,
+				10, 8, 1, SCE_GS_MODULATE, 0, 0, 0, 0, 0));
 		vif1SetTexRect(&full, &shrink, &gray, 0, 0xFFFFFF);
 	}
 	vif1SetZTest(1);
@@ -229,51 +353,47 @@ sub_2144c0(int n, int frame, int field)
 	vif1SetXYOffset(1, field);
 }
 
-/* 0x214790 - letterbox bars.  Confirmed structural detail: col is
- * copied from its template FIRST, then r1/r2 are zero-filled via one
- * memset(&r1, 0, 32) covering both adjacent 16-byte Rects (matches an
- * aggregate-zero-initializer for two adjacently-declared locals under
- * this compiler), with only w/h (and r2.y) patched afterward.
- * RESIDUAL (2/97 insns matched): a similar early-instruction-count
- * delta to DrawToExtraBuf2 desyncs the tail of the function. */
+/* 0x214790 - letterbox bars.  MATCHES.  Confirmed structural detail: col is
+ * copied from its template FIRST (slot sp+0), and the two bars are ONE
+ * two-element ARRAY, not two separate Rects: the single 32-byte
+ * aggregate initializer is what produces the single memset(temp, 0, 32)
+ * at sp+48 followed by one 32-byte block copy down to sp+16.  Two
+ * separate Rect initializers would emit two 16-byte clears and two
+ * copies.  Only .w is set in the initializer; the three .h/.y patches
+ * come afterwards and, being independent stores, are emitted
+ * last-store-first (bars[1].h, bars[1].y, bars[0].h). */
 static void
 DrawBlackBars(void)
 {
-	Rect r1 = {0}, r2 = {0};
 	Color col = barColTemplate;
+	Rect bars[2] = { { 0, 0, screenW, 0 }, { 0, 0, screenW, 0 } };
 	int imgh, bar;
 
 	imgh = (float)screenW * 9.0f * screenAY / (screenAX * 16.0f);
 	bar = (screenH - imgh + 1)/2;
-	r1.w = screenW;
-	r1.h = bar;
-	r2.y = bar + imgh;
-	r2.w = screenW;
-	r2.h = bar;
+	bars[0].h = bar;
+	bars[1].y = bar + imgh;
+	bars[1].h = bar;
 
 	vif1SetXYOffset(1, evenOddField);
 	vif1SetZTest(0);
 	vif1SetZWrite(0);
 	vif1SetAlphaBlend(1, 1, 128);
-	vif1SetFlatRect(&r1, &col, 1, 0xFFFFFF);
-	vif1SetFlatRect(&r2, &col, 1, 0xFFFFFF);
+	vif1SetFlatRect(&bars[0], &col, 1, 0xFFFFFF);
+	vif1SetFlatRect(&bars[1], &col, 1, 0xFFFFFF);
 	vif1SetZWrite(1);
 	vif1SetZTest(1);
 }
 
-/* 0x214918 - full-screen 'B'/'W' fade rect.  The real builds BOTH
+/* 0x214918 - full-screen 'B'/'W' fade rect.  MATCHES.  The real builds BOTH
  * colours unconditionally: white from a pre-baked {255,255,255,0}
  * template, black via a zero-fill (memset), then patches only .a
  * before drawing whichever one the mode byte selects.  81/82 insns
- * matched; RESIDUAL is a single instruction: the real loads mode[0] via
- * signed "lb" here too, matched everywhere else this byte is read, but
- * in this one spot (right after the alpha>128 clamp) the register
- * allocator's context gives "lbu" instead - tried plain char, signed
- * char, and a separate local for the loaded byte, all reproduce the
- * same one-instruction opcode difference with zero effect on
- * semantics. */
+ * matched.  The one byte load is "lbu", so mode is an UNSIGNED char
+ * pointer (ee-gcc's plain char is signed); it is loaded once and both
+ * comparisons reuse the register. */
 static void
-DrawSomeSprite2(const signed char *mode, int alpha)
+DrawSomeSprite2(const unsigned char *mode, int alpha)
 {
 	Rect r = spriteRectTemplate;
 	Color colW = whiteSpriteTemplate;
@@ -300,86 +420,118 @@ DrawSomeSprite2(const signed char *mode, int alpha)
 	vif1SetZTest(1);
 }
 
-/* 0x214a60 - args (0, 0, alpha), only alpha is used.
- * RESIDUAL (1/111 insns matched, needs more work): confirmed the real
- * uses the vif1Begin()/pktSetAlphaBlend()/pktSetTexRect()/vif1End()
- * pkt-chaining idiom (each pkt* call takes/returns the packet pointer,
- * as established for DrawExtraBuf2) and calls a vif1SetTexture-style
- * helper at 0x213ec0 before drawing, both reflected below. NOT yet
- * matched: the real appears to copy TWO static 16-byte UV templates
- * (0x2a4558, 0x2a4568 - 16 bytes apart) unconditionally at the top of
- * the function, rather than building one uv Rect and doing "uv.y+=32"
- * between the two pktSetTexRect calls as done here; it also scales the
- * sceTextRect index via "pal_bool<<5" (pal!=0 turned into a 0/32 byte
- * offset) rather than a 2D array index. Both need re-deriving from the
- * real bytes before this will line up. */
+/* 0x214a60 - args (0, 0, alpha), only alpha is used.  109/111.
+ * Source shapes recovered from the ROM:
+ *  - "int pal = IsPAL() != 0;" is the FIRST declaration (that is why the
+ *    call precedes the two template copies) and the "!= 0" is real: the
+ *    ROM normalises the result with sltu before scaling it by 32
+ *    (sll 5), which a bare IsPAL() index would not do;
+ *  - xy and uv are initialised from two SEPARATE 16-byte templates
+ *    (0x2a4558/0x2a4568 - each gets its own lui, so they are two
+ *    symbols, not one two-element array), and xy's initializer is DEAD:
+ *    both draws overwrite all four fields.  gcc keeps the store because
+ *    xy's address escapes to pktSetTexRect;
+ *  - the per-draw xy update is four scalar assignments out of the flat
+ *    sceTextRect row, not a struct copy (see that extern's comment);
+ *  - col is filled .a FIRST, then .r/.g/.b: with the usual r,g,b,a
+ *    order every scratch register in the two template copies and the
+ *    128 constant shifts by one (11 extra register diffs), which is how
+ *    the field order was pinned down.
+ *
+ * RESIDUAL 2 words, 0 differ: the ROM emits the two "addu" that form
+ * the [pal][1]/[pal][3] addresses BEFORE the two "lw" that use the
+ * [pal][0]/[pal][2] ones, this build emits them after - a pure sched
+ * tie inside one basic block.  Reordering the four field assignments
+ * and moving "uv.y += 32" both only make it worse (103, 101, 90 and
+ * 107/111 respectively). */
 static void
 DrawSCEText(int x, int y, int alpha)
 {
-	Rect xy, uv;
+	int pal = IsPAL() != 0;
+	Rect xy = sceTextXYTemplate;
+	Rect uv = sceTextUVTemplate;
 	Color col;
-	int pal;
 	void *pkt;
 
-	pal = IsPAL();
-	uv.x = 0;
-	uv.y = 1;
-	uv.w = 256;
-	uv.h = 30;
+	col.a = alpha;
 	col.r = 128;
 	col.g = 128;
 	col.b = 128;
-	col.a = alpha;
 
 	vif1SetXYOffset(1, evenOddField);
 	vif1SetTexture(&textures[TEXID_SCE]);
 
-	xy = sceTextRect[pal][0];
+	xy.x = sceTextRect[pal][0];
+	xy.y = sceTextRect[pal][1];
+	xy.w = sceTextRect[pal][2];
+	xy.h = sceTextRect[pal][3];
 	pkt = vif1Begin();
 	pkt = pktSetAlphaBlend(pkt, 1, 4, alpha);
 	pkt = pktSetTexRect(pkt, &xy, &uv, &col, 1, 0xFFFFFE);
-	xy = sceTextRect[pal][1];
+	xy.x = sceTextRect[pal][4];
+	xy.y = sceTextRect[pal][5];
+	xy.w = sceTextRect[pal][6];
+	xy.h = sceTextRect[pal][7];
 	uv.y += 32;
 	pkt = pktSetTexRect(pkt, &xy, &uv, &col, 1, 0xFFFFFE);
 	vif1End();
 }
 
-/* 0x214cb0 - args (0,0,0,alpha), only alpha is used.
- * RESIDUAL (2/108 insns matched, needs more work): same open items as
- * DrawSCEText (pkt-chaining confirmed right in shape, but the exact
- * struct/template layout at the top hasn't been re-derived byte for
- * byte) plus the PAL y/h rescale, which per the callee notes goes
- * through the softfloat helpers (fptodp/dpmul/dpdiv/dptoli) - not yet
- * verified that plain "double" arithmetic here reproduces that exact
- * call sequence. */
+/* 0x214cb0 - args (0,0,0,alpha), only alpha is used.  89/108, and the
+ * instruction COUNT and text now agree exactly (0 missing, 0 extra).
+ * Source shapes recovered from the ROM:
+ *  - "int pal = IsPAL();" is the first declaration and its result is
+ *    DEAD (v0 is immediately overwritten by GetLanguage's); IsPAL() is
+ *    called a second time for the actual test further down.  The dead
+ *    call is really in the ROM - gcc cannot delete it - so the source
+ *    genuinely had a leftover unused local here;
+ *  - "int lang = GetLanguage();" is likewise hoisted into a declaration
+ *    (the call sits at the top, not at the vif1SetTexture use site);
+ *  - xy/uv come from two separate 16-byte templates, as in DrawSCEText;
+ *  - the openingType guard comes AFTER col is filled in (the col stores
+ *    are before the branch, one of them in its delay slot);
+ *  - the PAL rescale is DOUBLE arithmetic (softfloat fptodp/dpmul/
+ *    dpdiv/dptoli): the multiplier is a plain double literal, but the
+ *    divisor's stored bits are a FLOAT value widened to double, so it
+ *    is written 0.457627f in the source;
+ *  - the int operand carries an explicit (float) cast: the ROM converts
+ *    it with cvt.s.w and then calls the float->double helper
+ *    (0x25a468), whereas an uncast int would call the int->double
+ *    helper with the value in a0.  This one cast is what closed the
+ *    last instruction-count gap here.
+ *
+ * RESIDUAL 19 words, all register names, confined to the two template
+ * copies and the 128/1/openingType constants:
+ *   ROM   copy1 scratch a0,a1  copy2 scratch v0,a1  128=a0 type=v0 1=a1
+ *   ours  copy1 scratch v1,a1  copy2 scratch t0,t1  128=v1 type=a1 1=v0
+ * (ours burns two extra scratch registers on the second copy).  Levers
+ * tried with no effect: "int pal = IsPAL(), lang = GetLanguage();" as
+ * one declaration, pkt declared before col, and the col field order
+ * (unlike DrawSCEText, it makes no difference here).  Same tie class as
+ * DrawExtraBuf2. */
 static void
 DrawIllegalText(int x, int y, int z, int alpha)
 {
-	Rect xy, uv;
+	int pal = IsPAL();
+	int lang = GetLanguage();
+	Rect xy = illegalXYTemplate;
+	Rect uv = illegalUVTemplate;
 	Color col;
 	void *pkt;
 
-	xy.x = 64;
-	xy.y = 88;
-	xy.w = 512;
-	xy.h = 64;
-	uv.x = 0;
-	uv.y = 0;
-	uv.w = 512;
-	uv.h = 128;
+	col.a = 128;
 	col.r = alpha;
 	col.g = alpha;
 	col.b = alpha;
-	col.a = 128;
 
 	if(openingType != 1)
 		return;
 
 	vif1SetXYOffset(1, evenOddField);
-	vif1SetTexture(&textures[TEXID_PNG + GetLanguage()]);
+	vif1SetTexture(&textures[TEXID_PNG + lang]);
 	if(IsPAL()) {
-		xy.y = xy.y * 0.52627105 / 0.457627;
-		xy.h = xy.h * 0.52627105 / 0.457627;
+		xy.y = (float)xy.y * 0.52627105 / 0.457627f;
+		xy.h = (float)xy.h * 0.52627105 / 0.457627f;
 	}
 	vif1SetAlphaBlend(1, 5, alpha);
 	pkt = vif1Begin();
@@ -387,20 +539,18 @@ DrawIllegalText(int x, int y, int z, int alpha)
 	vif1End();
 }
 
-/* 0x214e60 - structure matches the real exactly through the
- * illegalTextState arm/disarm and the sub_2144c0 call (verified
- * instruction-for-instruction). RESIDUAL (33/47 insns matched): after
- * the call, the real reloads illegalTextAlpha into $a0 (register
- * allocator's free choice once sub_2144c0's own a0-a2 params die); this
- * build gets the identical control flow but the allocator picks $a1
- * instead, which flips the final clamp's movn/movz polarity too since
- * it's a register-allocation cascade, not a source-shape difference -
- * every reordering of the reload/branch tried here reproduced the same
- * $a1 choice. */
+/* 0x214e60 - MATCHES.  The clamp is a separate named limit variable (the ROM
+ * keeps alpha in a0 across it and computes the clamped value into a
+ * fresh register: slti 113 / li 112 / movn).  The winning phrasing is
+ * "lim = alpha; if(alpha >= 113) lim = 112;" - gcc inverts it into
+ * "load 112, conditionally move alpha in".  Writing it the DoSCEText
+ * way round ("lim = 112; if(alpha < 113) lim = alpha;") makes gcc reuse
+ * the 112 it already has in a register and compare with slt against
+ * that register instead of slti against 113. */
 void
 DoIllegalText(void)
 {
-	int alpha;
+	int alpha, lim;
 
 	if(openingPosition[2] > 800.0f)
 		if(illegalTextState == 0)
@@ -415,7 +565,9 @@ DoIllegalText(void)
 	} else {
 		illegalTextAlpha = ++alpha;
 	}
-	alpha = alpha < 113 ? alpha : 112;
-	illegalTextAlpha = alpha;
-	DrawIllegalText(0, 0, 0, alpha);
+	lim = alpha;
+	if(alpha >= 113)
+		lim = 112;
+	illegalTextAlpha = lim;
+	DrawIllegalText(0, 0, 0, lim);
 }
