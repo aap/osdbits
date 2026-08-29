@@ -279,7 +279,12 @@ InitFog(void)
 			fv[x*17+y][2] = 134.0f;
 			fv[x*17+y][3] = 1.0f;
 
-			dx = -5.1f - ((2*x-16)*6.0f*0.5f + 3.0f);
+			/* the ROM's constant is 0xC0A33332 - double -5.1
+			 * TRUNCATED to float, not rounded (spelling in the
+			 * original source unknown; -5.1f gives ...33 and a
+			 * plain -5.1 double-promotes the whole expression).
+			 * Verified by the #lit4 pool comparator. */
+			dx = -5.0999994f - ((2*x-16)*6.0f*0.5f + 3.0f);
 			dy = 0.0f - ((2*y-16)*6.0f*0.5f + 3.0f);
 			d = sqrtf(dx*dx + dy*dy);
 			d = (foo - d*4.0f)*96.0f/foo + 0.0f;
@@ -323,7 +328,30 @@ InitFog(void)
  * the %lo (base+4656 with a 0 displacement instead of base+4648 with
  * an 8), the same reassociation documented in DrawIllegalFog;
  * (c) the s/t and RGBAQ blocks are scheduled differently, which is
- * probably downstream of (a). */
+ * probably downstream of (a).
+ *
+ * 2026-08-29: re-tried (a) exhaustively and confirmed it is the SAME
+ * $sN/$sN+1 tie class as fades'/DrawFlareSprite's residuals (see
+ * flare.c's file header) - l and fogAnimation's hoisted base are BOTH
+ * created in the same relative order in our RTL as in the ROM's (l's
+ * pseudo from the loop guard, fogAnimation's from the first statement
+ * in the body), yet the two builds pick opposite hard regs for them.
+ * Tried and rejected: all 5!*2 = 240 declaration-order/position
+ * combinations of {l,x,y,k,a,pkt} (byte-identical output for every one
+ * - confirms decls with no initializer are true no-ops for this
+ * compiler, not just for this one variable); an explicit
+ * `float *anim = fogAnimation;` pointer base (costs 4 words, doesn't
+ * touch the swap); all 24 permutations of the four
+ * `sprVertices->verts1[k][i] = ...` store statements in the first k
+ * loop (the "aligned" match count is IDENTICAL - 232 - for every one of
+ * the 24; some orderings shift matches between "differ" and
+ * "missing/extra" without net improvement, and one ordering [3,2,1,0]
+ * changes the k-loop's own address-giv bias from `sprVertices+44`
+ * toward the ROM's `sprVertices+32`-ish scheme but costs 2 words
+ * elsewhere, netting worse overall).  Whatever breaks this tie is not
+ * reachable through statement placement or declaration facts in this
+ * function; see DrawIllegalFog's identical s7/s8 case below for a
+ * second confirmation. */
 static void
 DrawFog(void)
 {
@@ -509,7 +537,17 @@ sub_215798(void)
  *    pinned); a loop-invariant-motion tie, ~5 words.
  *  - illegalFogColors is reached as %hi in s8 + an in-loop addiu where
  *    the ROM keeps the full address in s7, and s7/s8 are swapped
- *    against fogUV+4. */
+ *    against fogUV+4.
+ *
+ * 2026-08-29: the s7/s8 swap and the $f22 tie are both instances of the
+ * SAME $sN/$sN+1 / $fN/$fN+1 tie class as DrawFog's l/fogAnimation swap
+ * and flare.c's fades/DrawFlareSprite residuals (see flare.c's file
+ * header for the full writeup and the negative results already
+ * confirmed there - declaration order and statement/store reordering
+ * are both no-ops for this tie class in this compiler).  Not re-tried
+ * those same levers here since flare.c already exhausted them on
+ * structurally identical residuals; no further attempt made this
+ * round. */
 static void
 DrawIllegalFog(void)
 {

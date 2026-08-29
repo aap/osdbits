@@ -88,6 +88,36 @@ def main():
             return word & 0xFFFF0000
         return word
 
+    # optional literal-pool check: a "#lit4 <va>" line in the functions
+    # table names where this TU's .lit4 pool starts in the image.  Reloc
+    # masking hides WHICH literal an instruction references, so two
+    # sources with different constants or different literal ORDER can
+    # both score byte-exact (bitten twice: a 0.9f read as 0.1f, and a
+    # statement swap that reordered the pool) - comparing the pool
+    # bytes themselves closes the hole.
+    lit4va = None
+    with open(ftab) as f:
+        for line in f:
+            m = re.match(r"#lit4\s+0x([0-9a-f]+)", line.strip(), re.I)
+            if m:
+                lit4va = int(m.group(1), 16)
+    if lit4va is not None:
+        with tempfile.NamedTemporaryFile(suffix=".bin") as tf:
+            subprocess.run([os.path.join(TOOLS, "ee-objcopy"), "-O", "binary",
+                "-j", ".lit4", obj, tf.name], check=True)
+            lit = open(tf.name, "rb").read()
+        bad = [i for i in range(0, len(lit), 4)
+            if lit[i:i+4] != img[lit4va - BASE + i:lit4va - BASE + i + 4]]
+        if bad:
+            print(".lit4 pool: %d/%d words differ from image @%x:" %
+                (len(bad), len(lit)//4, lit4va))
+            for i in bad[:8]:
+                print("  +%03x: real %s ours %s" % (i,
+                    img[lit4va - BASE + i:lit4va - BASE + i + 4][::-1].hex(),
+                    lit[i:i+4][::-1].hex()))
+        else:
+            print(".lit4 pool: %d words MATCH @%x" % (len(lit)//4, lit4va))
+
     total = ok = 0
     for name, (va, size) in funcs.items():
         if name not in syms:

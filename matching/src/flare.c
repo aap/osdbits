@@ -45,6 +45,42 @@
  *    reached with lui/addiu even when it physically lands in .sdata
  *    (fadeSpriteName); an extern array of known size in the same place
  *    would be gp-relative.
+ *  - 2026-08-29 round: ALL FOUR remaining functions' residuals reduce to
+ *    ONE recurring tie class - two unrelated same-class pseudos (both
+ *    live across the same span, neither with a real ordering constraint)
+ *    land on ADJACENT hard registers in the SAME relative order on both
+ *    sides, but the ROM and our build pick OPPOSITE members of the pair
+ *    (fades: position[2]'s value vs local `f` on $f1/$f2; DrawFlareSprite:
+ *    flarePos's %hi vs the early-hoisted `size*2` on $s5/$s6; see fog.c
+ *    for the DrawFog/DrawIllegalFog instances of the same thing on
+ *    $s0/$s1 and $s7/$s8).  Empirically this class is INSENSITIVE to
+ *    every source-shape lever in this file: local-decl order (240
+ *    permutations of fades'/DrawFog's int locals compiled byte-identical
+ *    regardless of order - decls with no initializer clearly generate no
+ *    RTL until first use, so declaration position is a no-op for this
+ *    compiler), statement order within the affected block (exhaustive
+ *    24-permutation search of DrawFog's k=0..3 vertex-store loop found
+ *    zero net improvement - some orderings change which of {differ,
+ *    missing, extra} a mismatch is filed under without changing the
+ *    aligned-match count), and explicit pointer aliasing for the
+ *    contested value (a named local alias compiles identically to the
+ *    inline field access every time it was tried).  Whatever decides the
+ *    tie lives deeper in gcc's RTL (probably total reference count over
+ *    the WHOLE function, which our restructuring attempts didn't change
+ *    even when they changed the instructions actually emitted) - this
+ *    matches sub_215798's own note in fog.c ("~9k campaign variants
+ *    never moved it") and flare_21A6D8's residual, so treat any future
+ *    $sN/$sN+1 or $fN/$fN+1 swap-only residual as PROBABLY this same
+ *    class rather than re-deriving the negative result from scratch.
+ *  - flare_21AA50/AF18 additionally keep the sprVertices pointer in TWO
+ *    hard registers across each 6-block colour-clamp chain (loaded once,
+ *    duplicated via a plain `move`, pre-clamp store through one copy,
+ *    post-clamp store through the other - see the function comment); an
+ *    explicit second C-level alias for one of the two stores compiles
+ *    down to the SAME single register both sides would otherwise use,
+ *    so this duplication is also not source-shape-reachable and is the
+ *    same tie class, just manifesting as a redundant reg-reg copy
+ *    instead of a swap.
  */
 
 
@@ -391,11 +427,21 @@ DrawIllegalDisc(void)
  *  - K_SCREEN_W/H are reached through ONE shared "lui reg,0x1f" (see
  *    the KernelBlob note above).
  *
- * Residual (41 differ / 15+15): the ROM hoists three separate
- * "lui 0x33/0x32" symbol-high registers (flarePos, flareRot,
- * flareRingSmall) into s6/s7/s8 and forms addresses as %lo(sym)(reg);
- * ours CSEs them into fully-formed pointers.  Everything from the
- * prologue through sceVu0FTOI0Vector now matches word for word.
+ * Residual (41 differ / 15+15): 2026-08-29 re-check - the "CSE into
+ * fully-formed pointers" theory above is WRONG for the current source;
+ * both sides already keep %hi(flarePos/flareRot/flareRingSmall) in s5,
+ * s7, s8 and only addiu the %lo when a pointer VALUE is actually needed
+ * (the shapes are identical instruction-for-instruction).  The real
+ * divergence is narrower: flarePos's %hi lands in $s6 in the ROM but
+ * $s5 in ours, and the OTHER member of that pair is the completely
+ * unrelated `size*2` (rect.w) that gcc hoists and schedules into a
+ * callee-saved register right in the middle of this block for its own
+ * scheduling reasons (real: $s5; ours: $s6) - i.e. this is the
+ * $sN/$sN+1 tie class from the file header, not a hoisting-strategy
+ * difference; every use of flarePos later in the function differs by
+ * exactly this one swapped register letter, which is where all 41
+ * words come from.  Everything from the prologue through
+ * sceVu0FTOI0Vector matches word for word.
  * ============================================================== */
 static void
 DrawFlareSprite(int size, int alpha, int r, int g, int b, float scale)
@@ -559,11 +605,13 @@ sub_21a438(void)
  * reproduces exactly that (a separate variable "d = 64.0f" gets hoisted
  * into its own callee-saved register and costs 8 words).
  *
- * Residual (4 words): flareRot[i][1] and [2] land in the opposite FP
- * registers (f0/f3); the ROM issues the three loads in ADDRESS order
- * while we issue them in source order.  Statement order is otherwise
- * confirmed [0], [2], [1] by the .lit4 order (gp-32352 = 0.2,
- * gp-32348 = 0.35, gp-32344 = 0.27).
+ * MATCHES (221/221, and the TU's 36-word .lit4 pool is byte-exact).
+ * The increments are written in ADDRESS order [0], [1], [2] - that is
+ * what makes the ROM's store order come out.  Counter-intuitively the
+ * pool then holds 0.2, 0.35, 0.27: .lit4 emission order is NOT naive
+ * first-use statement order here (the scheduler's load clustering
+ * decides), so never infer statement order from pool order alone -
+ * check.py's #lit4 comparator now verifies the pool bytes directly.
  * ============================================================== */
 static void
 flare_21A6D8(void)
@@ -574,8 +622,8 @@ flare_21A6D8(void)
 	phase = (float)(openingFrameCount % 201)*0.03125f - PI;
 	for(i = 0; i < 7; i++) {
 		flareRot[i][0] += (i+1)*0.2f;
-		flareRot[i][2] += (i+1)*0.35f;
 		flareRot[i][1] += (i+1)*0.27f;
+		flareRot[i][2] += (i+1)*0.35f;
 		while(flareRot[i][0] > PI) flareRot[i][0] -= TAU;
 		while(flareRot[i][0] < -PI) flareRot[i][0] += TAU;
 		while(flareRot[i][1] > PI) flareRot[i][1] -= TAU;
@@ -616,11 +664,27 @@ flare_21A6D8(void)
  *  - six clamp blocks in the "< 256" idiom through a local int c.
  *
  * Residual: the ROM keeps TWO copies of the sprVertices pointer across
- * the clamp blocks (lw a0; move a1,a0; the two stores of each block
- * alternate between them) where we keep one, the loop counter and i+1
- * are swapped between two callee-saved registers, and the ROM
+ * the clamp blocks (lw a0; move a1,a0; the FIRST (pre-clamp) store of
+ * each block uses one copy, the SECOND (post-clamp, after the merge of
+ * the if/else) uses the other) where we keep one, the loop counter and
+ * i+1 are swapped between two callee-saved registers, and the ROM
  * re-materialises the constant 272 and the &ring[0][1] address instead
  * of reusing the hoisted copies.  All register/hoisting ties.
+ *
+ * 2026-08-29: confirmed unmovable via source shape.  Tried and
+ * rejected for the sprVertices duplicate: an explicit second pointer
+ * (`int *v0 = sprVertices->verts2[0];` etc. used for one of the two
+ * stores per block) - compiles to the exact same single register both
+ * stores already use, because the two accesses are provably the same
+ * value with no intervening call and this compiler's CSE folds them
+ * regardless of how the source spells the second reference.  Whatever
+ * makes the ROM re-derive (not alias) the value across the if/else
+ * merge is internal to gcc, not reachable from here; see the file
+ * header's $sN/$sN+1 tie-class note - flareColorSmall/Large's %hi also
+ * belongs to that same family ($a1 here vs $a2 in the ROM, which is
+ * simply the just-freed third argument register of the preceding
+ * vif1SetAlphaBlend(1,0,128) call reused for a new purpose - free in
+ * both builds, picked differently by each).
  * ============================================================== */
 static void
 flare_21AA50(void)
@@ -787,7 +851,18 @@ flare_21AF18(void)
  *  - the "B" sprite name is an extern array of unknown size at
  *    0x2A77F0 (see fadeSpriteName).
  *
- * Residual (9 words): f1/f2 allocation ties only.
+ * Residual (9 words): f1/f2 allocation ties only.  2026-08-29: confirmed
+ * unmovable - openingPosition[2]'s value sits in $f1 for the WHOLE
+ * function in the ROM (loaded once, reused by both branches) and in $f2
+ * for us, with local `f` taking the other of the pair in each branch;
+ * tried and rejected: hoisting `float z = openingPosition[2];` to a
+ * named top-of-function local (byte-identical output - this compiler's
+ * CSE already treats the two array reads as one value regardless of
+ * whether a source-level temp names it), and swapping `f`/`g`'s
+ * declaration order within the else-if block (also byte-identical - see
+ * the file-header law about declarations with no initializer generating
+ * no RTL until first use).  This is the $fN/$fN+1 tie class described
+ * in the file header; see that note before spending more time here.
  * ============================================================== */
 static void
 fades(void)

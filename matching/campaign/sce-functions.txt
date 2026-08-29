@@ -1,0 +1,1 @@
+DrawSCEText 0x214a60 0x1bc
