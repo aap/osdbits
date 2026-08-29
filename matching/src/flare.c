@@ -5,20 +5,48 @@
  * file instead mirrors the REAL binary's structure (which differs from
  * the port in a few places noted below), so it can match byte for byte.
  *
- * MATCH STATUS (see per-function comments for the still-mismatching
- * ones): sub_219f08, DrawIllegalDisc, DrawIllegalCubes, DrawRedFlare,
- * InitIllegalScene, DrawIllegalScene, sub_21b690 MATCH exactly.
- * sub_219cb8, sub_21a438, flare_21A6D8, DrawFlareSprite, FlareThing,
- * flare_21AA50, flare_21AF18, fades are structurally/semantically
- * correct (verified against the disassembly instruction-by-instruction)
- * but still show residual mismatches that all trace back to this old
- * compiler's REGISTER ALLOCATION / INSTRUCTION SCHEDULING being
- * extremely sensitive to the exact phrasing of the source (which local
- * variables exist, their declaration order, which sub-expression is
- * written first) in ways that can't be recovered from the disassembly
- * alone without the literal original source.  None of the remaining
- * diffs are semantic/structural bugs; see each function's comment.
+ * MATCH STATUS (2026-08-29, 10/15 byte-exact): sub_219cb8,
+ * DrawIllegalCubes, sub_219f08, DrawIllegalDisc, FlareThing,
+ * sub_21a438, DrawRedFlare, InitIllegalScene, DrawIllegalScene,
+ * sub_21b690 MATCH exactly.  Still short:
+ *   flare_21A6D8   217/221 (4 words: one load/store register tie)
+ *   fades           63/76  (9 words: f1/f2 allocation ties)
+ *   flare_21AA50   253/306
+ *   flare_21AF18   247/287
+ *   DrawFlareSprite 155/211
+ * See each function's comment for the recovered source shapes and the
+ * residual ties.
+ *
+ * NOTE gp == 0x2AF070 (crt0: lui a0,0x2b; addiu a0,a0,-3984; the IDB
+ * names 0x2AF070 _gp_).  Every gp offset in the comments below resolves
+ * against that: redFlareIntensity gp-28888 = 0x2A7F98, sprVertices
+ * gp-30996 = 0x2A775C, sprMatrices gp-31000 = 0x2A7758,
+ * openingFrameCount gp-31088 = 0x2A7700, .lit4 around 0x2A71D0.
+ *
+ * CODEGEN LAWS learned here (all verified with standalone compiles):
+ *  - "x / <float literal>" is ALWAYS strength-reduced to a multiply by
+ *    the reciprocal, even for non-power-of-2 divisors that are exactly
+ *    invertible; the real's div.s against a plain 64.0f therefore means
+ *    the divisor was a VARIABLE in the source, and its assignment sits
+ *    inside the loop (see flare_21A6D8).
+ *  - float -> UNSIGNED int calls the fp-bit helper __fixunssfsi
+ *    (0x25a368, which calls unpack_d at 0x2599d8); float -> signed int
+ *    is an inline cvt.w.s.  A call to 0x25a368 in the ROM is thus an
+ *    (unsigned) conversion, nothing more exotic (see fades).
+ *  - the 0..255 clamp idiom the ROM uses everywhere is
+ *      c = <expr>; lvalue = c;
+ *      if(c < 256) { if(c < 0) c = 0; } else c = 255;
+ *      lvalue = c;
+ *    i.e. the LOW bound is tested inside the "< 256" arm.  Written the
+ *    natural way round ("if(c > 255) c = 255; else if(c < 0) c = 0;")
+ *    the compiler inverts the branch and emits two cmoves instead of
+ *    the ROM's branch + movz + merged store.
+ *  - an extern array of UNKNOWN size is not small-data, so it is
+ *    reached with lui/addiu even when it physically lands in .sdata
+ *    (fadeSpriteName); an extern array of known size in the same place
+ *    would be gp-relative.
  */
+
 
 typedef unsigned int u32;
 typedef unsigned long u64;
@@ -85,7 +113,10 @@ extern void  sceVu0FTOI0Vector(sceVu0IVECTOR dst, sceVu0FVECTOR src);
 extern void  sceVu0Normalize(sceVu0FVECTOR dst, sceVu0FVECTOR src);
 extern void  DrawToExtraBuf2(void);
 extern void  DrawExtraBuf2(int a0, int a1, int fix, u32 rgb, int alpha, int field);
-extern void  DrawSomeSprite2(char *s, int alpha);
+extern void  DrawSomeSprite2(char *s, u32 alpha);
+extern char  fadeSpriteName[];	/* real: 0x2A77F0, "B" - reached with
+				 * lui/addiu, i.e. NOT small-data, i.e.
+				 * an extern array of unknown size */
 extern void  InitIllegalDisc(void);
 extern void  DrawIllegalFog(void);
 extern void  DrawIllegalCube(void *work, int instance);
@@ -135,18 +166,37 @@ extern sceVu0FVECTOR cubeOutB[5];	/* real: 0x27b140 */
 extern sceVu0FVECTOR cubeRate[5];	/* real: 0x27b190 */
 extern sceVu0FVECTOR cubeCorners[8];	/* real: 0x27b370 */
 extern sceVu0FVECTOR cubeBaseColor[5];	/* real: 0x27b3f0 - instance colours */
+/* 0x27AF50 is the ILLEGAL scene's own seed table.  The opening scene
+ * (OpeningInitLightsCubes, 0x217ab8) reads a DIFFERENT one at 0x27A210;
+ * osdbits/opening.c has only the 0x27A210 values and feeds them to both
+ * inits, which is why its illegal cubes end up too far away.  Real
+ * 0x27AF50 contents:
+ *   {-10.4068,  4.1636, 5.0429}  {-12.9184, -4.2708, 4.3654}
+ *   {  2.7639,  0.1509, 4.1075}  {  4.0958, -1.3173, 3.0952}
+ *   { -2.4321,  0.5447, 2.7732} */
 extern sceVu0FVECTOR cubeSeedTable[5];	/* real: 0x27af50 */
 
 extern sceVu0FVECTOR clipMin, clipMax;
 
-/* fixed low-memory kernel/SDK words the real reads via ordinary
- * (relocated - hence masked by check.py) symbol access; real absolute
- * addresses were 0x1F0C44/0x1F0C50/0x1F0C54 but the actual link
- * address doesn't matter here since HI16/LO16 are masked. */
-extern int kernelBlob[2048];	/* far (non-small-data) - forces lui+lw */
-#define K_FIELD    kernelBlob[0x311]	/* 0xC44/4 */
-#define K_SCREEN_W kernelBlob[0x314]	/* 0xC50/4 */
-#define K_SCREEN_H kernelBlob[0x315]	/* 0xC54/4 */
+/* fixed low-memory kernel/SDK words (0x1F0C44 field, 0x1F0C50 screen
+ * width, 0x1F0C54 screen height).
+ * NOT a relocated symbol: the real reaches these through ONE "lui
+ * reg,0x1f" whose base register is shared by both the 0xC50 and 0xC54
+ * loads (DrawFlareSprite).  A relocated extern array needs an extra
+ * addiu for the %lo once it is indexed twice; a struct at a literal
+ * address reproduces the real exactly (verified with standalone test
+ * compiles), and the resulting lui/offset immediates are the real
+ * ones, so check.py compares them unmasked. */
+struct KernelBlob { int pad0[785]; int field; int pad1[2]; int screenW, screenH; };
+#define KB	   (*(struct KernelBlob*)0x1F0000)
+#define K_SCREEN_W KB.screenW		/* 0x1F0C50 */
+#define K_SCREEN_H KB.screenH		/* 0x1F0C54 */
+/* DrawRedFlare's single 0xC44 read, by contrast, is the RELOCATED-symbol
+ * shape: the real puts the lui in its own register ("lui v0,0x1f; lw
+ * t1,3140(v0)"), which only the extern-array form produces - the literal
+ * struct above reuses one register and loses the scheduling gap. */
+extern int kernelBlob[2048];
+#define K_FIELD    kernelBlob[0x311]	/* 0x1F0C44 */
 
 /* forward decls (static, so .o keeps only our named functions) */
 static void sub_21b690(float half, float x, float y, float z);
@@ -168,6 +218,21 @@ static void DrawIllegalScene(void);
 extern int fooOpeningType;
 
 extern void sub_215798(void);	/* out-of-TU: illegal fog init */
+
+/* The per-quad shading callback DrawTexturedQuad (0x21c560) calls
+ * through gp-30824.  gp == 0x2AF070, so that is 0x2A7808 (.sdata) -
+ * the slot docs/object-order.md already calls "the cube callback
+ * pointer".  Exactly three accesses exist in the whole ROM:
+ *   0x217b5c  OpeningInitLightsCubes  sw v1 -> sub_216f88 (opening cubes)
+ *   0x219d64  sub_219cb8              sw v1 -> sub_2192c0 (illegal cubes)
+ *   0x21c68c  DrawTexturedQuad        lw v0, then "jalr v0" at 0x21c6bc
+ * NOTE the sign extension: "lui v1,0x22; addiu v1,v1,-27968" is
+ * 0x220000-0x6D40 = 0x2192C0, NOT 0x2292C0 (which is mid-function
+ * anyway); sub_2192c0 sits directly in front of DrawIllegalCube. */
+extern void sub_2192c0(void *quad, int corner, int face, void *work,
+	int instance, int a6, int a7, float t);
+extern void (*cubeQuadFunc)(void *quad, int corner, int face, void *work,
+	int instance, int a6, int a7, float t);
 
 /* ============================================================== *
  * sub_21b690 (0x21b690) - build the cube corner table and set all
@@ -209,17 +274,20 @@ sub_21b690(float half, float x, float y, float z)
 }
 
 /* ============================================================== *
- * sub_219cb8 (0x219cb8) - place the five illegal-scene cubes.
+ * sub_219cb8 (0x219cb8) - place the five illegal-scene cubes.  MATCH.
  *
- * RESIDUAL MISMATCH (10/123): confirmed the loop body/instruction
- * SHAPE is right (cubeOutB[i][1] must be "(i*2)%8", not "&7" - the
- * real does the full signed-modulo-by-power-of-2 dance (movn/sra/sll/
- * subu), which only "%" emits; "&7" would compile to a bare andi).
- * What's left is that the four base-pointer registers (cubeSeedTable,
- * cubeAnchor, cubeOutB, cubeRate) land in different physical registers
- * than the real (real: v1/a1/a0/v0 in that order; the exact mapping
- * depends on internal RTL pseudo-numbering this old compiler doesn't
- * expose any source-level control over).
+ * Recovered shapes: (a) "cubeOutB[i][1] = f*((i*2)%8)/5.0f" really is
+ * "%", not "&7" - the ROM does the full signed-modulo-by-power-of-2
+ * dance (slt/movn/sra/sll/subu), which only "%" emits; (b) the cube
+ * quad callback store (see the cubeQuadFunc note above) is the FIRST
+ * statement after sub_21b690(), which is what pins the four table base
+ * pointers into v1/a1/a0/v0 the way the ROM has them - without it every
+ * base register shifts by one and 13 words differ.
+ *
+ * NOTE the ILLEGAL seed table is 0x27AF50, a DIFFERENT table from the
+ * opening's 0x27A210 (which OpeningInitLightsCubes reads).  See the
+ * cube-distance report: osdbits/opening.c uses the opening table in
+ * both places.
  * ============================================================== */
 static void
 sub_219cb8(void)
@@ -228,6 +296,7 @@ sub_219cb8(void)
 	float f;
 
 	sub_21b690(1.2f, 0.0f, 0.0f, 0.0f);
+	cubeQuadFunc = sub_2192c0;
 	for(i = 0; i < 5; i++) {
 		f = (i-2)*0.8f;
 		if(f == 0.0f)
@@ -300,52 +369,67 @@ DrawIllegalDisc(void)
 }
 
 /* ============================================================== *
- * DrawFlareSprite (0x219fb0) - one billboard lens sprite.  The real
- * does the perspective divide via sceVu0FTOI0Vector + integer
- * fixed-point math (screen halves read from a fixed low-memory
- * word), not plain float scaling.
+ * DrawFlareSprite (0x219fb0) - one billboard lens sprite.  155/211.
  *
- * RESIDUAL MISMATCH (22/211): structure/call sequence up through
- * sceVu0ApplyMatrix is verified instruction-for-instruction (matrix
- * chain args, register-for-register).  The FTOI0Vector + K_SCREEN_W/H
- * tail reproduces the real ALGORITHM (confirmed by hand-tracing every
- * real instruction), but the real allocates size/alpha/etc. to s1/s0/..
- * while this compiles them into s4/etc. - a register-allocation
- * artifact of overall register pressure across this large (211-insn,
- * 9 saved GPRs) function, not a structural difference.
+ * Recovered shapes:
+ *  - the 49.0f is a VARIABLE, not a literal: the ROM computes
+ *    "rad*0.004f" ONCE (mul.s f20,f22,f20) and reuses it for both the
+ *    cos and the sin store, which only happens if "(rad*0.004f)" is a
+ *    common subexpression, which in turn requires rad to be a variable
+ *    (a literal 49.0f*0.004f would be folded at compile time).
+ *  - the phase is "(rad + (openingFrameCount & 0x1f))*0.1f" - a FLOAT
+ *    add of 49.0f to the (unsigned!) masked frame counter, not
+ *    "(float)(49 + ...)"; that is where the unsigned-to-float
+ *    srl/or/add.s dance comes from.
+ *  - there is NO "float *v" alias for sprVertices->verts1[0]: the ROM
+ *    reloads sprVertices from gp after every call, which a local
+ *    pointer (kept in a callee-saved register) would prevent.
+ *  - the projected coordinates are WRITTEN BACK into
+ *    sprVertices->verts2[0][0..1] and rect.x/rect.y are then computed
+ *    FROM the stored values (hence the ROM's swc1-then-lw round trip on
+ *    the y component).
+ *  - K_SCREEN_W/H are reached through ONE shared "lui reg,0x1f" (see
+ *    the KernelBlob note above).
+ *
+ * Residual (41 differ / 15+15): the ROM hoists three separate
+ * "lui 0x33/0x32" symbol-high registers (flarePos, flareRot,
+ * flareRingSmall) into s6/s7/s8 and forms addresses as %lo(sym)(reg);
+ * ours CSEs them into fully-formed pointers.  Everything from the
+ * prologue through sceVu0FTOI0Vector now matches word for word.
  * ============================================================== */
 static void
 DrawFlareSprite(int size, int alpha, int r, int g, int b, float scale)
 {
 	Rect rect, uv;
 	Color col;
-	float ph, q;
-	float *v;
+	float ph, q, rad;
 
 	vif1SetAlphaBlend(1, 0, alpha);
-	ph = (float)(49 + (openingFrameCount & 0x1f))*0.1f;
+	rad = 49.0f;
+	ph = (rad + (openingFrameCount & 0x1f))*0.1f;
 	while(ph > PI) ph -= TAU;
 	while(ph < -PI) ph += TAU;
-	flarePos[0][0] = cosf(ph)*49.0f*0.004f;
-	flarePos[0][1] = sinf(ph)*49.0f*0.004f;
+	flarePos[0][0] = cosf(ph)*(rad*0.004f);
+	flarePos[0][1] = sinf(ph)*(rad*0.004f);
 	sceVu0RotMatrix(sprMatrices->m9, sprMatrices->unit, flareRot[0]);
 	sceVu0TransMatrix(sprMatrices->worldMatrix, sprMatrices->m9, flarePos[0]);
 	sceVu0MulMatrix(sprMatrices->worldScreenMatrix,
 		sprMatrices->cameraScreenMatrix, sprMatrices->worldMatrix);
-	v = sprVertices->verts1[0];
-	sceVu0ApplyMatrix(v, sprMatrices->worldScreenMatrix, flareRingSmall[0][0]);
+	sceVu0ApplyMatrix(sprVertices->verts1[0], sprMatrices->worldScreenMatrix, flareRingSmall[0][0]);
 
-	q = 1.0f/v[3];
-	v[0] *= q;
-	v[1] *= q;
-	v[2] *= q;
-	v[3] = 1.0f;
-	sceVu0FTOI0Vector(sprVertices->verts2[0], v);
+	q = 1.0f/sprVertices->verts1[0][3];
+	sprVertices->verts1[0][0] *= q;
+	sprVertices->verts1[0][1] *= q;
+	sprVertices->verts1[0][2] *= q;
+	sprVertices->verts1[0][3] = 1.0f;
+	sceVu0FTOI0Vector(sprVertices->verts2[0], sprVertices->verts1[0]);
 	sprVertices->verts2[0][0] -= 2048;
 	sprVertices->verts2[0][1] -= 2048;
 
-	rect.x = (int)((float)sprVertices->verts2[0][0]*scale + (float)(K_SCREEN_W/2)) - size;
-	rect.y = (int)((float)sprVertices->verts2[0][1]*scale + (float)(K_SCREEN_H/2)) - size/2;
+	sprVertices->verts2[0][0] = (int)((float)sprVertices->verts2[0][0]*scale + (float)(K_SCREEN_W/2));
+	rect.x = sprVertices->verts2[0][0] - size;
+	sprVertices->verts2[0][1] = (int)((float)sprVertices->verts2[0][1]*scale + (float)(K_SCREEN_H/2));
+	rect.y = sprVertices->verts2[0][1] - size/2;
 	rect.w = size*2;
 	rect.h = size;
 	uv.x = 0;
@@ -361,15 +445,13 @@ DrawFlareSprite(int size, int alpha, int r, int g, int b, float scale)
 }
 
 /* ============================================================== *
- * FlareThing (0x21a300) - the lens-flare sprite stack.
+ * FlareThing (0x21a300) - the lens-flare sprite stack.  MATCH.
  *
- * RESIDUAL MISMATCH (25/78): every value/argument is correct; the
- * real schedules "mov.s $f12,$f20" (the invariant scale=1.0f arg)
- * either before or after the four integer arg loads for each of the
- * four identical-shaped DrawFlareSprite(..., 1.0f) calls, and isn't
- * even consistent with ITSELF between call 1-3 vs call 4 - a pure
- * instruction-scheduling tie-break for independent, same-latency
- * operations feeding one call, not reproducible from source structure.
+ * Recovered shapes: the four fixed-size sprites are written out one
+ * call per size (the ROM has no loop), and "a" is computed as a FLOAT
+ * sum "n*3 + redFlareIntensity*0.5f" that is then converted, not an
+ * int plus a converted float.  The clamp uses the "< 256" idiom
+ * described in the file header.
  * ============================================================== */
 extern char textures[16][64];	/* placeholder texture table (far array) */
 #define TEXID_FLAR 4
@@ -387,101 +469,101 @@ FlareThing(int n)
 	DrawFlareSprite(170, m, 128, 64, 64, 1.0f);
 	DrawFlareSprite(256, m, 128, 64, 64, 1.0f);
 	DrawFlareSprite(448, m, 128, 64, 64, 1.0f);
-	a = n*3 + (int)(redFlareIntensity*0.5f);
-	if(a > 255) a = 255;
-	if(a < 0) a = 0;
+	a = n*3 + redFlareIntensity*0.5f;
+	if(a < 256) { if(a < 0) a = 0; } else a = 255;
 	size = redFlareIntensity*0.125f + 420.0f;
-	DrawFlareSprite(size, a, 128, 112, 96, 0.1f);
+	/* NOTE: gp-32368 == 0x2A7200 holds 0.9f, not 0.1f - the port's
+	 * 0.1f is wrong (the .lit4 immediate is masked by check.py, so
+	 * this does not show up as a mismatch). */
+	DrawFlareSprite(size, a, 128, 112, 96, 0.9f);
 }
 
 /* ============================================================== *
  * sub_21a438 (0x21a438) - build the flare rings AND fill the two
- * colour blocks at runtime (the port's static initializers are a
- * simplification of this).
+ * colour blocks at runtime.  MATCH.
  *
- * RESIDUAL MISMATCH (36/168): confirmed the colour blocks are filled
- * by runtime stores (not static initializers - real has no
- * relocation-free .data for them) with these exact 16 values; the
- * real's stack frame is 240 bytes with 9 saved GPRs (s0-s8) + 9 saved
- * FPRs (f20-f28), this version needs 2 fewer of each (224 bytes) -
- * another register-pressure artifact from an equivalent but not
- * textually identical nested-loop body (the k=0..15 inner loop over
- * 16 ring vertices plus the two parallel per-ring cos/sin/store chains
- * for flareRingSmall and flareRingLarge).
+ * Recovered shapes (all found by watching which pseudo gets which
+ * register / which store lands where):
+ *  - the sixteen colour words are written in the interleaved order
+ *    Small[0..2], Large[0..2], Small[3], Small[4..7], Large[4..7],
+ *    Large[3] - the constant-to-register order (v0=48, a1=128, t0=16,
+ *    t1=40, t2=8, t3=12, t4=2056) only comes out with 8 and 12 created
+ *    before 2056, and Large[3]=128 has to be the LAST store of all.
+ *  - the ring-centre zeros are CHAINED
+ *    (ring[i][0][0] = ring[i][0][1] = ring[i][0][2] = 0.0f), which is
+ *    why they are stored from one FP register instead of "sw zero";
+ *    the per-vertex "[2] = 0.0f" inside the k loop is standalone and
+ *    does get "sw zero".
+ *  - the large ring's radius is written inline at both use sites
+ *    ("cosf(a)*((float)(i*8) + 28.0f)"), not lifted to a variable
+ *    before the loop - as a variable it would be hoisted out of the k
+ *    loop, but the ROM recomputes mtc1/cvt/add every iteration.
+ *  - flareRot's zeros come BEFORE flarePos's, and flarePos's chain runs
+ *    the other way ("flarePos[i][1] = flarePos[i][0] = 0.0f").
  * ============================================================== */
 static void
 sub_21a438(void)
 {
 	int i, k;
-	float a, r;
+	float a;
 
 	flareColorSmall[0] = 128;
 	flareColorSmall[1] = 16;
 	flareColorSmall[2] = 40;
+	flareColorLarge[0] = 48;
+	flareColorLarge[1] = 8;
+	flareColorLarge[2] = 12;
 	flareColorSmall[3] = 2056;
 	flareColorSmall[4] = 0;
 	flareColorSmall[5] = 0;
 	flareColorSmall[6] = 0;
 	flareColorSmall[7] = 128;
-	flareColorLarge[0] = 48;
-	flareColorLarge[1] = 8;
-	flareColorLarge[2] = 12;
-	flareColorLarge[3] = 128;
 	flareColorLarge[4] = 0;
 	flareColorLarge[5] = 0;
 	flareColorLarge[6] = 0;
+	flareColorLarge[3] = 128;
 	flareColorLarge[7] = 128;
 
 	for(i = 0; i < 7; i++) {
-		flareRingSmall[i][0][0] = 0.0f;
-		flareRingSmall[i][0][1] = 0.0f;
-		flareRingSmall[i][0][2] = 0.0f;
+		flareRingSmall[i][0][0] = flareRingSmall[i][0][1] = flareRingSmall[i][0][2] = 0.0f;
 		flareRingSmall[i][0][3] = 1.0f;
-		flareRingLarge[i][0][0] = 0.0f;
-		flareRingLarge[i][0][1] = 0.0f;
-		flareRingLarge[i][0][2] = 0.0f;
+		flareRingLarge[i][0][0] = flareRingLarge[i][0][1] = flareRingLarge[i][0][2] = 0.0f;
 		flareRingLarge[i][0][3] = 1.0f;
-		r = (float)(i*8) + 28.0f;
 		for(k = 0; k < 16; k++) {
 			a = k*PI*2.0f*0.0625f;
 			flareRingSmall[i][1+k][0] = cosf(a)*8.0f;
 			flareRingSmall[i][1+k][1] = sinf(a)*8.0f;
 			flareRingSmall[i][1+k][2] = 0.0f;
 			flareRingSmall[i][1+k][3] = 1.0f;
-			flareRingLarge[i][1+k][0] = cosf(a)*r;
-			flareRingLarge[i][1+k][1] = sinf(a)*r;
+			flareRingLarge[i][1+k][0] = cosf(a)*((float)(i*8) + 28.0f);
+			flareRingLarge[i][1+k][1] = sinf(a)*((float)(i*8) + 28.0f);
 			flareRingLarge[i][1+k][2] = 0.0f;
 			flareRingLarge[i][1+k][3] = 1.0f;
 		}
-		flarePos[i][0] = 0.0f;
-		flarePos[i][1] = 0.0f;
-		flarePos[i][2] = 1160.0f;
-		flareRot[i][0] = 0.0f;
-		flareRot[i][1] = 0.0f;
+		flareRot[i][0] = flareRot[i][1] = 0.0f;
 		flareRot[i][2] = i*0.925f*PI*2.0f/7.0f;
+		flarePos[i][1] = flarePos[i][0] = 0.0f;
+		flarePos[i][2] = 1160.0f;
 	}
 }
 
 /* ============================================================== *
- * flare_21A6D8 (0x21a6d8) - per-frame spin/orbit update.
+ * flare_21A6D8 (0x21a6d8) - per-frame spin/orbit update.  217/221.
  *
- * RESIDUAL MISMATCH (160/221, i.e. mostly matching): two small,
- * confirmed-benign spots -
- *   1) the flareRot[i][1]/[2] load/store pair comes out in the
- *      opposite physical registers (f0 vs f3) from real, even though
- *      the STORE ORDER (component 0, then 2, then 1) is right - a
- *      scheduler tie-break between two independent, same-shape stores.
- *   2) "r = ... * PI * 2.0f / 64.0f" - this compiler ALWAYS strength-
- *      reduces "/ <float pow2 literal>" into "* reciprocal" (verified
- *      with standalone test cases; unconditional, not source-order
- *      dependent), yet the real genuinely emits div.s against a plain
- *      64.0f immediate.  Not reproducible via any source rephrasing
- *      tried (double, explicit (float)64, extracting to a statement);
- *      the real must divide by something this compiler's build did NOT
- *      treat as a foldable literal (e.g. a variable that happens to
- *      still load via lui/mtc1) - undetermined from the disassembly
- *      alone.  This single substitution cascades into a same-length
- *      but differently-scheduled tail for the rest of the function.
+ * Recovered shape: "/64.0f" cannot be a literal (this compiler always
+ * turns float-division-by-literal into a reciprocal multiply, verified
+ * standalone).  The ROM loads 0x42800000 into f21 INSIDE the loop and
+ * then overwrites f21 with the quotient, i.e. the divisor variable
+ * shares a register with r and its assignment is inside the loop and
+ * is not the only assignment to that variable - "r = 64.0f; r = .../r;"
+ * reproduces exactly that (a separate variable "d = 64.0f" gets hoisted
+ * into its own callee-saved register and costs 8 words).
+ *
+ * Residual (4 words): flareRot[i][1] and [2] land in the opposite FP
+ * registers (f0/f3); the ROM issues the three loads in ADDRESS order
+ * while we issue them in source order.  Statement order is otherwise
+ * confirmed [0], [2], [1] by the .lit4 order (gp-32352 = 0.2,
+ * gp-32348 = 0.35, gp-32344 = 0.27).
  * ============================================================== */
 static void
 flare_21A6D8(void)
@@ -500,7 +582,8 @@ flare_21A6D8(void)
 		while(flareRot[i][1] < -PI) flareRot[i][1] += TAU;
 		while(flareRot[i][2] > PI) flareRot[i][2] -= TAU;
 		while(flareRot[i][2] < -PI) flareRot[i][2] += TAU;
-		r = (float)((7-i)*(7-i))*PI*2.0f/64.0f;
+		r = 64.0f;
+		r = (float)((7-i)*(7-i))*PI*2.0f/r;
 		f = r + phase;
 		while(f > PI) f -= TAU;
 		while(f < -PI) f += TAU;
@@ -511,90 +594,101 @@ flare_21A6D8(void)
 
 /* ============================================================== *
  * flare_21AA50 / flare_21AF18 (0x21aa50 / 0x21af18) - the small and
- * large tri-fan discs.  The real does NOT share a helper: each is a
- * full, independently-compiled copy (colour clamp block unrolled,
- * the 18-vertex fan split into a before/loop/after shape rather than
- * one k<=17 loop, and centre/rim colour kept in sprVertices->verts2
- * scratch so it survives the VU0 calls inside the disc loop).
+ * large tri-fan discs.  253/306 and 247/287.
  *
- * RESIDUAL MISMATCH (22/306, 21/287): the colour-clamp block's shape
- * (init store + separate >255 and <0 branches, including the real's
- * redundant delay-slot pre-clamp store) is confirmed correct against
- * the disassembly for the 6-component unroll.  The per-vertex fan body
- * is written to the real's threaded-pkt style (pktSetAD/vif1Begin/
- * vif1End all taking/returning the packet pointer explicitly, matching
- * the real ABI rather than the port's hidden-global pktSetAD) and the
- * before/loop/after 1+16+1 vertex split matches the real's structure
- * instruction-for-instruction in shape; what's not reproduced is the
- * real's exact GPR assignment across this large (306/287-insn, deeply
- * call-heavy) loop body - each of the ~9 VU0/GS calls per iteration
- * clobbers caller-saved regs, so which of the many live values (loop
- * index, ring/colour pointers, pkt) lands in which sN register is
- * decided by whole-function register pressure this old linear
- * allocator doesn't expose a source-level lever for.
+ * The two are NOT the same code with a different table: 21AF18 is 19
+ * instructions shorter because it draws the whole 17-vertex fan in ONE
+ * loop with an "if(k == 0)" picking the centre colour, while 21AA50
+ * peels the centre vertex out and runs a 16-iteration loop after it.
+ * Recovered shapes common to both:
+ *  - the fan vertices are walked with an explicit "float *w" pointer
+ *    (w += 4), not by indexing ring[i][k]; 21AA50 counts DOWN
+ *    (k = 15; k >= 0; k--) from &ring[i][1], 21AF18 counts up
+ *    (k = 0; k < 17; k++) from &ring[i][0].
+ *  - the RGBAQ/XYZF2 operands are plain "sprVertices->verts2[..][..]"
+ *    ints (signed lw), not a "u32 *v" alias (which produces lwu and
+ *    keeps sprVertices in a callee-saved register instead of the ROM's
+ *    reload-from-gp before every packet write).
+ *  - the clip test wraps the body ("if(ClipAll(...) == 0) { ... }"
+ *    followed by an unconditional vif1End) rather than doing
+ *    "if(clipped) { vif1End; continue; }" - the ROM branches straight
+ *    to the shared vif1End at the bottom of the loop.
+ *  - six clamp blocks in the "< 256" idiom through a local int c.
+ *
+ * Residual: the ROM keeps TWO copies of the sprVertices pointer across
+ * the clamp blocks (lw a0; move a1,a0; the two stores of each block
+ * alternate between them) where we keep one, the loop counter and i+1
+ * are swapped between two callee-saved registers, and the ROM
+ * re-materialises the constant 272 and the &ring[0][1] address instead
+ * of reusing the hoisted copies.  All register/hoisting ties.
  * ============================================================== */
 static void
 flare_21AA50(void)
 {
-	int i, k;
+	int i, k, c;
 	float q;
-	u32 *v;
+	float *w;
 	void *pkt;
 
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 0, 128);
 
-	sprVertices->verts2[0][0] = (int)(flareColorSmall[0]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[0][0] > 255) sprVertices->verts2[0][0] = 255;
-	if(sprVertices->verts2[0][0] < 0) sprVertices->verts2[0][0] = 0;
-	sprVertices->verts2[0][1] = (int)(flareColorSmall[1]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[0][1] > 255) sprVertices->verts2[0][1] = 255;
-	if(sprVertices->verts2[0][1] < 0) sprVertices->verts2[0][1] = 0;
-	sprVertices->verts2[0][2] = (int)(flareColorSmall[2]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[0][2] > 255) sprVertices->verts2[0][2] = 255;
-	if(sprVertices->verts2[0][2] < 0) sprVertices->verts2[0][2] = 0;
-	sprVertices->verts2[1][0] = (int)(flareColorSmall[4]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[1][0] > 255) sprVertices->verts2[1][0] = 255;
-	if(sprVertices->verts2[1][0] < 0) sprVertices->verts2[1][0] = 0;
-	sprVertices->verts2[1][1] = (int)(flareColorSmall[5]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[1][1] > 255) sprVertices->verts2[1][1] = 255;
-	if(sprVertices->verts2[1][1] < 0) sprVertices->verts2[1][1] = 0;
-	sprVertices->verts2[1][2] = (int)(flareColorSmall[6]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[1][2] > 255) sprVertices->verts2[1][2] = 255;
-	if(sprVertices->verts2[1][2] < 0) sprVertices->verts2[1][2] = 0;
-
+	c = (int)(flareColorSmall[0]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[0][0] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[0][0] = c;
+	c = (int)(flareColorSmall[1]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[0][1] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[0][1] = c;
+	c = (int)(flareColorSmall[2]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[0][2] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[0][2] = c;
+	c = (int)(flareColorSmall[4]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[1][0] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[1][0] = c;
+	c = (int)(flareColorSmall[5]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[1][1] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[1][1] = c;
+	c = (int)(flareColorSmall[6]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[1][2] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[1][2] = c;
 	for(i = 0; i < 7; i++) {
 		pkt = vif1Begin();
 		sceVu0RotMatrix(sprMatrices->m9, sprMatrices->unit, flareRot[i]);
 		sceVu0TransMatrix(sprMatrices->worldMatrix, sprMatrices->m9, flarePos[i]);
 		sceVu0MulMatrix(sprMatrices->worldScreenMatrix,
 			sprMatrices->cameraScreenMatrix, sprMatrices->worldMatrix);
-		if(sceVu0ClipAll(clipMin, clipMax, sprMatrices->worldScreenMatrix, flareRingSmall[i][0], 17)) {
-			vif1End(pkt);
-			continue;
-		}
-		pkt = pktSetAD(pkt, SCE_GS_PRIM, SCE_GS_PRIM_SET(SCE_GS_PRIM_TRIFAN, 1, 0, 0, 1, 0, 1, 0, 0));
+		if(sceVu0ClipAll(clipMin, clipMax, sprMatrices->worldScreenMatrix, flareRingSmall[i][0], 17) == 0) {
+			pkt = pktSetAD(pkt, SCE_GS_PRIM, SCE_GS_PRIM_SET(SCE_GS_PRIM_TRIFAN, 1, 0, 0, 1, 0, 1, 0, 0));
 
-		q = sprTransformVertex(sprVertices->verts2[2], flareRingSmall[i][0], sprMatrices->worldScreenMatrix);
-		v = (u32*)sprVertices->verts2[2];
-		pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[0][0],
-			sprVertices->verts2[0][1], sprVertices->verts2[0][2], 128, *(u32*)&q));
-		pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(v[0], v[1], v[2], 0));
+			q = sprTransformVertex(sprVertices->verts2[2], flareRingSmall[i][0], sprMatrices->worldScreenMatrix);
+			pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[0][0],
+				sprVertices->verts2[0][1], sprVertices->verts2[0][2], 128, *(u32*)&q));
+			pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(sprVertices->verts2[2][0],
+				sprVertices->verts2[2][1], sprVertices->verts2[2][2], 0));
 
-		for(k = 1; k <= 16; k++) {
-			q = sprTransformVertex(sprVertices->verts2[2], flareRingSmall[i][k], sprMatrices->worldScreenMatrix);
-			v = (u32*)sprVertices->verts2[2];
+			w = flareRingSmall[i][1];
+			for(k = 15; k >= 0; k--) {
+				q = sprTransformVertex(sprVertices->verts2[2], w, sprMatrices->worldScreenMatrix);
+				pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[1][0],
+					sprVertices->verts2[1][1], sprVertices->verts2[1][2], 128, *(u32*)&q));
+				pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(sprVertices->verts2[2][0],
+					sprVertices->verts2[2][1], sprVertices->verts2[2][2], 0));
+				w += 4;
+			}
+
+			q = sprTransformVertex(sprVertices->verts2[2], flareRingSmall[i][1], sprMatrices->worldScreenMatrix);
 			pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[1][0],
 				sprVertices->verts2[1][1], sprVertices->verts2[1][2], 128, *(u32*)&q));
-			pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(v[0], v[1], v[2], 0));
+			pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(sprVertices->verts2[2][0],
+				sprVertices->verts2[2][1], sprVertices->verts2[2][2], 0));
+
 		}
-
-		q = sprTransformVertex(sprVertices->verts2[2], flareRingSmall[i][1], sprMatrices->worldScreenMatrix);
-		v = (u32*)sprVertices->verts2[2];
-		pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[1][0],
-			sprVertices->verts2[1][1], sprVertices->verts2[1][2], 128, *(u32*)&q));
-		pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(v[0], v[1], v[2], 0));
-
 		vif1End(pkt);
 	}
 	vif1SetZTest(1);
@@ -603,32 +697,38 @@ flare_21AA50(void)
 static void
 flare_21AF18(void)
 {
-	int i, k;
+	int i, k, c;
 	float q;
-	u32 *v;
+	float *w;
 	void *pkt;
 
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 0, 128);
 
-	sprVertices->verts2[0][0] = (int)(flareColorLarge[0]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[0][0] > 255) sprVertices->verts2[0][0] = 255;
-	if(sprVertices->verts2[0][0] < 0) sprVertices->verts2[0][0] = 0;
-	sprVertices->verts2[0][1] = (int)(flareColorLarge[1]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[0][1] > 255) sprVertices->verts2[0][1] = 255;
-	if(sprVertices->verts2[0][1] < 0) sprVertices->verts2[0][1] = 0;
-	sprVertices->verts2[0][2] = (int)(flareColorLarge[2]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[0][2] > 255) sprVertices->verts2[0][2] = 255;
-	if(sprVertices->verts2[0][2] < 0) sprVertices->verts2[0][2] = 0;
-	sprVertices->verts2[1][0] = (int)(flareColorLarge[4]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[1][0] > 255) sprVertices->verts2[1][0] = 255;
-	if(sprVertices->verts2[1][0] < 0) sprVertices->verts2[1][0] = 0;
-	sprVertices->verts2[1][1] = (int)(flareColorLarge[5]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[1][1] > 255) sprVertices->verts2[1][1] = 255;
-	if(sprVertices->verts2[1][1] < 0) sprVertices->verts2[1][1] = 0;
-	sprVertices->verts2[1][2] = (int)(flareColorLarge[6]*redFlareIntensity*0.015625f);
-	if(sprVertices->verts2[1][2] > 255) sprVertices->verts2[1][2] = 255;
-	if(sprVertices->verts2[1][2] < 0) sprVertices->verts2[1][2] = 0;
+	c = (int)(flareColorLarge[0]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[0][0] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[0][0] = c;
+	c = (int)(flareColorLarge[1]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[0][1] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[0][1] = c;
+	c = (int)(flareColorLarge[2]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[0][2] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[0][2] = c;
+	c = (int)(flareColorLarge[4]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[1][0] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[1][0] = c;
+	c = (int)(flareColorLarge[5]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[1][1] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[1][1] = c;
+	c = (int)(flareColorLarge[6]*redFlareIntensity*0.015625f);
+	sprVertices->verts2[1][2] = c;
+	if(c < 256) { if(c < 0) c = 0; } else c = 255;
+	sprVertices->verts2[1][2] = c;
 
 	for(i = 0; i < 7; i++) {
 		pkt = vif1Begin();
@@ -636,32 +736,30 @@ flare_21AF18(void)
 		sceVu0TransMatrix(sprMatrices->worldMatrix, sprMatrices->m9, flarePos[i]);
 		sceVu0MulMatrix(sprMatrices->worldScreenMatrix,
 			sprMatrices->cameraScreenMatrix, sprMatrices->worldMatrix);
-		if(sceVu0ClipAll(clipMin, clipMax, sprMatrices->worldScreenMatrix, flareRingLarge[i][0], 17)) {
-			vif1End(pkt);
-			continue;
-		}
-		pkt = pktSetAD(pkt, SCE_GS_PRIM, SCE_GS_PRIM_SET(SCE_GS_PRIM_TRIFAN, 1, 0, 0, 1, 0, 1, 0, 0));
+		if(sceVu0ClipAll(clipMin, clipMax, sprMatrices->worldScreenMatrix, flareRingLarge[i][0], 17) == 0) {
+			pkt = pktSetAD(pkt, SCE_GS_PRIM, SCE_GS_PRIM_SET(SCE_GS_PRIM_TRIFAN, 1, 0, 0, 1, 0, 1, 0, 0));
 
-		q = sprTransformVertex(sprVertices->verts2[2], flareRingLarge[i][0], sprMatrices->worldScreenMatrix);
-		v = (u32*)sprVertices->verts2[2];
-		pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[0][0],
-			sprVertices->verts2[0][1], sprVertices->verts2[0][2], 128, *(u32*)&q));
-		pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(v[0], v[1], v[2], 0));
+			w = flareRingLarge[i][0];
+			for(k = 0; k < 17; k++) {
+				q = sprTransformVertex(sprVertices->verts2[2], w, sprMatrices->worldScreenMatrix);
+				if(k == 0)
+					pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[0][0],
+						sprVertices->verts2[0][1], sprVertices->verts2[0][2], 128, *(u32*)&q));
+				else
+					pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[1][0],
+						sprVertices->verts2[1][1], sprVertices->verts2[1][2], 128, *(u32*)&q));
+				pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(sprVertices->verts2[2][0],
+					sprVertices->verts2[2][1], sprVertices->verts2[2][2], 0));
+				w += 4;
+			}
 
-		for(k = 1; k <= 16; k++) {
-			q = sprTransformVertex(sprVertices->verts2[2], flareRingLarge[i][k], sprMatrices->worldScreenMatrix);
-			v = (u32*)sprVertices->verts2[2];
+			q = sprTransformVertex(sprVertices->verts2[2], flareRingLarge[i][1], sprMatrices->worldScreenMatrix);
 			pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[1][0],
 				sprVertices->verts2[1][1], sprVertices->verts2[1][2], 128, *(u32*)&q));
-			pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(v[0], v[1], v[2], 0));
+			pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(sprVertices->verts2[2][0],
+				sprVertices->verts2[2][1], sprVertices->verts2[2][2], 0));
+
 		}
-
-		q = sprTransformVertex(sprVertices->verts2[2], flareRingLarge[i][1], sprMatrices->worldScreenMatrix);
-		v = (u32*)sprVertices->verts2[2];
-		pkt = pktSetAD(pkt, SCE_GS_RGBAQ, SCE_GS_RGBAQ_SET(sprVertices->verts2[1][0],
-			sprVertices->verts2[1][1], sprVertices->verts2[1][2], 128, *(u32*)&q));
-		pkt = pktSetAD(pkt, SCE_GS_XYZF2, SCE_GS_XYZF_SET(v[0], v[1], v[2], 0));
-
 		vif1End(pkt);
 	}
 	FlareThing((int)(redFlareIntensity*0.0625f));
@@ -669,45 +767,56 @@ flare_21AF18(void)
 }
 
 /* ============================================================== *
- * fades (0x21b398, unnamed) - the illegal scene's screen fades.
+ * fades (0x21b398, unnamed) - the illegal scene's screen fades.  63/76.
  *
- * RESIDUAL MISMATCH (9/76): the branch structure (z<800 / z>1128 /
- * openingEndFlag) and every constant/argument value matches port's
- * semantics.  For "128 - (int)(z - 672.0f)" the real calls the
- * 0x25a368 float-to-int helper (with what nets out, after its own
- * internal 128x-scale-then-1/128x-unscale dance, to plain z-672.0f as
- * the argument); this compiler instead emits a direct cvt.w.s/mfc1
- * for a plain (int) cast of a float - confirmed by standalone test
- * compiles, so a bare "(int)(float_expr)" cast never reaches that
- * helper here.  Whatever made the real route through it (a different
- * cast idiom, an explicit rounding call, or a double intermediate -
- * tried and ruled out) isn't recoverable from the bytes alone.  The
- * second (z>1128) branch, which has no such cast until its own
- * DrawSomeSprite2(..., (int)f) call, was not reachable for comparison
- * once the first branch's helper-vs-direct divergence shifts the tail.
+ * Recovered shapes:
+ *  - DrawSomeSprite2's alpha parameter is UNSIGNED: both branches route
+ *    their float through __fixunssfsi (0x25a368).  A signed (int) cast
+ *    would have been an inline cvt.w.s.
+ *  - the first branch's argument really is
+ *    "(128.0f - (672.0f - z) - 128.0f)*128.0f/128.0f" - five FP ops
+ *    that net out to z-672 but that the compiler does not fold (only
+ *    the /128.0f becomes a reciprocal multiply).
+ *  - the alpha must be computed into a LOCAL before the call; written
+ *    inline as the second argument, the string address is materialised
+ *    before the __fixunssfsi call and so needs a callee-saved register
+ *    (32-byte frame + "move a0,s0"), where the ROM has a 16-byte frame
+ *    and builds the address straight into a0 afterwards.
+ *  - the 0..128 clamp writes a SECOND variable (g), leaving f intact -
+ *    hence the ROM's "mtc1 zero,f12" + two "mov.s f12,.." arms.
+ *  - the "B" sprite name is an extern array of unknown size at
+ *    0x2A77F0 (see fadeSpriteName).
+ *
+ * Residual (9 words): f1/f2 allocation ties only.
  * ============================================================== */
 static void
 fades(void)
 {
+	u32 a;
+
 	if(openingPosition[2] < 800.0f) {
-		DrawSomeSprite2("B", 128 - (int)(openingPosition[2] - 672.0f));
+		a = 128 - (u32)((128.0f - (672.0f - openingPosition[2]) - 128.0f)*128.0f/128.0f);
+		DrawSomeSprite2(fadeSpriteName, a);
 		illegalFadeCounter = 0;
 	} else if(openingPosition[2] > 1128.0f) {
-		float f;
+		float f, g;
 
 		f = (32.0f - (1160.0f - openingPosition[2]))*4.0f;
 		if(f < 0.0f)
-			f = 0.0f;
+			g = 0.0f;
 		else if(f > 128.0f)
-			f = 128.0f;
-		DrawSomeSprite2("B", f);
+			g = 128.0f;
+		else
+			g = f;
+		a = g;
+		DrawSomeSprite2(fadeSpriteName, a);
 		illegalFadeCounter = 0;
 	}
 	if(openingEndFlag) {
 		illegalFadeCounter++;
 		if(illegalFadeCounter > 128)
 			illegalFadeCounter = 128;
-		DrawSomeSprite2("B", illegalFadeCounter);
+		DrawSomeSprite2(fadeSpriteName, illegalFadeCounter);
 	}
 }
 
