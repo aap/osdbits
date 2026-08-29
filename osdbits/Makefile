@@ -1,9 +1,16 @@
 
 SHELL       = /bin/sh
 
-TOP         = /usr/local/sce/ee
+# freesce (the sdk-2.4-branch build installed in /usr/local/freesce) is
+# the primary SDK; the original SDK 2.4 install fills in what freesce
+# doesn't have yet (libpkt, and any header freesce lacks - freesce's
+# include dir is searched first).  "make TOP=/usr/local/sce/ee
+# SCETOP=/usr/local/sce/ee" relinks the plain sce 3.0.3 SDK.
+TOP         = /usr/local/freesce/ee
+SCETOP      = /usr/local/sce_24/ee
 LIBDIR      = $(TOP)/lib
 INCDIR      = $(TOP)/include
+INCS        = -I$(INCDIR) -I$(SCETOP)/include
 
 TARGET      = main
 OBJS        = crt0.o \
@@ -13,11 +20,13 @@ OBJS        = crt0.o \
               $(TARGET).o
 
 LCFILE      = $(LIBDIR)/app.cmd
+# libpkt and libdev come from the original SDK until freesce has them
+# (freesce's libdev is missing the vif1/vu1/gif resets)
 LIBS        = $(LIBDIR)/libgraph.a \
               $(LIBDIR)/libvu0.a \
               $(LIBDIR)/libdma.a \
-              $(LIBDIR)/libpkt.a \
-              $(LIBDIR)/libdev.a
+              $(SCETOP)/lib/libpkt.a \
+              $(SCETOP)/lib/libdev.a
 
 PREFIX      = ee
 AS          = $(PREFIX)-gcc
@@ -32,7 +41,11 @@ CFLAGS      = -O2 -Wall -fno-common -fno-strict-aliasing
 CXXFLAGS    = -O2 -Wall -fno-exceptions -fno-common -fno-strict-aliasing
 ASFLAGS     = -c -xassembler-with-cpp
 DVPASMFLAGS = 
-LDFLAGS     = -mno-crt0 -L$(LIBDIR) -lm
+# freesce's app.cmd has no GROUP(-lc -lkernl -lgcc) like the sce one, so
+# name them explicitly; libkernl (freesce klib) and libc are mutually
+# recursive, hence the group
+LDFLAGS     = -mno-crt0 -L$(LIBDIR) \
+              -Wl,--start-group -lkernl -lc -lgcc -Wl,--end-group -lm
 TMPFLAGS    =
 
 .SUFFIXES: .c .s .cc .dsm
@@ -42,20 +55,21 @@ all: $(TARGET).elf
 $(TARGET).elf: $(OBJS) $(LIBS)
 	$(LD) -o $@ -T $(LCFILE) $(OBJS) $(LIBS) $(LDFLAGS)
 
-crt0.o: $(LIBDIR)/crt0.s
-	$(AS) $(ASFLAGS) $(TMPFLAGS) -o $@ $<
+# freesce installs a prebuilt crt0.o (no crt0.s in the prefix)
+crt0.o: $(LIBDIR)/crt0.o
+	cp $< $@
 
 .s.o:
-	$(AS) $(ASFLAGS) $(TMPFLAGS) -I$(INCDIR) -o $@ $<
+	$(AS) $(ASFLAGS) $(TMPFLAGS) $(INCS) -o $@ $<
 
 .dsm.o:
-	$(DVPASM) $(DVPASMFLAGS) -I$(INCDIR) -o $@ $<
+	$(DVPASM) $(DVPASMFLAGS) $(INCS) -o $@ $<
 
 .c.o:
-	$(CC) $(CFLAGS) $(TMPFLAGS) -I$(INCDIR) -c $< -o $*.o
+	$(CC) $(CFLAGS) $(TMPFLAGS) $(INCS) -c $< -o $*.o
 
 .cc.o:
-	$(CC) $(CXXFLAGS) $(TMPFLAGS) -I$(INCDIR) -c $< -o $*.o
+	$(CC) $(CXXFLAGS) $(TMPFLAGS) $(INCS) -c $< -o $*.o
 
 run: $(TARGET).elf
 	$(RUN) $(TARGET).elf
