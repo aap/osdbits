@@ -332,25 +332,35 @@ DrawFog(void)
 }
 
 /* 0x215798 - init the illegal-disc fog: the shared 3x3-vertex patch and
- * the 128 particles.  64/161 insns match: the first loop (vertex patch)
- * and the rand()%64+64 / rand()%96/128-style idioms in the second loop
- * match the ROM's own signed-modulo-by-power-of-2 codegen closely, but
- * our object's frame is 16 bytes smaller than the real one (-176 vs.
- * -192) from the very first instruction, and the s1/s2 (i/j) register
- * assignment doesn't match either - both point to this function
- * needing one more spilled/live value than our version does, same
- * class of register-pressure gap as InitFog/DrawFog. Tried: swapping
- * the i/j declaration order (no effect on the mismatch count) and
- * replacing the v/col pointer aliases with direct 2D-array indexing
- * (made it dramatically worse, 3/161 - unlike InitFog, this function
- * wants the pointer-alias form). Left as the best of the variants
- * tried. */
+ * the 128 particles.
+ *
+ * 2026-08-29, with the resync differ: 149/161.  Real source shapes
+ * recovered from the ROM's codegen:
+ *  - the center-cell guard is `if(j == 1 && i == j)` (the ROM compares
+ *    i against the REGISTER holding j, not against the constant 1);
+ *  - `col[2] = col[1] = c*96/128;` comes BEFORE `col[3] = 128;` (the
+ *    hoisted 96 gets its callee-saved reg before the 128, and the
+ *    chain stores 8(s0) then 4(s0));
+ *  - `pos[2] = rand()%805 + 477` is the THIRD particle statement, so
+ *    the pos[3]/rot/state stores schedule into the div-805's shadow;
+ *  - rot is cleared with a CHAIN (w[0]=w[1]=w[2]=0.0f -> one hoisted
+ *    0.0f in $f20) while pos[3]=0.0f standalone gets `sw zero`;
+ *  - the particle loop is a hand-written countdown (k=127, bgez) over
+ *    three explicit walking pointers (v += 4, w += 4, st++) - array
+ *    indexing [k] never turns into this shape (no loop reversal, and
+ *    reusing one alias for pos AND rot blocks strength reduction
+ *    entirely);
+ *  - the pointer inits must go w-then-v to put v in s1/w in s2.
+ * Residual 12 words: k and the hoisted 805 have swapped callee-saved
+ * regs (s3/s4), which also perturbs the preheader lui temps and one
+ * bne/bnel.  No source lever moved this tie (for vs do-while, k's
+ * declaration position); left for a permuter pass. */
 static void
 sub_215798(void)
 {
-	int j, i, c;
-	float *v;
-	int *col;
+	int i, j, c, k;
+	float *v, *w;
+	int *col, *st;
 
 	for(j = 0; j < 3; j++)
 		for(i = 0; i < 3; i++) {
@@ -364,22 +374,26 @@ sub_215798(void)
 		for(i = 0; i < 3; i++) {
 			col = illegalFogColors[j*3+i];
 			c = 0;
-			if(j == 1 && i == 1)
+			if(j == 1 && i == j)
 				c = rand()%64 + 64;
 			col[0] = c;
+			col[2] = col[1] = c*96/128;
 			col[3] = 128;
-			col[1] = col[2] = c*96/128;
 		}
-	for(i = 0; i < 128; i++) {
-		illegalFogPos[i][0] = (rand()%4800 - 2400)*0.01f;
-		illegalFogPos[i][1] = (rand()%4800 - 2400)*0.01f;
-		illegalFogPos[i][3] = 0.0f;
-		illegalFogRot[i][0] = 0.0f;
-		illegalFogRot[i][1] = 0.0f;
-		illegalFogRot[i][2] = 0.0f;
-		illegalFogRot[i][3] = 1.0f;
-		illegalFogState[i] = 0;
-		illegalFogPos[i][2] = rand()%805 + 477;
+	w = (float*)illegalFogRot;
+	v = (float*)illegalFogPos;
+	st = illegalFogState;
+	for(k = 127; k >= 0; k--) {
+		v[0] = (rand()%4800 - 2400)*0.01f;
+		v[1] = (rand()%4800 - 2400)*0.01f;
+		v[2] = rand()%805 + 477;
+		v[3] = 0.0f;
+		w[0] = w[1] = w[2] = 0.0f;
+		w[3] = 1.0f;
+		*st = 0;
+		v += 4;
+		w += 4;
+		st++;
 	}
 }
 
