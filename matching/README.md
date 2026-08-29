@@ -34,3 +34,38 @@ per-instruction diff for mismatches.
 at 0x200000 (Sony data - NOT in the repo): decompress your BIOS's
 OSDSYS file with ps2expand, or dump 0x200000+ from a PCSX2 savestate's
 `eeMemory.bin`.
+
+For a mismatch, check.py prints an ALIGNED diff (difflib over
+opcode-normalized words, immediates/branch/jump targets blanked
+symmetrically) so an inserted or deleted instruction costs one line
+instead of desyncing the rest of the function; the MATCH verdict is
+still the strict positional masked compare.
+
+## related tooling: n64-decomp-workbench
+
+`~/othersrc/n64-decomp-workbench` (pure-stdlib Python, `pip install -e`
+or PYTHONPATH) is an original late-stage MIPS mismatch diagnoser from
+the N64 IDO scene.  Verdict after a deep look (2026-08-29):
+
+- Its comparator stack is generic MIPS-over-objdump text and WORKS on
+  R5900 ee-gcc objects (verified on our opening.o incl. sqrt.s/lq/sq/
+  MMI) - but use a modern `/bin/objdump`, not ee-objdump (no
+  `--disassemble=SYM`), and know that `score --rom` reads words
+  big-endian (score.py:216) so ROM-vs-object scoring silently breaks
+  on PS2 images; `shift_align.comparable_text` also mis-normalizes
+  branch targets for any function not at .text offset 0.
+- check.py's aligned diff already covers its core alignment idea;
+  `align-dumps`/`view-dumps` remain useful as a second opinion with
+  mechanism classification (register/schedule/constant lanes): feed it
+  `objdump -d -r` of our .o and `objdump -D -b binary -m mips:5900 -EL`
+  windows of the image.
+- Most interesting untapped piece: `sweep`/`campaign` - its OWN
+  compiler-agnostic textual C variant generators (commutative flips,
+  carrier locals, live-range fusion) driven by an arbitrary
+  `--compile-command`, i.e. a permuter that could take ee-gcc directly.
+  Candidate for the tie-class residuals (register-allocation ties that
+  no source-order lever moves).  Its decomp-permuter driver proper is
+  IDO-shaped - ignore, along with all trace-*/instrument/oracle/pass
+  commands (IDO compiler internals).
+- The case-studies/*.md are compiler-independent matching methodology
+  and worth reading on their own.
