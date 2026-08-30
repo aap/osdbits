@@ -1068,6 +1068,10 @@ MenuFrame(void)
 	 * leaves the GS default (REPEAT), which would wrap the halo's
 	 * edge texels */
 	vif1SetCLAMP_1(1, 1, 0, 0, 0, 0);
+	/* NOT original: snapshot evenOddFrame once for the whole frame - both
+	 * 0x21D0A0's stage and 0x2283D0's zoom blur address "the buffer being
+	 * drawn", and the swap thread can flip the flag between them */
+	MenuBackFrameStart();
 	MenuCamera();
 	/* real: 0x21D0A0 - the TEXCKABE backdrop tunnel plus the composite
 	 * that tints the whole screen deep blue.  It has to run between the
@@ -1085,6 +1089,18 @@ MenuFrame(void)
 	SceneReset();
 	UpdateOrbs();
 	SceneWalk();
+	/* real: 0x2283D0, the FIRST thing stage 5 (0x2283F0) does, before any
+	 * of the 2D layer: 0x22C3C0(phase - 5), which is 0x22C3C0(5) in the
+	 * idle menu.  Five bilinear shrink/stretch round trips over the whole
+	 * frame buffer - this is why the retail orbs are so much softer than
+	 * the port's, and why the text drawn after it stays crisp.
+	 *
+	 * The ROM has the fade curtain (0x22B020) before this and the text
+	 * after; the port draws the curtain last.  That reordering is safe:
+	 * the curtain is a uniform full-screen alpha blend and the blur is
+	 * linear, so blur(lerp(scene, black, a)) == lerp(blur(scene), black,
+	 * a) either way. */
+	MenuZoomBlur();
 	/* real: 0x2283F0's main-menu slot (0x2283A0), which runs between
 	 * the 3D list and the letterbox.  The fade words are 0x22AD30/
 	 * 0x22AD28's job in the ROM; pass them instead of exporting them. */

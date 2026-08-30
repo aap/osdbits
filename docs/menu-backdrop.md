@@ -510,3 +510,386 @@ eventual port of that screen:
 - the orbs in the real menu are **blurrier** than the port's - see
   menu-scene.md §10: the unported second orb pass into the offscreen
   buffer (+ its composite) is the standing suspect.
+
+---
+
+# Why the retail menu's orbs are blurrier: `0x2283D0`'s always-on zoom blur
+
+Written in the style of `docs/menu-scene.md`; numbered to be merged in as
+a successor to that file's §10, with the corrections in §7 belonging to
+`docs/menu-backdrop.md`.
+
+Method: `objdump -D -b binary -m mips:5900 -EL --adjust-vma=0x200000` of
+`/u/aap/src/osdsys/expanded.bin`, every function read to its own `jr ra`;
+static data read straight out of the image; checked against a decoded GIF
+stream of the **retail BIOS's own menu** (`real1.pkl`, three consecutive
+frames from a PCSX2 `.gs` dump of `scph39001`) and against PCSX2
+`DumpGSData` folder dumps of the port.  Confidence tags as in
+`osdsys-map.md`: **[ok]** disassembly-backed and cross-checked, **[tnt]**
+plausible/partial.
+
+---
+
+## 1. The verdict
+
+The orbs are not drawn differently.  Every register of the trail, the
+halo and the core matches the port already.  What the port was missing is
+a **whole-screen post-process that runs after the 3D scene and before the
+2D text, on every single idle frame**:
+
+```
+0x21CF20 (Module U's frame hub), stage 5:
+    0x2283F0
+      -> 0x2283D0:  phase = *(gp-28844);
+                    if (phase >= 5) 0x22C3C0(phase - 5);
+      -> the 2D layer (0x226FA8, 0x227198, ..., 0x2283A0 = the menu text)
+```
+
+`*(gp-28844)` is **10** whenever no screen transition is running (§2), so
+this is `0x22C3C0(5)`: **five bilinear shrink-and-stretch round trips
+through work buffer 4** over the entire frame buffer.  The 3D layer -
+orbs, trails, halos, backdrop - goes through all five; the text and the
+rest of the 2D layer are drawn afterwards and stay crisp.  That, and
+nothing else, is the softness aap sees on the console. **[ok]**
+
+Measured point spread of the five passes (a host-side model of the exact
+GS mapping, `orb/`'s throwaway script): an isolated bright pixel comes
+out with **31 % of its peak and sigma 1.96 px horizontally**, **15 % of
+its peak and sigma 1.81 px vertically**.  The orb core sprite is only
+about 9 x 5 px and the halo 60 x 30 px, so the core all but dissolves
+into the halo - exactly the reported look.
+
+The five passes also **shift the 3D layer up and left**, by 1.5 px per
+pass horizontally and 1.25 px vertically = **7.8 x 6.2 px** over the
+five.  That is not a porting slip, it is what the record's `u0 = 0.5`
+against `x0 = 0` does (§3); the port reproduces it because it emits the
+same numbers.  It is invisible in practice because the offset is constant
+and applied to a freshly composed image, and because the text is drawn
+after it.
+
+## 2. Why `phase` is 10, not 0
+
+`0x2285C0` (stage 12 of `0x21CF20`) writes the ramp:
+
+```
+v = timerCount(0x27EC40)                  ; 0x22AC18 = *(t+4)
+if (v >= *(gp-30396))  *(gp-28844) = 0
+else                   *(gp-28844) = 10 - v*10 / *(gp-30396)
+```
+
+`*(gp-30396)` is set to **10** by the per-screen init `0x228460`
+(`(isPAL ? 50 : 60)/6`), and nothing on the idle path ever opens the
+timer at `0x27EC40`, so `v` stays 0 and the ramp sits at its maximum
+`10 - 0 = 10`.  (It is `0` only for the one frame after a transition has
+run to completion.) **[ok]**
+
+The two blur call sites are complements over that ramp:
+
+| site | argument | idle (phase 10) | mid-transition (phase 5) |
+|---|---|---|---|
+| `0x21D0A0` (before the scene) | `phase < 6 ? phase : 10 - phase` | **0** | 5 |
+| `0x2283D0` (after the scene) | `phase >= 5 ? phase - 5 : 0` | **5** | 0 |
+
+So the blur does not switch on and off during a transition - it *migrates*
+from after the scene to before it, keeping five passes' worth in flight
+the whole way down to phase 5, then fading out below that.
+
+## 3. `0x22C3C0` exactly as the GS sees it
+
+`0x22C3C0(n)`, record `0x27F820` = `{0x80,0x80,0x80,0x80}`, `x0/y0 = 0`,
+`u0/v0 = 8` (i.e. 0.5 texel), **`ABE = 0`**, `TME = 1`:
+
+```
+x = 5108; y = 2388;                       ; 1/16 pixel units
+for (k = 0; k < n; k++) {
+    0x22BF58(1,0,0)   ; TEX0 = the screen  (0x22A198: TBP = this frame's
+                      ;                     draw buffer, PSM = PSMCT24,
+                      ;                     TW 10 TH 8, filter = 1)
+                      ; FRAME = work buffer 4 (0x22A4C8(1,...): FBP 280)
+    0x22A0C0(1,1)     ; ALPHA_1 = 0x44, TEST_1 = ZTE 1 / ZTST 1 ALWAYS
+    rec.x1 = x ; rec.y1 = y
+    rec.u1 = (w<<4)+8 ; rec.v1 = ((h-1)<<4)+8
+    0x2299C0(rec)     ; SPRITE, FST, ABE 0
+    0x22C020(1,0,0)   ; TEX0 = work buffer 4 (0x22A290(1): TBP 8960,
+                      ;                       PSM = PSMCT32)
+                      ; FRAME = the screen  (0x22A3B8)
+    0x22A0C0(1,1)
+    rec.x1 = w<<4 ; rec.y1 = (h-1)<<4
+    rec.u1 = x+8 ; rec.v1 = y+8
+    0x2299C0(rec)
+    x -= 32; y -= 16;
+}
+0x22A0C0(1, 3)
+```
+
+so the five destination rectangles are **319.25 x 149.25, 317.25 x
+148.25, 315.25 x 147.25, 313.25 x 146.25, 311.25 x 145.25**, always from
+the full `640 x 223` screen, and each is stretched straight back.
+
+**The whole effect is `sceGsSetDefTexEnv`'s `filter` argument.**  Both
+`0x22A198` and `0x22A290` pass `filter = 1`, which sets `MMAG = MMIN =
+LINEAR` (`TEX1 = 0x61`).  With NEAREST this loop would be a lossy
+resample and nothing more; with LINEAR each round trip is a ~2 px box
+followed by a ~4 px triangle, and five of them compound. **[ok]**
+
+The half-texel bookkeeping is what produces §1's shift: the destination
+*corner* `x = 0` is mapped to source `u = 0.5` (the centre of source
+texel 0), not to `u = 0`, in both directions of the round trip, so each
+pass moves the picture by half a *source* texel of the down-scale
+(`0.5 * 640/319.25 = 1.0` px) plus half a destination texel
+(`0.5` px) = 1.5 px.
+
+## 4. The retail GS stream, one whole frame
+
+Decoded from `real1.pkl` (retail BIOS, PCSX2 `.gs`, frame between the 1st
+and 2nd VSYNC).  141 draws.  Order, with what each one is:
+
+| # | FRAME | what |
+|---|---|---|
+| 1 | 70 | full-screen `TME 0` clear |
+| 2-17 | 70 | 16 x 60-vertex TRISTRIP, TEX0 TBP 11264 TW7 TH7 = TEXCKABE, A 64 - the backdrop tunnel |
+| 18 | 210 | copy screen (TBP 2240, **PSMCT24**) -> work buffer 3 |
+| 19 | 280 | copy screen -> work buffer 4 |
+| 20 | 70 | composite: TEX0 TBP **6720** (work buffer 3), RGBAQ **(55,40,60,128)**, ABE 0 |
+| 21-41 | 70 | **7 orbs, visible pass**: trail, halo, core |
+| 42-62 | 210 | **7 orbs, offscreen pass** into work buffer 3 |
+| 63,65 | 280 | `0x2267E8`'s two clears of work buffer 4 to black |
+| 64,66 | 70 | `0x226768(30)` additive blits of the (black) work buffer 4 |
+| 67 | 70 | a 96-vertex IIP TRISTRIP (2D-ish, unidentified) |
+| 68 | 70 | the fade curtain, `A = 0` |
+| **69-78** | **280 / 70** | **the five zoom-blur pairs** |
+| 79-141 | 70 | the menu text (TEX0 TBP 12037, TW 8 TH 9) |
+
+The five pairs, verbatim:
+
+```
+FRAME 280 <- TEX0 {TBP 2240, TBW 10, PSM 1(CT24), TW 10, TH 8}  TEX1 0x61
+            ALPHA 0x44  PRIM SPRITE/TME/FST, ABE 0  RGBAQ 128,128,128,128
+            XY (0,0)-(319.25,149.25)   UV (0.5,0.5)-(640.5,223.5)
+FRAME  70 <- TEX0 {TBP 8960, TBW 10, PSM 0(CT32), TW 10, TH 8}  TEX1 0x61
+            XY (0,0)-(640,223)         UV (0.5,0.5)-(319.75,149.75)
+   ... then 317.25/148.25 & 317.75/148.75
+   ... then 315.25/147.25 & 315.75/147.75
+   ... then 313.25/146.25 & 313.75/146.75
+   ... then 311.25/145.25 & 311.75/145.75
+```
+
+(XY quoted after subtracting `XYOFFSET_1` = 1728, 1936 = `(2048-w/2)<<4`,
+`(2048-h/2)<<4`.)
+
+`osdbits`' `ZoomBlur()` now emits exactly these ten sprites, with the same
+TEX0/TEX1/ALPHA/PRIM and the same 1/16-pixel extents. **[ok]**
+
+### 4.1 The orb draws already matched
+
+From the same frame, per orb (all `ALPHA_1 = 0x48` = `Cs*As + Cd`,
+`TEX1 = 0x61`):
+
+| primitive | retail | `osdbits/menu.c` |
+|---|---|---|
+| trail | `PRIM` LINE_STRIP, IIP 0, TME 0, ABE 0, **AA1 1**, 49 vertices | identical |
+| halo | SPRITE, TME 1, ABE 1, FST 1; TEX0 TBP **11840** TBW 1 TW 6 TH 6 (TEXCBLUR, 64x64); UV (0,0)-(63,63); RGBAQ **(48,98,128,60)** | identical (`0x27EB30` = `{0x30,0x62,0x80,0x3C}`) |
+| core | same PRIM; TEX0 TBP **11776** (TEXCNAVI); UV (0,0)-(63,63); RGBAQ **(128,128,128,128)** | identical (`0x27F930`) |
+
+Sprite extents agree too: a retail halo is
+`(1982.19,2060.19)-(2041.75,2090.00)` = 59.6 x 29.8 px, a core
+`(2007.50,2072.88)-(2016.44,2077.31)` = 8.9 x 4.4 px, which is
+`depth * 6.5e-06 * {30, 4.5}` with the vertical half of that - the
+formula `menu.c` already implements.
+
+So suspects 2 (halo/sprite parameters), 3 (texture content / a missing
+particle texture) and 4 (the wobble phases) are all **negative**:
+
+* only TEXC slots 6 and 7 are ever bound by `0x22EFF0`; the slot table at
+  `0x27F1C0` (stride 12, `{ptr, wexp, hexp}`) gives both of them
+  `wexp = hexp = 6`, i.e. genuine 64x64 pages, and the retail TEX0s
+  confirm `TW 6 TH 6`.  No third texture participates. **[ok]**
+* `res/TEXCBLUR_EXP` and `res/TEXCNAVI_EXP` are 4096 bytes each (64x64
+  8-bit) and decode through `0x22A790` (`opening.c`'s "format 3"), which
+  is what `menuTextures[]` declares.  TEXCBLUR is a soft radial falloff
+  filling the middle ~34 texels, TEXCNAVI a solid disc across the whole
+  page - the ROM's own content.
+* `0x34E960`'s phases only feed the entry scatter, which the port uses
+  the same way.
+
+## 5. So what *is* the second orb pass for?
+
+`0x22EFF0` really does run the whole orb twice - at `0x22F784` it points
+`FRAME` at **work buffer 3** (`0x22A4C8(0, NULL, field)` -> FBP 210, no
+clear) and repeats the trail, halo and core - and it never puts `FRAME`
+back; `0x2267E8` is the next thing to set it.
+
+**In the idle menu that second pass is dead, and the retail GS stream
+proves it.**  In the whole 141-draw frame above, exactly **one** draw
+samples TBP 6720 (= work buffer 3): the composite at #20, which runs
+*before* the orbs.  The next frame's `0x22C190(0)` copy is an **opaque**
+sprite (`rec(0x27F760)+0x34 = ABE = 0`) covering the full screen, so it
+overwrites work buffer 3 wholesale before anything can read the orbs back
+out of it. **[ok]**
+
+That resolves the tension `docs/menu-backdrop.md` left open.  The two
+"inert" readings were both right; what was wrong was the assumption that
+*something* must consume the offscreen copy.  Nothing does, on this
+screen.  Work buffer 3 has a live consumer elsewhere - `0x22C228` /
+`0x22BFD0` / `0x22C088`, the work-buffer-3 twin of the zoom blur, called
+from the stage at `0x226D80`-`0x226F74` (a different scene: 12 objects
+transformed through `0x22D2E8`/`0x22D798`, then the wb3 blur, then
+`0x22C2A0`) - so the second pass is presumably live on *that* screen and
+is simply carried along, unread, by the main menu.
+
+Two details of the second pass that are only visible because it exists,
+and that pin down `0x22EFF0`'s stack layout:
+
+* its core sprite uses the colour record at **`0x27F940` =
+  `{0xFF,0xFF,0xFF,0x80}`** where the visible pass uses `0x27F930` =
+  `{0x80,0x80,0x80,0x80}` - and the retail dump shows exactly that,
+  `(255,255,255,128)` on FRAME 210 against `(128,128,128,128)` on
+  FRAME 70;
+* its halo sprite comes out at `A = 128` where the visible one is
+  `A = 60`, because `0x22F794`'s `sw v1(=128), 60(sp)` lands **inside**
+  the halo's colour quadword: `sp+48..63` is the copy of the trail head's
+  colour and `sp+60` is its alpha.
+
+## 6. One real quirk the port does *not* have (deliberately)
+
+That same aliasing means the visible pass's halo and core alphas are
+**timer-scaled**: `0x22F54C` reads `sp+60` (the halo colour's alpha, 60),
+passes it through `0x22AC20(0x27F900, a)` and writes the result back into
+`sp+60` before the sprite is drawn; `0x22F678` does the same to `sp+28`
+(the core's 128).  `0x27F900` is the trail timer that `0x22EE98` opens for
+`(fps<<8)/60` = 256 counts and `0x22EFF0` steps once per orb, so both
+alphas ramp 0 -> 60 / 0 -> 128 over the first ~37 frames of a menu entry
+and are constant thereafter.  `osdbits` passes the raw record colours, so
+it matches from frame 37 on and is slightly brighter before that.  Not
+ported: it is invisible under the 128-frame fade-up that runs over the
+same window.  Listed here as **approximated**.
+
+## 7. Corrections to the docs
+
+1. **`docs/menu-backdrop.md` §6 - "the blur is a screen-transition
+   effect, not the always-on wash" is WRONG.**  It is *both*, and in the
+   idle menu it is at **full strength**.  §6 read only `0x21D0A0`'s call
+   site.  The always-on one is `0x2283D0`, reached from stage 5 of
+   `0x21CF20`, and at `phase = 10` it runs `0x22C3C0(5)`.
+2. **`docs/menu-backdrop.md` §10.1 mis-attributes its own evidence.**  It
+   records that "the retail dump also caught `0x22C3C0` running live with
+   n = 5 ... which is what §6 predicts for a transition ramp of 5".  The
+   dump was of an *idle* menu; n = 5 is the idle value, from `0x2283D0`.
+   That observation was the answer to this whole question, sitting in the
+   notes already.
+3. **`docs/menu-scene.md` §10.6's aside about the second pass** - "the
+   offscreen buffer the zoom-blur composite samples" - is wrong twice
+   over: the buffer is work buffer **3**, and on this screen nothing
+   samples it (§5).  The zoom blur ping-pongs through work buffer **4**
+   and reads the *screen*.
+4. **`docs/menu-backdrop.md` §2.2 "there is no frame-to-frame feedback in
+   the menu"** stands, and is now the reason the second pass is dead
+   rather than an unexplained coincidence.
+5. `docs/menu-backdrop.md` §12's open question "`0x22C228`/`0x22BFD0`/
+   `0x22C088` - callers not chased" is partly closed: `0x226F00`/
+   `0x226F08` in the stage at `0x226D80` (see §5).  Which screen that
+   stage belongs to is still open. **[tnt]**
+
+## 8. What the port does now
+
+`osdbits/menuback.c`:
+
+* **`BlurBlit(tbp, psm, x1, y1, u1, v1)`** - new.  Emits `0x2299C0`'s
+  sprite straight in 1/16-pixel units (TEX1, TEX0, CLAMP_1, PRIM, RGBAQ,
+  UV/XYZ2 x2).  The old code went through `Rect`/`pktSetTexRect`, which
+  is whole-pixel only and shrinks the far corner by 1/16 - it could not
+  express 319.25 x 149.25.  **Exact.**
+* **`ZoomBlur(n)`** - rewritten on top of `BlurBlit`; same loop and same
+  constants as before, now with the ROM's exact extents, the ROM's PSMs
+  (PSMCT24 reading the screen, PSMCT32 reading work buffer 4) and the
+  ROM's `ALPHA_1 = 0x44` / ZTST ALWAYS around it.  **Exact.**
+* **`MenuZoomBlur()`** - new, `real: 0x2283D0`.  `if (backPhase >= 5)
+  ZoomBlur(backPhase - 5)`.  **Exact** (given `backPhase`, see below).
+* **`MenuBackFrameStart()`** - new, **NOT original**.  Snapshots
+  `evenOddFrame` and the draw buffer's TBP once per frame, so
+  `MenuBackdrop()` and `MenuZoomBlur()` cannot straddle a swap-thread
+  flip and address different buffers.  `MenuBackdrop()` used to do this
+  itself; it now uses the snapshot.
+* `backPhase` (argv[11], default 10) is now documented as the transition
+  ramp `*(gp-28844)`.  It still defaults to 10 = idle, which is what
+  makes the blur on by default.  `backPhase = 5` turns the post-scene
+  blur off without touching anything else, which is the A/B switch used
+  below.  **Approximated**: the port has no transition timer, so the ramp
+  is a constant instead of `0x2285C0`'s output.
+
+`osdbits/menu.c`:
+
+* `MenuFrame()` calls `MenuBackFrameStart()` first, and `MenuZoomBlur()`
+  between `SceneWalk()` (stage 3, `0x2268F0`) and `MenuTextFrame()`
+  (stage 5's 2D layer).
+
+`osdbits/inc.h`: two declarations.
+
+**Not ported / stubbed**: the second orb pass into work buffer 3 (§5 -
+dead on this screen, and porting it would cost a second full orb render
+for nothing); `0x22C3C0`'s transition-side call from `0x21D0A0` still
+exists but is still driven by the same fixed `backPhase`; the halo/core
+alpha ramp of §6.
+
+### 8.1 Ordering note
+
+The ROM's stage order is scene -> fade curtain (`0x22B020`) -> blur
+(`0x2283D0`) -> text.  The port draws the curtain *after* the text.  The
+blur was inserted before the text anyway, so the port's order is
+scene -> blur -> text -> curtain.  That is safe: the curtain is a uniform
+full-screen alpha blend and the blur is linear, so
+`blur(lerp(scene, black, a)) == lerp(blur(scene), black, a)`.
+
+## 9. How it was checked
+
+**Register level.**  `real1.pkl` (retail BIOS `.gs`, decoded with a GIF
+walker) against a PCSX2 `DumpGSData` folder dump of the patched port
+(`menu 12 34 56 160 1 128 0 0 1 0 10 0`, SW renderer, one frame).  The
+port's ten blur sprites, verbatim from the dump:
+
+| # | FRAME FBP | TEX0 | TEX1 | ALPHA | XY | UV |
+|---|---|---|---|---|---|---|
+| 04556 | 0x2580 (extraBuf2) | 0x8c0 tbw10 **PSM 1** tw10 th8 | 1/1 | 0,1,0,1 | (0,-0.5)-(**319.25**,148.75) | (0.5,0.5)-(640.5,223.5) |
+| 04557 | 0x8c0 (screen) | 0x2580 tbw10 **PSM 0** tw10 th8 | 1/1 | 0,1,0,1 | (0,-0.5)-(640,222.5) | (0.5,0.5)-(**319.75**,149.75) |
+| 04558/9 | | | | | 317.25/147.75 | 317.75/148.75 |
+| 04560/1 | | | | | 315.25/146.75 | 315.75/147.75 |
+| 04562/3 | | | | | 313.25/145.75 | 313.75/146.75 |
+| 04564/33 | | | | | 311.25/144.75 | 311.75/145.75 |
+
+against the retail rows in §4: identical PRIM (SPRITE, TME 1, ABE **0**,
+FST 1), identical TEX0 (TBW 10, TW 10, TH 8, PSMCT24 reading the screen /
+PSMCT32 reading the work buffer), identical TEX1 (`0x61`), identical
+ALPHA (`0x44`), identical ZTST (1 = ALWAYS), identical RGBAQ
+(128,128,128,128), identical UVs, identical widths.
+
+The **0.5 px offset in Y** is not a mismatch: `XYOFFSET_1.OFY` is
+`1936.5` in the port's dumped frame and `1936.0` in the retail one -
+field parity.  Both write `y0 = 0` into the record and let the draw
+environment's per-field OFY place it (`0x22A3B8`'s fourth argument is the
+field; `vif1SetXYOffset`'s `halfpx` is the port's equivalent), so the two
+behave the same way; the dumps just caught opposite fields.  X matches to
+the 1/16, including the 0.25 fractional widths.
+
+**Pass counts.**  Retail: 7 orbs x 3 primitives x 2 passes = 42 orb draws,
+then 10 blur sprites, per frame.  Port: 7 x 3 x 1 = 21 orb draws (the
+second pass is deliberately absent), then the same 10 blur sprites.
+
+**Visually**, `DumpFrameAscii` at frame 90, orbs only
+(`menu 12 34 56 0 1 128 90 0 1 0 <phase> 0`), 8x8-block max luminance:
+
+```
+phase 5  (no post-scene blur = the old behaviour)   phase 10 (the ROM's idle)
+|                  ...                           |  |                 :*##=.   |
+|                .=@@@*.                         |  |               .:*@@@#:   |
+|              :-+#@@@#:                         |  |               ..=%@@*.   |
+|             .::--*@@+.                         |  |                   ..     |
+|            .::                                 |  |                          |
+|            :.                                  |  |                          |
+|             .                                  |  |                          |
+```
+
+(columns trimmed to the interesting 40).  The cluster stays where it was,
+the hard `@@@` cores keep their peak but lose their edges, the dim trail
+tail is smeared below the ramp's first level, and the whole thing moves
+one 8-px block left and about six rows' worth up - the §1 shift, to the
+block.  Nothing else in the map changed.

@@ -418,55 +418,80 @@ SetScreenTarget(void)
 	vif1SetFramebuffer(env->frame1.FBP, env->frame1.PSM, screenW, screenH, 0);
 }
 
+/* real: 0x2299C0 over the record at 0x27F820, {0x80,0x80,0x80,0x80},
+ * x0/y0 = 0, u0/v0 = 8, ABE = 0, TME = 1.  The extents go straight in as
+ * 1/16 units, which is what the zoom blur needs: its destination is
+ * 319.25 x 149.25, not an integer rectangle, so the Rect/pktSetTexRect
+ * path (whole pixels, and a 1/16 shrink on the far corner) cannot express
+ * it.  0x2298A8 adds (2048 - w/2, 2048 - h/2) << 4 to both corners, the
+ * same convention pktSetFlatRect uses. */
+static void
+BlurBlit(u32 tbp, u32 psm, int x1, int y1, int u1, int v1)
+{
+	int ox = (2048-screenW/2)<<4;
+	int oy = (2048-screenH/2)<<4;
+
+	vif1Begin();
+	/* real: sceGsSetDefTexEnv's `filter' argument is 1 in both
+	 * 0x22A198 and 0x22A290, so MMAG = MMIN = LINEAR (TEX1 = 0x61).
+	 * The bilinear taps are the whole effect - with NEAREST this loop
+	 * would be a lossy resample and nothing else. */
+	pktSetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(1, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(tbp, screenW/64, psm,
+		10, 8, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+	pktSetAD(SCE_GS_CLAMP_1, SCE_GS_SET_CLAMP(1, 1, 0, 0, 0, 0));
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 1, 0, 0, 0, 1, 0, 0));
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0x80, 0x80, 0x80, 0x80, 0x3f800000));
+	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(8, 8));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox, oy, 0));
+	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(u1, v1));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox + x1, oy + y1, 0));
+	vif1End();
+}
+
 /* real: 0x22C3C0 - the zoom blur, N passes of "shrink the screen into a
  * work buffer, stretch it back over the screen".  Pass k shrinks to
- * (5108 - 32k)/16 x (2388 - 16k)/16 pixels, i.e. about 319x149 from a
- * 640x223 source, and reads back a half-texel wider rect.  The vertical
- * ratio is not the horizontal one, so it is a squash as much as a blur.
+ * (5108 - 32k)/16 x (2388 - 16k)/16 pixels = 319.25 x 149.25 down to
+ * 311.25 x 145.25, from a 640 x 223 source, and reads back a half-texel
+ * wider rect.  The vertical ratio is not the horizontal one, so it is a
+ * squash as much as a blur, and the per-pass shrink decorrelates the
+ * sampling grids so the softening accumulates smoothly.
  *
- * N comes from 0x21D0A0's `phase < 6 ? phase : 10 - phase' over the
- * transition ramp 0x2285C0 writes (`10 - count*10/duration'), so it is 0
- * whenever no screen transition is running - which is every frame of the
- * idle menu.  osdbits has no transition, so this is inert unless argv[7]
- * forces a phase. */
+ * Both blits are opaque (the record's ABE is 0); the ALPHA_1 = 0x44 that
+ * 0x22A0C0(1,1) pushes between them is dead state.  What does the work is
+ * TEX1's LINEAR/LINEAR - see BlurBlit. */
 static void
 ZoomBlur(int n)
 {
-	Color white = { 0x80, 0x80, 0x80, 0x80 };
-	Rect dst, src;
 	int x, y;
 
 	if(n <= 0)
 		return;
 
+	vif1SetZWrite(0);
+	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) - ZTST ALWAYS */
+	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 = 0x44, unused (ABE 0) */
 	x = 5108;
 	y = 2388;
 	for(; n > 0; n--) {
-		/* real: 0x22BF58(1,0,0) - TEX = the screen, FRAME = work buf 2 */
+		/* real: 0x22BF58(1,0,0) - TEX = the screen (PSMCT24, the psm
+		 * 0x22A198 passes), FRAME = work buffer 4 */
 		SetTarget(extraBuf2);
-		dst.x = dst.y = 0;
-		dst.w = x/16; dst.h = y/16;
-		src.x = src.y = 0;
-		src.w = screenW; src.h = screenH-1;
-		vif1Begin();
-		pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(backScreenTbp, screenW/64,
-			SCE_GS_PSMCT32, 10, 8, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
-		vif1End();
-		vif1SetTexRect(&dst, &src, &white, 0, 0);
+		BlurBlit(backScreenTbp, SCE_GS_PSMCT24,
+			x, y, (screenW<<4)+8, ((screenH-1)<<4)+8);
 
-		/* real: 0x22C020(1,0,0) - TEX = work buf 2, FRAME = the screen */
+		/* real: 0x22C020(1,0,0) - TEX = work buffer 4 (PSMCT32, the psm
+		 * 0x22A290 passes), FRAME = the screen */
 		SetScreenTarget();
-		dst.w = screenW; dst.h = screenH-1;
-		src.w = x/16; src.h = y/16;
-		vif1Begin();
-		pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf2, screenW/64,
-			SCE_GS_PSMCT32, 10, 8, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
-		vif1End();
-		vif1SetTexRect(&dst, &src, &white, 0, 0);
+		BlurBlit(extraBuf2, SCE_GS_PSMCT32,
+			screenW<<4, (screenH-1)<<4, x+8, y+8);
 
 		x -= 32;
 		y -= 16;
 	}
+	/* real: 0x22A0C0(1, 3) at the tail leaves ALPHA_1 = 0x44 and ZTST
+	 * GREATER; the port already holds 0x44 and the next stage
+	 * (menutext.c) sets both itself, so there is nothing to re-push. */
 }
 
 /* real: the colour record at 0x27B4B0, {0x37, 0x28, 0x3C, 0x80}.  With
@@ -475,9 +500,53 @@ ZoomBlur(int n)
 static Color compositeColor = { 0x37, 0x28, 0x3C, 0x80 };
 static Color whiteColor = { 0x80, 0x80, 0x80, 0x80 };
 
-/* NOT original: argv[7] forces the zoom-blur phase so it can be seen
- * without a screen transition to drive it. */
+/* The screen-transition ramp *(gp-28844), which 0x2285C0 rewrites every
+ * frame as `count >= duration ? 0 : 10 - count*10/duration' off the timer
+ * at 0x27EC40 (duration *(gp-30396) = 10 on NTSC).  Nothing in the idle
+ * menu ever opens that timer, so count stays 0 and the ramp sits at its
+ * maximum, **10** - which is what the two blur call sites key on.
+ * argv[11] overrides it so a transition can be faked. */
 static int backPhase = 10;
+
+/* NOT original: SwapBuffers flips evenOddFrame on the swap thread, so
+ * reading it twice in one frame can straddle a flip and point the two
+ * blur stages at different buffers.  Snapshot it once, at the top of the
+ * frame, exactly as opening.c's stableEvenOddFrame does. */
+void
+MenuBackFrameStart(void)
+{
+	sceGsDrawEnv1 *env;
+
+	backFrameParity = evenOddFrame;
+	env = backFrameParity == 0 ? &db.draw0 : &db.draw1;
+	backScreenTbp = env->frame1.FBP * 32;
+}
+
+/* real: 0x2283D0, the head of 0x2283F0 - stage 5 of 0x21CF20, which runs
+ * AFTER the 3D scene (0x2268F0) and the fade curtain (0x22B020) and
+ * BEFORE the 2D layer (0x2283A0 and friends):
+ *
+ *     phase = *(gp-28844);
+ *     if(phase >= 5) 0x22C3C0(phase - 5);
+ *
+ * In the idle menu phase is 10, so this is **0x22C3C0(5)** on every
+ * single frame: the whole 3D scene - orbs, trails, halos - is run through
+ * five bilinear shrink/stretch round trips before the crisp 2D text goes
+ * on top.  That is what makes the retail orbs so much softer than a
+ * straight port of 0x22EFF0, and it is a screen-wide effect, not
+ * something in the orb draws themselves.
+ *
+ * 0x21D0A0's own `phase < 6 ? phase : 10 - phase' call is the complement:
+ * 0 while idle, rising as this one falls, so the blur migrates from
+ * after the scene to before it as a transition runs.  docs/menu-backdrop
+ * 6 saw only 0x21D0A0's site and concluded the blur was transition-only;
+ * that is wrong - see the notes. */
+void
+MenuZoomBlur(void)
+{
+	if(backPhase >= 5)
+		ZoomBlur(backPhase - 5);
+}
 
 /* real: 0x21CE58's share of the backdrop's setup - 0x229698 + 0x22A9B8(1)
  * (TEXC slot 1's descriptor and upload), 0x2287B0 (initBgTimer) and the
@@ -519,14 +588,9 @@ InitMenuBackdrop(void)
 void
 MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode)
 {
-	sceGsDrawEnv1 *env;
-
-	/* snapshot the buffer parity once: SwapBuffers flips evenOddFrame on
-	 * the swap thread, so a second read mid-frame can already see the
-	 * next frame's value (opening.c's stableEvenOddFrame, same reason) */
-	backFrameParity = evenOddFrame;
-	env = backFrameParity == 0 ? &db.draw0 : &db.draw1;
-	backScreenTbp = env->frame1.FBP * 32;
+	/* the buffer parity was snapshotted by MenuBackFrameStart() at the
+	 * top of the frame - both this stage and MenuZoomBlur() need the same
+	 * one, and evenOddFrame can flip between them */
 
 	/* real: 0x229358's head - step the timer, and refresh the three fade
 	 * words only while the timer is not closed */

@@ -149,7 +149,9 @@ void MenuTextDump(int par);
 
 /* ---- menuback.c: the TEXCKABE backdrop tunnel and the composite ---- */
 void InitMenuBackdrop(void);
+void MenuBackFrameStart(void);
 void MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode);
+void MenuZoomBlur(void);
 
 /* ---- menutext.c: the menu's 2D text/item layer ---- */
 void InitMenuText(void);
