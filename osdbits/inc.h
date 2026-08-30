@@ -128,6 +128,12 @@ void vif1SetZTest(int enb);
 void vif1SetZWrite(int enb);
 void vif1SetXYOffset(int field, int halfpx);
 void vif1SetTexture(Texture *tex);
+void vif1SetFramebuffer(u32 fbp, u16 psm, int width, int height, int clear);
+void vif1SetTexRect(Rect *r, Rect *tr, Color *col, u32 abe, u32 z);
+/* the two spare screen-sized GS buffers InitRender allocates; the menu
+ * backdrop's composite reuses them as Module U's 3*w*h / 4*w*h work
+ * buffers (menuback.c) */
+extern u32 extraBuf1, extraBuf2;
 extern int frameCount;
 extern int hwFrameLimit;
 int OsdArgInt(int n, int def);
@@ -135,3 +141,16 @@ int OsdArgInt(int n, int def);
 /* ---- menu.c: the main-menu 3D background scene ---- */
 void InitMenuScene(void);
 void DoMenuScene(void);
+
+/* ---- menutext.c: the readback diagnostic, run from DoMenuScene's
+ * post-swap window ---- */
+int MenuTextDumpFrame(void);
+void MenuTextDump(int par);
+
+/* ---- menuback.c: the TEXCKABE backdrop tunnel and the composite ---- */
+void InitMenuBackdrop(void);
+void MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode);
+
+/* ---- menutext.c: the menu's 2D text/item layer ---- */
+void InitMenuText(void);
+void MenuTextFrame(int fadeMode, int fadeAlpha);

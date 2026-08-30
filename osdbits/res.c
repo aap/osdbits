@@ -1,7 +1,9 @@
 #include "inc.h"
 #include "res.h"
 
+#include "res/FNTASCII_EXP.inc"
 #include "res/TEXCBLUR_EXP.inc"
+#include "res/TEXCKABE_EXP.inc"
 #include "res/TEXCNAVI_EXP.inc"
 #include "res/TEXOBLPR_EXP.inc"
 #include "res/TEXOBLP_EXP.inc"
@@ -175,6 +177,12 @@ LoadResources(void)
 	resources[RESID_TEXCBLUR].size = TEXCBLUR_EXP_len;
 	resources[RESID_TEXCNAVI].data = TEXCNAVI_EXP;
 	resources[RESID_TEXCNAVI].size = TEXCNAVI_EXP_len;
+	/* the menu background's wall texture (menuback.c) */
+	resources[RESID_TEXCKABE].data = TEXCKABE_EXP;
+	resources[RESID_TEXCKABE].size = TEXCKABE_EXP_len;
+	/* the OSD text engine's Latin font page (menutext.c) */
+	resources[RESID_FNTASCII].data = FNTASCII_EXP;
+	resources[RESID_FNTASCII].size = FNTASCII_EXP_len;
 }
 
 u8*

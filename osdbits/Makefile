@@ -17,6 +17,8 @@ OBJS        = crt0.o \
               res.o \
               opening.o \
               menu.o \
+              menuback.o \
+              menutext.o \
               towerchain.o \
               $(TARGET).o
 

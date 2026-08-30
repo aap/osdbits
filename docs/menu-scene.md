@@ -595,6 +595,15 @@ of moving rigidly - they bunch up and spread out again on a one-minute
 cycle. The ease target is `1 - *(gp-28852)`, so the browser transition
 can pull the cloud back in by driving that global up.
 
+*(Amended after the text-layer dive, 2026-08-30: `0x225628` — stage 10,
+via `0x225BF8` — runs EVERY frame, and rewrites `*(gp-28852)` as
+`1 - minutes/60` each time, so the radius ease target is really the
+minute hand (`10 + 7.25*min/60`, growing over the hour and snapping in
+on the hour), and `tiltZ`/`spinY` are not "at entry" values but eased
+toward the live clock every frame at `*(gp-32168)`, tiltZ snapping when
+`|spinY| < 201`. The port carries the per-frame `orbEaseOut` write;
+the tilt/spin easing is still the seed-once approximation.)*
+
 **Matrix order matters**: `mdRotX/Y/Z` (0x230198/0x230260/0x230328) do
 `sceVu0MulMatrix(top, top, R)` - **post**-multiply - whereas the camera
 builder `0x22ED20` uses `sceVu0RotMatrix{X,Y,Z}(m, m, a)`, which

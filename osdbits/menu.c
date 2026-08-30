@@ -700,6 +700,14 @@ UpdateOrbs(void)
 	rateX = ClockSeconds() * (65536.0f/60.0f);
 	rateY = ClockMinutes() * (65536.0f/60.0f);
 
+	/* real: 0x225628 (stage 10, via 0x225BF8) rewrites this EVERY frame,
+	 * so the radius ease target 1-orbEaseOut is the minute hand: the ring
+	 * grows over the hour and snaps back in on the hour.  (0x225628 also
+	 * re-eases orbTiltZ/orbSpinY toward the live clock at *(gp-32168),
+	 * snapping tiltZ when |spinY| < 201 - not ported yet, the seed-once
+	 * approximation only lags on runs crossing a minute boundary.) */
+	orbEaseOut = 1.0f - ClockMinutes()*(1.0f/60.0f);
+
 	t = orbEase;
 	radius = (t*7.25f + 10.0f) * menuScale;
 	orbEase = t + ((1.0f - orbEaseOut) - t)*0.005f;
@@ -989,6 +997,7 @@ InitMenuScene(void)
 
 	for(i = 0; i < NUMMENUTEXTURES; i++)
 		InitTexture(&menuTextures[i]);
+	InitMenuBackdrop();	/* real: 0x229698/0x22A9B8(1) + 0x2287B0 */
 
 	InitOrbAngles();
 	InitOrbPhases();
@@ -1008,6 +1017,10 @@ InitMenuScene(void)
 	 * can start it part-way (128 = skip the entry entirely). */
 	FadeArm(2);
 	menuFadeAlpha = clamp(OsdArgInt(5, 0), 0, 128);
+
+	/* real: 0x21CE58 also runs do_load_font (0x21DBA0) and the
+	 * per-screen init 0x228460 - menutext.c */
+	InitMenuText();
 
 	SceneReset();
 }
@@ -1056,9 +1069,26 @@ MenuFrame(void)
 	 * edge texels */
 	vif1SetCLAMP_1(1, 1, 0, 0, 0, 0);
 	MenuCamera();
+	/* real: 0x21D0A0 - the TEXCKABE backdrop tunnel plus the composite
+	 * that tints the whole screen deep blue.  It has to run between the
+	 * camera and the object list because its last act overwrites the
+	 * frame buffer (menuback.c). */
+	/* aap ground truth (real console): the TEXCKABE tunnel is NOT
+	 * visible in the main menu, only in System Configuration - like the
+	 * 12-rod clock carousel it must be gated on that screen's entry
+	 * (suspect: the never-opened fade timer 0x27F190, the way the
+	 * carousel's 0x27EB00 is opened only by "enter System Config").
+	 * Default off here; argv[11] (back=1) shows it for tuning until a
+	 * System Config mode exists. */
+	if(OsdArgInt(11, 0))
+		MenuBackdrop(menuCamera, menuViewScreen, menuFadeMode);
 	SceneReset();
 	UpdateOrbs();
 	SceneWalk();
+	/* real: 0x2283F0's main-menu slot (0x2283A0), which runs between
+	 * the 3D list and the letterbox.  The fade words are 0x22AD30/
+	 * 0x22AD28's job in the ROM; pass them instead of exporting them. */
+	MenuTextFrame(menuFadeMode, menuFadeAlpha);
 	DrawFadeCurtain();
 	FadeStep();
 	ClockTick();
@@ -1070,7 +1100,7 @@ MenuFrame(void)
 #define FBDUMP ((u128*)0x1000000)
 
 static void
-DumpFrameAscii(void)
+DumpFrameAscii(int par)
 {
 	static const char ramp[] = " .:-=+*#%@";
 	sceGsStoreImage si;
@@ -1079,11 +1109,16 @@ DumpFrameAscii(void)
 	char line[81];
 
 	sceGsSyncPath(0, 0);
-	sceGsSetDefStoreImage(&si, evenOddFrame == 0 ? 0 : (screenW*screenH)/64,
+	sceGsSetDefStoreImage(&si, par == 0 ? 0 : (screenW*screenH)/64,
 		screenW/64, SCE_GS_PSMCT32, 0, 0, screenW, screenH);
 	FlushCache(0);
 	sceGsExecStoreImage(&si, FBDUMP);
 	sceGsSyncPath(0, 0);
+	/* the store image reverses VIF1 for the download; whatever is left
+	 * in the FIFO afterwards gets parsed as vifcodes by the next packet
+	 * (PCSX2 logs "Unknown VifCmd" and libdma eventually hangs; real
+	 * VIF1 would ER1-stall).  A full VIF1 reset clears it. */
+	sceDevVif1Reset();
 
 	px = UNCACHED(FBDUMP);
 	printf("frame %d, %dx%d, 8x8 blocks (max luminance):\n", frameCount, screenW, screenH);
@@ -1109,14 +1144,41 @@ DumpFrameAscii(void)
 void
 DoMenuScene(void)
 {
+	int par;
+
 	for(;;) {
 		if(menuDebug && frameCount % 10 == 0)
 			printf("menu frame %d (fade %d/%d)\n",
 				frameCount, menuFadeMode, menuFadeAlpha);
 		MenuFrame();
-		if(menuDebug && frameCount == menuDebug)
-			DumpFrameAscii();
+		/* the GS readbacks run AFTER WaitNextFrame: the swap thread
+		 * kicks its own GIF writes at vsync, asynchronously, and one
+		 * landing while the bus is reversed for the download splits a
+		 * packet mid-stream (Unknown VifCmd spam, then a libdma hang).
+		 * Right after the handshake the swap thread is quiet for a
+		 * whole frame.  `par` is the parity of the buffer just drawn,
+		 * captured before the swap flips it. */
 		WaitNextFrame();
+		/* the parity of the buffer just drawn.  Read AFTER the
+		 * handshake: evenOddFrame is flipped by the swap thread, so a
+		 * mid-frame read races it (the stableEvenOddFrame lesson from
+		 * opening.c); the post-handshake value is the settled one and
+		 * empirically selects the just-drawn buffer. */
+		par = evenOddFrame;
+		if((menuDebug && frameCount == menuDebug) ||
+		   (MenuTextDumpFrame() > 0 && MenuTextDumpFrame() == frameCount)) {
+			if(menuDebug && frameCount == menuDebug)
+				DumpFrameAscii(par);
+			if(MenuTextDumpFrame() > 0 && MenuTextDumpFrame() == frameCount)
+				MenuTextDump(par);
+			/* the reversed-bus download leaves VIF1/DMA desynced
+			 * under PCSX2 (the downloaded data also runs through the
+			 * vifcode parser; not even sceDevVif1Reset recovers it),
+			 * so a readback ends the run.  Real hardware has dsedb's
+			 * storeimage for this instead. */
+			printf("readback done, exiting\n");
+			Exit(0);
+		}
 		frameCount++;
 		if(hwFrameLimit > 0 && frameCount >= hwFrameLimit) {
 			sceGsSyncPath(0, 0);
