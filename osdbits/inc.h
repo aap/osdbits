@@ -202,6 +202,7 @@ void MenuConfigCubes(void);	/* real: 0x226FA8 */
 int MenuConfigOpen(void);
 int MenuConfigAlpha(int fadeAlpha);
 int MenuConfigItemPos(int i, float *x, float *y);
+void MenuConfigSetCursor(int n);
 
 /* ---- menutext.c: the readback diagnostic, run from DoMenuScene's
  * post-swap window ---- */
@@ -217,6 +218,8 @@ void MenuBackFadeOpen(void);	/* real: 0x2291E8 */
 void MenuBackFadeClose(void);	/* real: 0x229230 */
 int MenuBackdropVisible(void);
 void MenuBackBindScreenCopy(void);
+int MenuBackField(void);
+void MenuBackMeshHalfOffset(int on);
 
 /* ---- menutext.c: the menu's 2D text/item layer ---- */
 void InitMenuText(void);

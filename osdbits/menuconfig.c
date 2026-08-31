@@ -22,6 +22,14 @@
  *                       bevelled to 2.34 at y = 26..26.39 - one hour rod
  *   0x27EFB0   6 faces  a cube, half-extent 2.64 - one config item
  *
+ * "The same renderer" is true of the geometry pipeline (0x22CFA8 ->
+ * 0x22C888 -> 0x22C4E0) but NOT of the scene structs around it: the rod
+ * scene is handed the frame's camera every frame (0x2268F0) while the
+ * cube scene keeps a static, permanently IDENTITY one (0x352840, set by
+ * 0x228460 and never touched again), and the two also disagree about the
+ * refraction centre's 0.35 scale and the interlace half pixel.  See
+ * cubeCamera and MeshDraw.
+ *
  * Hex addresses are retail-image addresses; gp = 0x2AF070.  See
  * docs/menu-text.md 6 for the carousel groundwork this builds on. */
 
@@ -131,6 +139,64 @@ static const int cfgColRingB[4] = { 0x80, 0x80, 0x80, 0x1E };	/* 0x27EAF0 */
  * 0x27EAC0 and the fixed {167,217,255} at 0x34E940 */
 static const int cfgColFront[4] = { (0x2D+167)/2, (0x55+217)/2, (0x66+255)/2, 0x80 };
 
+/* =================== TEXCBUMP (TEXC slot 2) ===================
+ *
+ * The glass's second texture, and the one that makes the cubes look
+ * bumpmapped.  The slot descriptor at 0x27F1C0 + 2*12 declares wexp =
+ * hexp = 6 (a real 64x64 page) and the per-slot decoder table at
+ * 0x2A4BA0 sends slot 2 to 0x22A720, the plain grey expander: one source
+ * byte per texel, written as `b | b<<8 | b<<16 | 0x7F000000'.  The
+ * resource is 4096 bytes - tools/extract-res.py already emits
+ * res/TEXCBUMP_EXP.inc with the rest of TEXIMAGE, it was just never
+ * wired into res.c. */
+
+#define BUMPW 64
+#define BUMPH 64
+
+static u32 bumpTexels[BUMPW*BUMPH];
+
+static Texture bumpTexture = {
+	(u8*)bumpTexels, RESID_TEXCBUMP, nil, 0, { 0, 0, BUMPW, BUMPH },
+	0, 0, SCE_GS_PSMCT32, 0, { 0 }
+};
+
+/* real: 0x22A720 */
+static void
+DecodeBump(void)
+{
+	u8 *src;
+	int i;
+
+	src = GetResourceData(RESID_TEXCBUMP);
+	for(i = 0; i < BUMPW*BUMPH; i++)
+		bumpTexels[i] = src[i] | src[i]<<8 | src[i]<<16 | 0x7F000000;
+}
+
+/* real: 0x22AB90(2, 1, 2) -> 0x22AA88, the same binder menuback.c's
+ * BindKabe models for slot 1: TEX1 forced to 0x61 (LINEAR/LINEAR),
+ * CLAMP_1 back to REPEAT/REPEAT over sceGsSetDefTexEnv's CLAMP/CLAMP,
+ * TEST_1 = (ztst << 17) | 0x30000 so the 2 arrives as GREATER, and
+ * ALPHA_1 = 0x48 with TEXA {0x7F, 1, 0x81}.  0x22C920 re-pushes its own
+ * CLAMP_1 per primitive anyway; the UVs run 0..1.5. */
+static void
+MenuConfigBindBump(void)
+{
+	vif1Begin();
+	pktSetAD(SCE_GS_TEXFLUSH, 0);
+	pktSetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(1, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(bumpTexture.gstex.tbp[0], BUMPW/64,
+		SCE_GS_PSMCT32, 6, 6, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+	pktSetAD(SCE_GS_CLAMP_1, SCE_GS_SET_CLAMP(0, 0, 0, 0, 0, 0));
+	pktSetAD(SCE_GS_TEXA, SCE_GS_SET_TEXA(0x7F, 1, 0x81));
+	vif1End();
+}
+
+/* real: 0x27EFB0 + 0xA0, the colour 0x22D2E8 hands both TEXCBUMP passes
+ * (the rod scene's 0x27E950 + 0xA0 is the same {8,8,8,128}).  With TFX
+ * MODULATE that caps each pass at 8*255/128 = 15 levels, so the emboss
+ * is a +-15 relief on top of the refraction, not a colour of its own. */
+static const int cubeBumpColor[4] = { 8, 8, 8, 0x80 };
+
 /* ==================== the mesh renderer ====================
  *
  * One transform pass (0x22CFA8's tail) into a per-face scratch record,
@@ -147,6 +213,7 @@ struct MeshVertex
 	sceVu0FVECTOR cam;	/* real +0x00 camera space */
 	sceVu0FVECTOR proj;	/* real +0x20 after the w divide */
 	float q;		/* real +0x40 = 1/w */
+	float u, v;		/* real +0x10/+0x14, the model UV, v scaled */
 };
 
 typedef struct MeshFace MeshFace;
@@ -163,21 +230,49 @@ struct MeshModel
 	int nfaces;
 	const float (*verts)[4];
 	const float (*norms)[4];
+	const float (*uvs)[4];
 };
 
 static MeshFace meshFaces[MAXFACES];
 static float meshObjX, meshObjY;	/* 0x22CFA8's outX/outY */
+/* the pair 0x22C4E0 actually shrinks toward: the rod path hands it
+ * 0x22CFA8's outX/outY unchanged, the cube path (0x22D2E8, right after
+ * the transform) multiplies both by *(gp-32064) = 0.35 first. */
+static float meshRefX, meshRefY;
 
 /* NOT original (argv[14]): 0 draws the meshes untextured, which is the
  * geometry on its own; 1 is the ROM's screen-space refraction sampling. */
 static int cfgMeshTex = 1;
+
+/* real: the scene struct's camera matrix pointer, +0x64.
+ *
+ * The two meshes do NOT share a camera.  0x2268F0's head writes the
+ * frame's camera and view-screen matrices into the ROD scene
+ * (`sw a1,96(v0); sw a0,100(v0)' on 0x27E950, whose static +0x60/+0x64
+ * are 0), so the rods are seen through the same camera as the orbs.  The
+ * CUBE scene 0x27EFB0 carries static pointers 0x352800/0x352840 instead,
+ * and the only writer of either is the per-screen init 0x228460:
+ * 0x267068 (sceVu0ViewScreenMatrix) builds 0x352800 from exactly the
+ * arguments 0x21CFD8 gives the frame's own (scrz 512, ax/ay 0x27B44C/
+ * 0x27B450, cx/cy 2048, nearz 1, farz 16777215, zmin 1, zmax 65536 - so
+ * the two matrices are numerically identical and menuViewScreen serves
+ * for both), and 0x267630 (sceVu0UnitMatrix) sets 0x352840 to the
+ * IDENTITY.  Nothing in the image ever writes it again - 0x27EFB0 is
+ * mentioned exactly once, at 0x226D78 - so the five cubes are drawn with
+ * NO camera at all: their table positions (x -22.5..-10.75, z 47.5) are
+ * already camera-space, 47.5 units from the eye rather than the 150.5
+ * the orb camera (z = -103) would put them at.  Running them through
+ * menuCamera made them 3.2x too small, 3.2x too close together and cut
+ * the refraction offset (which scales with 1/w) by the same factor. */
+static sceVu0FMATRIX cubeCamera;	/* real: 0x352840, the identity */
 
 /* real: 0x22CFA8 - build camera x world, project the object's origin,
  * then transform every face's four vertices and its normal.  The scale
  * is the scene struct's +0x68/+0x6C/+0x70 triple; only +0x6C is ever
  * anything but 1.0 for the rod (it is the fly-in progress). */
 static void
-MeshTransform(MeshModel *mdl, sceVu0FMATRIX world, float sx, float sy, float sz)
+MeshTransform(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
+	float sx, float sy, float sz)
 {
 	sceVu0FMATRIX m;
 	sceVu0FVECTOR o, b, v;
@@ -185,7 +280,7 @@ MeshTransform(MeshModel *mdl, sceVu0FMATRIX world, float sx, float sy, float sz)
 	float q, e1x, e1y, e2x, e2y;
 	int i, k;
 
-	matMul(m, menuCamera, world);
+	matMul(m, cam, world);
 
 	o[0] = o[1] = o[2] = 0.0f; o[3] = 1.0f;
 	matApply(o, m, o);
@@ -216,6 +311,11 @@ MeshTransform(MeshModel *mdl, sceVu0FMATRIX world, float sx, float sy, float sz)
 			f->v[k].proj[2] *= q;
 			f->v[k].proj[3] = 1.0f;
 			f->v[k].q = q;
+			/* real: the tail of the same loop - the U is the
+			 * model's, the V is scaled by the same +0x6C the
+			 * vertices' y was */
+			f->v[k].u = mdl->uvs[i*4+k][0];
+			f->v[k].v = mdl->uvs[i*4+k][1] * sy;
 		}
 
 		/* real: two 0x2676F8 (SubVector) calls on the PROJECTED
@@ -245,8 +345,12 @@ cfgCosf(int a)
  * The UV is NOT the model's: it is the vertex's own SCREEN position, so
  * the surface samples the copy of the frame taken before the object list
  * ran (menuback.c's extraBuf1, the ROM's work buffer 3).  That is what
- * makes these look like glass, and it is the "bumpmap-like" effect the
- * cubes show.  The two biases the ROM adds - 1024 to U (clamped, so a
+ * makes these look like glass.  (The "bumpmap-like" effect on the cubes
+ * is the separate TEXCBUMP emboss, MeshEmitBumpFace below; the amount of
+ * refraction is `normal * 1000 / 500 * q', so it is inversely
+ * proportional to the object's w - which is exactly why running the
+ * cubes through the wrong camera made them look flat as well as small.)
+ * The two biases the ROM adds - 1024 to U (clamped, so a
  * negative U comes out 0 and the 14-bit UV field takes the modulo) and
  * 256 to V - are its own; they are reproduced verbatim. */
 static void
@@ -268,10 +372,20 @@ MeshEmitFace(MeshFace *f, float fres, const int *col, float size, int extra)
 	g = bright + col[1] + extra; if(g >= 256) g = 255;
 	b = bright + col[2] + extra; if(b >= 256) b = 255;
 
-	/* real: 276 / 404 - TRIANGLE_STRIP | TME | FST, with AA1 added
-	 * for a nearly edge-on face (*(gp-32072) = 0.99) */
+	/* real: 276 / 404 - TRIANGLE_STRIP | TME | FST, and the AA1 bit
+	 * (0x80, the only difference between the two) goes on the ORDINARY
+	 * face, not the edge-on one:
+	 *     c.lt.s  f0(0.99), f21(fres)  ; 0.99 < fres
+	 *     bc1f    0x22c5cc             ; NOT taken -> v0 = 276
+	 *     b       0x22c5d0 / li v0,276
+	 *   0x22c5cc: li v0,404
+	 * so fres > *(gp-32072) = 0.99 selects 276 (AA1 OFF) and everything
+	 * else 404 (AA1 ON).  The port had the test the right way round for
+	 * the constant but the wrong way round for the bit, which left AA1
+	 * toggling on and off per face as a spinning rod's faces crossed
+	 * 0.99 - a shimmer on the silhouettes rather than a stable edge. */
 	prim = SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 0, cfgMeshTex, 0, 0,
-		fres > 0.99f, 1, 0, 0);
+		fres > 0.99f ? 0 : 1, 1, 0, 0);
 
 	vif1Begin();
 	pktSetAD(SCE_GS_PRIM, prim);
@@ -286,14 +400,60 @@ MeshEmitFace(MeshFace *f, float fres, const int *col, float size, int extra)
 	for(k = 0; k < 4; k++) {
 		nx = f->normal[0] * 1000.0f * f->v[k].q;
 		ny = f->normal[1] *  500.0f * f->v[k].q;
-		u = (f->v[k].proj[0] - 2048.0f - meshObjX)*0.95f + meshObjX - nx;
-		v = (f->v[k].proj[1] - 2048.0f - meshObjY)*0.95f + meshObjY - ny;
+		u = (f->v[k].proj[0] - 2048.0f - meshRefX)*0.95f + meshRefX - nx;
+		v = (f->v[k].proj[1] - 2048.0f - meshRefY)*0.95f + meshRefY - ny;
 		u += screenW/2 + 1024.0f;
 		if(u < 1024.0f)
 			u = 1024.0f;
-		v += screenH/2 + 256.0f - evenOddField*0.5f;
+		/* real: *(0x27B448), the module's own copy of the field, read
+		 * once per frame.  NOT original: the port reads the live
+		 * evenOddField, which SwapBuffers flips on the swap thread and
+		 * which can therefore change between two objects of the same
+		 * frame - menuback.c's per-frame snapshot instead (the same
+		 * race commit 37efd18 fixed for the blur's buffer parity). */
+		v += screenH/2 + 256.0f - MenuBackField()*0.5f;
 		pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(((int)(u*16.0f)) & 0x3FFF,
 			((int)(v*16.0f)) & 0x3FFF));
+		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
+			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
+	}
+	vif1End();
+}
+
+/* real: 0x22C920 - the TEXCBUMP pass's emit.  A completely different
+ * primitive from 0x22C4E0's: PRIM = 84 = TRIANGLE_STRIP | TME | ABE with
+ * FST CLEAR, so it uses ST/Q and the MODEL's own UVs (0..1.5 over the
+ * 64x64 page, which REPEAT wraps one and a half times) instead of the
+ * screen position.  The GIFtag template is 0x27F8B0 (NREG 14,
+ * {PRIM, CLAMP_1, ST, RGBAQ, XYZ2, ...}).
+ *
+ *     ST    = ((uv.x + ofsX) * q, (uv.y + ofsY) * q)
+ *     RGBAQ = the scene's +0xA0 colour, Q = q
+ *     XYZ2  = the same fixed-point position the refraction pass uses
+ *
+ * ABE is SET here, so the ALPHA_1 0x22A0C0 pushes around the two calls
+ * is live and is the whole point: the cube path runs this twice per face
+ * set, first ADDITIVE (0x22A0C0(0,2) -> ALPHA_1 0x48 = Cs*As + Cd) at
+ * offset (scene+0xB0, +0xB4) = (0.01, 0.01), then SUBTRACTIVE
+ * (0x22A0C0(2,2) -> 0x42 = (0 - Cs)*As + Cd) at offset (0, 0).  That
+ * difference of the same texture at two slightly different UVs is a
+ * classic emboss, and it is the "bumpmap" on aap's cubes. */
+static void
+MeshEmitBumpFace(MeshFace *f, const int *col, float ofsx, float ofsy)
+{
+	float s, t;
+	int k;
+
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 0, 1, 0,
+		1, 0, 0, 0, 0));	/* real: 84 */
+	pktSetAD(SCE_GS_CLAMP_1, 0x01000000);
+	for(k = 0; k < 4; k++) {
+		s = (f->v[k].u + ofsx) * f->v[k].q;
+		t = (f->v[k].v + ofsy) * f->v[k].q;
+		pktSetAD(SCE_GS_ST, SCE_GS_SET_ST(*(u32*)&s, *(u32*)&t));
+		pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2],
+			col[3], *(u32*)&f->v[k].q));
 		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
 			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
 	}
@@ -327,25 +487,70 @@ MeshDrawPass(MeshModel *mdl, const int *col, float size, int back, int extra)
 	}
 }
 
-/* real: the five passes of 0x22D920's f12 <= 0 arm (0x22E0EC).  The ROM
- * spreads them over three render targets - front faces into work buffer
- * 4 (0x22BFD0(1,0,1)), two more TEXCBUMP passes through 0x22C920 into
- * the same buffer, back faces onto the screen (0x22C020(1,0,1)) and a
- * fifth back-face pass into work buffer 3 - and 0x2267E8 then adds work
- * buffer 4 back over the screen twice at alpha 30.
+/* real: the 0x22C920 halves of the same per-face loops - same cull test,
+ * no Fresnel (the bump pass does not use one). */
+static void
+MeshBumpPass(MeshModel *mdl, const int *col, int back, float ofsx, float ofsy)
+{
+	int i;
+
+	for(i = 0; i < mdl->nfaces; i++)
+		if((meshFaces[i].cull != 0) == back)
+			MeshEmitBumpFace(&meshFaces[i], col, ofsx, ofsy);
+}
+
+/* THE PASS STRUCTURE.
  *
- * The port collapses that to the two untextured-geometry passes that
- * carry the shape, both straight onto the screen and both sampling the
- * pre-object copy of the frame (extraBuf1 = the ROM's work buffer 3):
- * back faces first, then front faces.  The TEXCBUMP passes and the
- * offscreen bloom are NOT ported. */
+ * 0x22D2E8 (the cubes) runs EIGHT loops over the face bank, five for the
+ * front faces and three for the back, spread over the two work buffers:
+ *
+ *   1  0x22BF58(1,0,0)  FRAME wb4, TEX **the screen** (0x22A198)
+ *                       front, 0x22C888 -> 0x22C4E0, extra 0
+ *   2  0x22AB90(2,1,2)  TEXCBUMP; 0x22A0C0(0,2) additive
+ *                       front, 0x22C920, offset (+0xB0, +0xB4) = 0.01
+ *   3  0x22A0C0(2,2)    subtractive
+ *                       front, 0x22C920, offset (0, 0)
+ *   4  0x22BFD0(0,1,1)  FRAME wb3, TEX wb4 - front, 0x22CCE8
+ *   5  0x22A0C0(0,3)    back, 0x22CA68
+ *   6  0x22BFD0(1,0,0) + 0x22C100()   wb3 -> wb4, half-width blit
+ *   7  0x22BFD0(0,1,1)  back, 0x22C888  (again against wb4)
+ *   8  0x22AB90/0x22A0C0 as 2 and 3    back, 0x22C920 x2
+ *
+ * and 0x226D00's tail then copies wb4 into wb3, runs 0x22C2A0's
+ * work-buffer-3 twin of the zoom blur over it and blits wb3 back over the
+ * screen opaquely (0x22C190(0)).
+ *
+ * The port keeps the six loops that carry the picture - refraction plus
+ * the two-offset emboss, back faces then front faces - and draws them all
+ * straight onto the screen.  The wb3/wb4 ping-pong, 0x22CCE8/0x22CA68 and
+ * the wb3 blur composite are still NOT ported.
+ *
+ * That last gap decides the refraction SOURCE.  Loop 1's texture really is
+ * the live screen (0x22A198), i.e. the tinted composite after the five
+ * zoom-blur round trips - but its FRAME is work buffer 4, and 0x226D00's
+ * tail ends by blitting work buffer 3 back over the screen opaquely
+ * (0x22C190(0)), so what the player sees is the work buffers' content, and
+ * both of them still hold 0x21D0A0's copy of the BRIGHT, un-tinted tunnel.
+ * Binding the screen in a port that also draws onto the screen gets the
+ * texture right and the destination wrong, and measurably so: with the
+ * screen as the source the cubes read `----' against the backdrop, with
+ * work buffer 3 (extraBuf1, what the ROM's destination holds) they read
+ * `%%%%%##%%#'.  So the port keeps extraBuf1 for both meshes.
+ *
+ * The RODS (0x22D920's 0x22E0EC arm) have the same five front-face loops
+ * with their own per-face bump phase (`f21 + i * *(gp-32032)'); only the
+ * refraction pass is ported for them, and their texture stays the
+ * pre-object copy work buffer 3 really holds (0x22BFD0(1,0,1)). */
 static int cfgDebug;		/* NOT original: menu.c's debugFrame */
 
 static void
-MeshDraw(MeshModel *mdl, sceVu0FMATRIX world, float sx, float sy, float sz,
-	const int *col, float size)
+MeshDraw(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
+	float sx, float sy, float sz, const int *col, float size,
+	float refScale, const int *bumpCol, float bumpOfs)
 {
-	MeshTransform(mdl, world, sx, sy, sz);
+	MeshTransform(mdl, cam, world, sx, sy, sz);
+	meshRefX = meshObjX * refScale;
+	meshRefY = meshObjY * refScale;
 
 	if(cfgDebug && frameCount == cfgDebug) {
 		int i, front = 0;
@@ -359,18 +564,49 @@ MeshDraw(MeshModel *mdl, sceVu0FMATRIX world, float sx, float sy, float sz,
 
 	vif1SetZWrite(0);
 	vif1SetZTest(0);
-	vif1SetAlphaBlend(1, 5, 128);	/* real: 0x22A0C0(1,1)/(1,2) */
+	/* real: 0x22A0C0(1, 1) -> the alpha jump table at 0x2A4B80 entry 1
+	 * (0x22A124), ALPHA_1 = 68 = 0x44 = (Cs - Cd)*As + Cd.  The port had
+	 * BlendModes[5] = 0x48 = Cs*As + Cd, the ADDITIVE one entry 0 gives.
+	 * That was dead state while PRIM's ABE was clear and the AA1 bit was
+	 * (wrongly) almost never set; with AA1 back where the ROM puts it the
+	 * GS blends, and 0x48 turned every glass face into an additive wash
+	 * over the tunnel.  With 0x44 and the RGBAQ's A = 0x80 the blend is
+	 * the identity, which is what an opaque glass face has to be. */
+	vif1SetAlphaBlend(1, 4, 128);	/* real: 0x22A0C0(1,1) = ALPHA_1 0x44 */
 	if(cfgMeshTex)
 		MenuBackBindScreenCopy();
 
 	MeshDrawPass(mdl, col, size, 1, 0);
+	if(bumpCol && cfgMeshTex) {
+		MenuConfigBindBump();
+		/* real: 0x22A0C0(0,2) then (2,2) - additive at the scene's
+		 * (+0xB0, +0xB4) offset, subtractive at (0, 0).  The ROM's
+		 * ZTST for both is GEQUAL; every mesh pass here keeps the
+		 * refraction pass's ALWAYS, which is the same result while
+		 * the meshes leave ZWrite off and the only depths in the
+		 * buffer are the tunnel's (two orders of magnitude nearer). */
+		vif1SetAlphaBlend(1, 5, 128);		/* 0x48, Cs*As + Cd */
+		MeshBumpPass(mdl, bumpCol, 1, bumpOfs, bumpOfs);
+		vif1SetAlphaBlend(1, 6, 128);		/* 0x42, Cd - Cs*As */
+		MeshBumpPass(mdl, bumpCol, 1, 0.0f, 0.0f);
+		vif1SetAlphaBlend(1, 4, 128);
+		MenuBackBindScreenCopy();
+	}
 	MeshDrawPass(mdl, col, size, 0, 0);
+	if(bumpCol && cfgMeshTex) {
+		MenuConfigBindBump();
+		vif1SetAlphaBlend(1, 5, 128);
+		MeshBumpPass(mdl, bumpCol, 0, bumpOfs, bumpOfs);
+		vif1SetAlphaBlend(1, 6, 128);
+		MeshBumpPass(mdl, bumpCol, 0, 0.0f, 0.0f);
+		vif1SetAlphaBlend(1, 4, 128);
+	}
 }
 
 /* ==================== the models ==================== */
 
-static MeshModel rodModel  = { 0, nil, nil };
-static MeshModel cubeModel = { 0, nil, nil };
+static MeshModel rodModel  = { 0, nil, nil, nil };
+static MeshModel cubeModel = { 0, nil, nil, nil };
 
 /* ============== the deferred record's mesh half ==============
  *
@@ -385,8 +621,11 @@ MenuConfigDrawMesh(SceneRec *rec)
 {
 	if(rec->progress < 0.0f)
 		return;
-	MeshDraw(&rodModel, rec->world, 1.0f, rec->progress, 1.0f,
-		rec->col0, rec->size);
+	/* real: the rod scene's camera pointer is the frame's own, written
+	 * into 0x27E950+0x64 by 0x2268F0; its outX/outY go into 0x22C888
+	 * unscaled (the 0.35 is 0x22D2E8's, i.e. the cubes' alone). */
+	MeshDraw(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f,
+		rec->col0, rec->size, 1.0f, nil, 0.0f);
 }
 
 /* ================= the carousel (0x225BF8 / 0x226028) ================= */
@@ -506,12 +745,107 @@ CarouselOpen(void)
  * by 30 every frame, plus 7000 per cube), and scaled by the timer's
  * progress plus the entry's own bias.
  *
- * The ROM draws them twice - 0x22D2E8 to the screen and 0x22D798 into
- * work buffer 3 - then runs the work-buffer-3 twin of the zoom blur
- * (0x22BFD0/0x22C088/0x22C2A0) and blits the result back.  The port
- * draws the first pass only. */
+ * 0x226FA8 also runs 0x226CF8 = 0x226BB8, which rewrites two of the
+ * table's own fields every frame (see MenuConfigCubeState below), so the
+ * 0x27F090 colour and size bias are live state, not constants.
+ *
+ * The ROM draws the whole set twice - the eight-loop 0x22D2E8 and then
+ * 0x22D798 into work buffer 3 - then runs the work-buffer-3 twin of the
+ * zoom blur (0x22BFD0/0x22C088/0x22C2A0) and blits the result back over
+ * the screen.  The port runs the first walk's six picture-carrying loops
+ * (see MeshDraw) and neither the second walk nor the blur composite.
+ *
+ * The camera is NOT the orb scene's - see cubeCamera above; that is what
+ * puts the cubes at their real size. */
 
 static int cubeSpin;		/* real: *(u16*)(gp-30432) */
+
+/* ---- 0x226BB8, the per-frame cube state (0x226FA8's 0x226CF8) ----
+ *
+ * The 0x27F090 table is not read-only: its +0x10 colour and +0x20 size
+ * bias are LIVE, and 0x226BB8 rewrites both every frame, between the
+ * cube timer's step and 0x226D00's walk.  For each of the five entries:
+ *
+ *   if(i == *(0x27BE28+16))            the item list's cursor
+ *       0x22EC60(0x27EC30, 0x27EC10, 1)      tracker -> {0,150,200,128}
+ *       target = *(0x27EC30)                 the tracker
+ *       alpha(+0x24) += 8, clamped to 128
+ *   else
+ *       target = *(0x27EC20) = {100,100,100,128}
+ *       alpha(+0x24) -= 8, clamped to 0
+ *   0x22EC60(entry+0x10, target, 7)          the cube's own colour
+ *   entry+0x20 *= *(gp-32144) = 0.95         the size bias decays
+ *
+ * so an unselected cube settles on a dim grey 100 and the cursor's one
+ * drifts to the menu's blue-cyan, and the {128,128,128,128} in the .data
+ * table is only where they start.  The bias is a KICK, not a constant:
+ * 0x227C20 (the screen's CIRCLE arm) writes *(gp-32136) = -0.1 into the
+ * cursor's entry, so the pressed cube shrinks 10 % and grows back as the
+ * 0.95 decays it.  The port's confirm button is not wired, so nothing
+ * seeds it yet and the resting scale is the timer ramp alone - but the
+ * decay is here so that it will be right when it is.
+ *
+ * The +0x24 label alpha is deliberately NOT touched here: it is the 2D
+ * item layer's, and menutext.c owns that side. */
+static int cubeColor[5][4];	/* real: 0x27F090 + n*48 + 0x10, live */
+static float cubeBias[5];	/* real: 0x27F090 + n*48 + 0x20, live */
+static int cubeTracker[4];	/* real: 0x27EC30 */
+static const int cubeColSel[4]   = {   0, 150, 200, 128 };	/* 0x27EC10 */
+static const int cubeColPlain[4] = { 100, 100, 100, 128 };	/* 0x27EC20 */
+
+/* real: *(0x27BE28 + 16), the config item list header's cursor.  That
+ * header is 2D-layer state and menutext.c owns it in the port, so it
+ * hands the value over here; until it does, item 0 is selected, which is
+ * the header's own .data value. */
+static int cubeCursor;
+
+void
+MenuConfigSetCursor(int n)
+{
+	cubeCursor = (u32)n < 5u ? n : 0;
+}
+
+/* real: 0x22EC60(dst, src, rate) for rate != 1 - four independent
+ * integer components, each stepped by `rate' toward the target and
+ * clamped on overshoot.  (Its rate == 1 arm at 0x22EC70 is the same
+ * thing with +-1 written out; the tracker uses that one.) */
+static void
+cfgEase(int *dst, const int *src, int rate)
+{
+	int k;
+
+	for(k = 0; k < 4; k++) {
+		if(dst[k] == src[k])
+			continue;
+		if(dst[k] < src[k]) {
+			dst[k] += rate;
+			if(dst[k] > src[k])
+				dst[k] = src[k];
+		} else {
+			dst[k] -= rate;
+			if(dst[k] < src[k])
+				dst[k] = src[k];
+		}
+	}
+}
+
+/* real: 0x226BB8 */
+static void
+MenuConfigCubeState(void)
+{
+	const int *target;
+	int i;
+
+	for(i = 0; i < 5; i++) {
+		if(i == cubeCursor) {
+			cfgEase(cubeTracker, cubeColSel, 1);
+			target = cubeTracker;
+		} else
+			target = cubeColPlain;
+		cfgEase(cubeColor[i], target, 7);
+		cubeBias[i] *= 0.95f;		/* real: *(gp-32144) */
+	}
+}
 
 /* NOT original: where each cube ended up on screen, so menutext.c can
  * hang its label off it.  The ROM's five item widgets (0x21DF28 and
@@ -538,6 +872,10 @@ MenuConfigCubes(void)
 
 	cfgStep(&cfgCubeTimer);
 	cubeSpin = (cubeSpin + 30) & 0xFFFF;	/* real: 0x2285C0 */
+	/* real: 0x226FA8 runs 0x226CF8 (= 0x226BB8) between the timer step
+	 * and 0x226D00, unconditionally - the colours keep easing even while
+	 * the cube timer is closed */
+	MenuConfigCubeState();
 	if(cfgIsState(&cfgCubeTimer, 0)) {
 		cubeScreenValid = 0;
 		return;
@@ -546,6 +884,15 @@ MenuConfigCubes(void)
 	s = cfgCubeTimer.duration ?
 		(float)cfgCubeTimer.count / (float)cfgCubeTimer.duration : 0.0f;
 
+	/* real: 0x22D2E8's only FRAME push is 0x22BF58(1, 0, 0), whose third
+	 * argument is the `field' 0x22A4C8 hands sceGsSetHalfOffset - and it
+	 * is 0, where the rods' three pushes all pass the real field.  So the
+	 * cubes are drawn with NO interlace half pixel, and so is the blit
+	 * that puts the stage's result back on the screen.  The port had them
+	 * inheriting the frame's, which moved them half a scanline on every
+	 * other field. */
+	MenuBackMeshHalfOffset(0);
+
 	for(i = 0; i < 5; i++) {
 		ang = (short)(cubeSpin + i*7000);
 		matUnit(mdTop);
@@ -553,12 +900,19 @@ MenuConfigCubes(void)
 		mdRotX(ang);
 		mdRotY(ang);
 		mdRotZ(ang);
-		MeshDraw(&cubeModel, mdTop, s + menuCubeBias[i],
-			s + menuCubeBias[i], s + menuCubeBias[i],
-			menuCubeColor[i], 200.0f);	/* real: scene 0x27EFB0 +0x90 */
+		/* real: the identity camera at 0x352840, *(gp-32064) = 0.35 on
+		 * the refraction centre, the bump colour at scene+0xA0 =
+		 * {8,8,8,128} and the emboss offset at scene+0xB0 = 0.01 */
+		MeshDraw(&cubeModel, cubeCamera, mdTop, s + cubeBias[i],
+			s + cubeBias[i], s + cubeBias[i],
+			cubeColor[i], 200.0f,	/* real: scene 0x27EFB0 +0x90 */
+			0.35f, cubeBumpColor, 0.01f);
 		cubeScreenX[i] = meshObjX;
 		cubeScreenY[i] = meshObjY;
 	}
+	/* the 2D layer that follows draws with the frame's own offset again
+	 * (0x22EFF0 and every text stage re-push it with the real field) */
+	MenuBackMeshHalfOffset(1);
 	cubeScreenValid = 1;
 }
 
@@ -660,9 +1014,19 @@ InitMenuConfig(void)
 	rodModel.nfaces = menuRodFaces;
 	rodModel.verts = menuRodVerts;
 	rodModel.norms = menuRodNorms;
+	rodModel.uvs = menuRodUVs;
 	cubeModel.nfaces = menuCubeFaces;
 	cubeModel.verts = menuCubeVerts;
 	cubeModel.norms = menuCubeNorms;
+	cubeModel.uvs = menuCubeUVs;
+
+	/* real: 0x228460's 0x267630(0x352840) - the cube scene's camera, and
+	 * the only thing in the image that ever writes it */
+	matUnit(cubeCamera);
+
+	/* real: 0x22A9B8(2), TEXC slot 2's decode + upload */
+	DecodeBump();
+	InitTexture(&bumpTexture);
 
 	memset(ring, 0, sizeof(ring));
 	for(i = 0; i < NRING; i++)
@@ -679,6 +1043,16 @@ InitMenuConfig(void)
 	}
 
 	cubeSpin = 0;			/* real: 0x2284C4 */
+	/* real: the .data the 0x27F090 table and 0x27EC30 start at, which
+	 * 0x226BB8 then eases away from */
+	for(i = 0; i < 5; i++) {
+		for(k = 0; k < 4; k++)
+			cubeColor[i][k] = menuCubeColor[i][k];
+		cubeBias[i] = menuCubeBias[i];
+	}
+	for(k = 0; k < 4; k++)
+		cubeTracker[k] = 0x80;
+	cubeCursor = 0;
 	cfgMeshTex = OsdArgInt(14, 1);
 	cfgDebug = OsdArgInt(6, 0);
 }

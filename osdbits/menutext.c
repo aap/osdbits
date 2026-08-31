@@ -748,6 +748,12 @@ ConfigMenuStepItems(void)
 {
 	int i, a;
 
+	/* real: 0x226BB8 reads the cursor straight out of the header at
+	 * 0x27BE28+16; the port's cube half (menuconfig.c) keeps its own
+	 * copy, so hand it over every frame - both sides of the selection
+	 * (label alpha here, cube colour there) follow the same index */
+	MenuConfigSetCursor(configCursor);
+
 	for(i = 0; i < configMenu.count; i++) {
 		a = configItemAlpha[i] + (i == configCursor ? 8 : -8);
 		configItemAlpha[i] = clamp(a, 0, 128);

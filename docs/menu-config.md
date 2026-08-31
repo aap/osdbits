@@ -1023,3 +1023,410 @@ and the orb cluster back - the same end state
   one of its own running), and takes `ELF=` from the environment so the
   committed build can be run through the same path.
 * `logs/` - every run above.
+
+---
+
+# Three glass problems on the System Configuration screen
+
+Scratch tree `/u/aap/.claude/jobs/58e316f8/tmp/glass/osdbits`, rebased onto
+**b5d7163** (the parallel menutext.c commit landed mid-job and was pulled in;
+`menutext.c` is byte-identical to the real tree and not in the diff).
+Deliverable diff: `glass.diff` (`inc.h`, `menuback.c`, `menuconfig.c`,
+`res.c`; +446/-42), `git apply -p1` from the repo root - checked.
+`res/TEXCBUMP_EXP.inc` is new but untracked like the rest of `res/`; regenerate
+it with the existing `python3 tools/extract-res.py <bios.bin> osdbits/res`
+(no change to the tool was needed).  Method as usual: `objdump -D -b binary -m mips:5900 -EL
+--adjust-vma=0x200000 /u/aap/src/osdsys/expanded.bin`, every function read to
+its `jr ra`, static data read straight out of the image, checked against
+headless PCSX2 software-renderer readbacks.
+
+---
+
+## 1. The cubes were too small and too close together
+
+**Root cause: the two meshes do not share a camera, and the port gave both of
+them the orb camera.**
+
+`0x22CFA8`'s first act is `MulMatrix(scene->+0x64, scene->+0x20)` - the scene
+struct's *own* camera pointer, not a global.  The two scene structs get theirs
+from different places:
+
+| | rod `0x27E950` | cube `0x27EFB0` |
+|---|---|---|
+| `+0x60` view-screen | `0` in `.data`, written every frame | `0x352800` in `.data` |
+| `+0x64` camera | `0` in `.data`, written every frame | `0x352840` in `.data` |
+
+* `0x2268F0`'s head is `sw a1,96(v0); sw a0,100(v0)` on `0x27E950` - the frame's
+  view-screen and camera matrices, straight off `0x21CF20`'s stack.  So the rods
+  really are seen through the orb camera.
+* `0x27EFB0` is mentioned **exactly once in the whole image**, at `0x226D78`
+  inside `0x226D00`, and that function never writes `+0x60`/`+0x64`.  The only
+  writer of either target is the per-screen init `0x228460`:
+
+```
+  22847c: addiu a0,a0,10240      ; a0 = 0x352800
+  ...     f12 = 512.0, f13/f14 = *(0x27B44C)/*(0x27B450), f15/f16 = 2048.0,
+          f17 = f19 = 1.0, f18 = *(gp-32132) = 16777215.0, sp+0 = 65536.0
+  2284c0: jal 0x267068           ; sceVu0ViewScreenMatrix
+  2284cc: jal 0x267630           ; sceVu0UnitMatrix
+  2284d0: addiu a0,a0,10304      ; a0 = 0x352840
+```
+
+`0x267068` is given *exactly* the arguments `0x21CFD8` gives the frame's own
+view-screen matrix, so `0x352800` and `menuViewScreen` are numerically the same
+matrix and the port can keep using `menuViewScreen`.  `0x352840` is the
+**identity**, and nothing ever writes it again (a whole-image scan for
+`lui 0x35` + `addiu ...,10304` finds the one site above).
+
+So the five cubes are drawn with **no camera at all**: the `0x27F090` table's
+positions are already camera space.  The consequences, all three of them
+reported by the owner:
+
+* the camera sits at `z = -103`, so running the cubes through it put them at
+  `w = 150.5` instead of `w = 47.5` - **3.17x too small**;
+* the same factor squeezed the zig-zag column from 118 px wide to 39 px and
+  from 117 px tall to 37 px - "too close together";
+* the refraction offset is `normal * 1000 (500 in y) * q` with `q = 1/w`, so it
+  was **3.17x too weak as well** - the "not refracting much" half of issue 2 is
+  the same bug.
+
+Measured, `menu 12 34 56 0 1 128 145 0 1 0 10 0 1 0 1`, the per-object
+diagnostic (`mesh 6 faces at X Y ... v0 X Y`):
+
+```
+before                                after
+-97.9 -16.2  v0 -90 -12               -124.0 -58.3  v0  -93 -43
+-136.7  -6.7 v0 -129  -7              -242.5 -27.9  v0 -205 -27
+-95.6   1.9  v0  -84  -3              -115.9  -1.3  v0  -79 -15
+-134.4 12.0  v0 -118  12              -234.4  30.4  v0 -187  30
+-97.5  20.8  v0  -87  25              -121.3  58.3  v0  -86  68
+```
+
+which is `512 * x/47.5` and `0.47*512 * y/47.5` for the table's
+`(-11.5,-11.5,47.5) … (-11.25,11.5,47.5)`, to the tenth of a pixel.  Half-extent
+2.64 now projects to 28.5 x 13.4 px, i.e. a 57 x 27 px cube, against 18 x 8
+before.  Frame 145, `notext=1`, 8x8-block max luminance, left half only:
+
+```
+before                                     after
+|.........:::::::......  .....   :--:  |  |....:#%%%%#%%:::...---::+++++   ---: |
+|.............:........    ...         |  |....%%%%%##%%#:.......::++=..        |
+|........................         ..:. |  |....%%#-----##*.........            .|
+|.................   ...   ====.:::--: |  |....-=------::**.  ...=======..:::--:|
+|.::::::::.......     ===:.:===......  |  |.:::::==-------+.....++========..... |
+|---------:::--:::::::==:-%@+==....    |  |-------=+=-:::::....::.....-==....   |
+|==::::::::::..........===@@#:*        |  |+=:::::::::::.......::::....==       |
+|...............      +++-%@@#=.       |  |.:::::.+##%##.......::::.:..+=.      |
+|................ ..::-:::=%@#%-.      |  |......#%#%#%###* ..::::::-+@@%-.     |
+|:..............:----::....:-+#-.      |  |:...+%%%#---+###*---::....-+##-.     |
+|:..........:-==--:.......::...........|  |:...:@%%------:--:.......--..........|
+```
+
+(the `@@@` column that stays put in both is the rod ring; the new bright blocks
+on the left are the five cubes.)
+
+### Not the cause, checked anyway
+
+* **The timer ramp.** `0x226D00`'s `t = timerCount(0x27EC00)/ *(gp-30400)` is a
+  plain linear `count/40` and the timer saturates at its duration, so `t` tops
+  out at exactly 1.0.  The port already had this.
+* **`scene+0x68/+0x6C/+0x70`.** All three get the same `t + bias` and multiply
+  the model vertices once, in `0x22CFA8`'s per-vertex loop
+  (`f0 = *(s3+0) * *(scene+0x68)` &c.).  No second scale anywhere.
+* **The anim phase.** The port opens the cube timer at entry, the ROM at Anim
+  count == `dur80`.  That is timing, not size, as the brief guessed.
+
+### One thing that *is* different, from the menutext agent's handoff
+
+`0x226BB8` (reached as `0x226CF8` from `0x226FA8`, between the timer step and
+`0x226D00`) rewrites the table every frame, and the port treated it as static:
+
+* `+0x10` **colour** eases (`0x22EC60`, rate 7) toward `0x27EC20 =
+  {100,100,100,128}` for the unselected cubes and toward the tracker `0x27EC30`
+  - itself easing at rate 1 toward `0x27EC10 = {0,150,200,128}` - for the
+  cursor's.  The `{128,128,128,128}` in `0x27F090` is only where they start.
+* `+0x20` **size bias** is `*= *(gp-32144) = 0.95` every frame.  It is a *kick*,
+  not a constant: `0x227C20` (the config screen's CIRCLE arm) writes
+  `*(gp-32136) = **-0.1**` into the cursor's entry, so the pressed cube shrinks
+  10 % and springs back.  The static value is 0.0 and the port's confirm button
+  is unwired, so the *resting* size was right; the mechanism was missing.
+
+Both are now ported (`MenuConfigCubeState`, `cfgEase`).  `+0x24` (the label
+alpha) is deliberately **not** touched here - menutext.c owns that half of
+`0x226BB8` as of b5d7163.  The cursor lives in menutext.c's item header, so
+menuconfig.c exposes `MenuConfigSetCursor(int)` and defaults to item 0 until
+someone wires it: **one line in `ConfigMenuInput`/`InitMenuText` finishes it**,
+and until then the cursor cube tints as if item 0 were selected.
+
+---
+
+## 2. The refraction was too weak
+
+Three separate causes; the first is much the biggest.
+
+### 2a. `q` (see §1) - fixed by the camera
+
+`1000 * q` went from 6.6 px to 21 px horizontally and 3.3 to 10.5 vertically.
+
+### 2b. `ALPHA_1` was the additive blend, and the `AA1` bit was inverted
+
+`0x22C4E0`'s PRIM select, read instruction by instruction:
+
+```
+22c5b0: lwc1 $f0,-32072(gp)   ; 0.99
+22c5b4: c.lt.s $f0,$f21       ; cc = (0.99 < fres)
+22c5bc: bc1f 0x22c5cc         ; cc FALSE -> 22c5cc
+22c5c4: b 0x22c5d0
+22c5c8: li v0,276             ; (delay) cc TRUE  -> 276 = TRISTRIP|TME|FST
+22c5cc: li v0,404             ;         cc FALSE -> 404 = the same + AA1 (0x80)
+```
+
+so **AA1 is on for the ordinary face and off for the near-edge-on one**, the
+opposite of what the port did.  Left inverted, AA1 flickered on and off per face
+as a spinning rod's faces crossed 0.99.
+
+Putting AA1 back where the ROM has it immediately exposed a second bug: the port
+pushed `vif1SetAlphaBlend(1, **5**, 128)` = `BlendModes[5]` = `0x48` = `Cs*As +
+Cd`, the **additive** blend, where `0x22A0C0(1,1)` picks entry 1 of the jump
+table at `0x2A4B80` (`0x22A124`, `li v0,68`) = **`0x44`** = `(Cs-Cd)*As + Cd`.
+With PRIM's ABE clear and AA1 almost never set that was dead state; with AA1 on
+the GS blends, and `0x48` turned every glass face into an additive wash - the
+whole screen went `@@@@` (logs/fix-cfg145.log).  With `0x44` and the emit's
+`A = 0x80` the blend is the identity, i.e. an opaque face, which is what it has
+to be.  Both are fixed; they cancel visually and leave the antialiased edge the
+ROM asks for.
+
+### 2c. The TEXCBUMP emboss - the actual "bumpmap" - was missing
+
+`0x22D2E8` runs **eight** loops over the face bank, five for the front faces and
+three for the back:
+
+| # | state | faces | emit |
+|---|---|---|---|
+| 1 | `0x22BF58(1,0,0)` FRAME wb4, TEX **the screen**; `0x22A0C0(1,1)` | front | `0x22C888` -> `0x22C4E0`, extra 0 |
+| 2 | `0x22AB90(2,1,2)` TEXCBUMP; `0x22A0C0(0,2)` = ALPHA `0x48` | front | `0x22C920`, offset `(+0xB0,+0xB4)` = (0.01, 0.01) |
+| 3 | `0x22A0C0(2,2)` = ALPHA **`0x42`** | front | `0x22C920`, offset (0, 0) |
+| 4 | `0x22BFD0(0,1,1)` FRAME wb3, TEX wb4 | front | `0x22CCE8` |
+| 5 | `0x22A0C0(0,3)` | back | `0x22CA68` |
+| 6 | `0x22BFD0(1,0,0)` + `0x22C100()` | - | wb3 -> wb4, half-width blit |
+| 7 | `0x22BFD0(0,1,1)`; `0x22A0C0(1,1)` | back | `0x22C888` |
+| 8 | as 2 and 3 | back | `0x22C920` x2 |
+
+Loops 2/3 and 8 are the bumpmap, and they are a plain **emboss**: the same
+64x64 TEXCBUMP page drawn twice over the mesh's own UVs, once ADDITIVE at a
++0.01 UV offset and once SUBTRACTIVE at zero offset.  `0x22C920`'s primitive is
+`PRIM = 84` = `TRISTRIP | TME | ABE` with **FST clear** (ST/Q, model UVs, not
+screen position), colour `scene+0xA0 = {8,8,8,128}`, `Q = q` per vertex, GIFtag
+template `0x27F8B0`.  With TFX MODULATE each pass caps at `8*255/128 = 15`
+levels, so the relief is +-15 on top of the refraction - subtle, and exactly
+what a "bumpmap-like surface effect" looks like.
+
+Ported as `MeshEmitBumpFace` / `MeshBumpPass`, for the cubes only (the rods'
+`0x22D920` arm has the same loops with a per-face phase `f21 + i*(gp-32032)`;
+left stubbed as before, and noted in the code).
+
+**TEXCBUMP is TEXC slot 2**: descriptor `0x27F1C0 + 2*12` says `wexp = hexp = 6`
+(a real 64x64 page) and the decoder table `0x2A4BA0[2]` is `0x22A720`, the grey
+expander (`b | b<<8 | b<<16 | 0x7F000000`).  `tools/extract-res.py` **already
+emits `res/TEXCBUMP_EXP.inc`** with the rest of TEXIMAGE (4452 -> 4096 bytes) -
+no tool change was needed, only the two lines in `res.c` that every other
+resource has.  The decode/upload is `DecodeBump` + `InitTexture`, the bind
+`MenuConfigBindBump` (`0x22AB90(2,1,2)` -> `0x22AA88`, TEX1 `0x61`, CLAMP_1 back
+to REPEAT/REPEAT, TEXA `{0x7F,1,0x81}`).
+
+### 2d. The refraction SOURCE - deliberately *not* changed, with evidence
+
+The brief asked me to confirm what `0x22A290(0)`'s bind really points at in the
+cube path.  It is not `0x22A290` at all: loop 1 uses `0x22BF58(1,0,0)`, whose
+first act is `0x22A198(*(0x1F0C40))` - **TEX0 = the live screen** (PSMCT24), by
+then carrying the tunnel, the composite, the orbs, the rods and `0x2283D0`'s
+five zoom-blur round trips.  Its FRAME, though, is work buffer 4, and
+`0x226D00`'s tail ends with `0x22C020(0,0,0)` + `0x22C190(0)` - an **opaque**
+full-screen blit of work buffer **3** back over the screen.  Neither work buffer
+is ported, and both of them still hold `0x21D0A0`'s copy of the *bright,
+un-tinted* tunnel.
+
+So binding the screen in a port that also *draws* onto the screen gets the
+texture right and the destination wrong.  Measured both ways, frame 145,
+`notext=1`, the cube column:
+
+```
+TEX = a fresh copy of the screen        TEX = extraBuf1 (work buffer 3)
+|....-----:::-::...........   |         |....%%%%%##%%#:.......::++=..|
+|....--:.....:::..........    |         |....%%#-----##*.........     |
+|......::::-::::: ..:::..=*#@ |         |......#%#%#%###* ..::::::-+@@|
+```
+
+The cubes all but vanish against the backdrop.  So the port keeps `extraBuf1`
+for both meshes (no code change), and the divergence is now written down in
+`MeshDraw`'s header comment instead of being silent.  Porting loops 4-8 and the
+`0x22C2A0` composite would make the ROM's own source correct; that is the next
+piece of work on this screen, not a bug fix.
+
+`MenuBackCaptureScreen()` was written, measured and then removed - it is not in
+the diff.
+
+---
+
+## 3. The flickering "clock background"
+
+### What the measurements say
+
+Headless SW renderer, one frame per run.  Two metrics: the existing 8x8-block
+max-luminance map, and (for the investigation only, reverted before the diff) a
+16x16-block **mean** luminance map, compared as mean absolute block difference.
+Adjacent frames are opposite fields; frames two apart are the same field and
+have twice the animation, so `d(N,N+1) > d(N,N+2)` is the signature of
+field-alternating content.
+
+| build | d(145,146) | d(146,147) | d(147,148) | d(145,147) | d(146,148) | ratio |
+|---|---|---|---|---|---|---|
+| HEAD | 0.491 | 0.593 | 0.471 | 0.445 | 0.454 | 1.22 |
+| all fixes, cubes still on the frame's half pixel | 0.661 | 0.677 | 0.652 | 0.416 | 0.396 | **1.61** |
+| all fixes + cube half-pixel off (delivered) | 0.500 | 0.530 | - | 0.416 | - | 1.24 |
+
+Controls, same metric:
+
+| scene | adjacent | 2 apart | ratio |
+|---|---|---|---|
+| main menu, orbs + blur only | 0.050 / 0.089 | 0.089 | 0.8 (none) |
+| main menu + tunnel + composite forced on (`back=1`) | 0.173 / 0.218 | 0.134 | 1.46 |
+| config (HEAD) | 0.491 / 0.593 | 0.445 | 1.22 |
+
+### Bisection
+
+Turning the two config meshes off one at a time (temporary edits, reverted),
+8x8 metric:
+
+| | d(145,146) | d(145,147) |
+|---|---|---|
+| rods + cubes (HEAD) | 6.3 % | 3.8 % |
+| rods only | 6.0 % | 3.8 % |
+| **cubes only** | **1.7 %** | **1.5 %** |
+| meshes untextured (`meshTex=0`) | 5.8 % | 4.0 % |
+
+so the alternation follows the **rods**, and it survives `meshTex=0`, i.e. it is
+in the rasterisation, not in the refraction sampling.  The `back=1` control
+above adds the tunnel to that list.
+
+### What it is
+
+The interlace half pixel, and everything that carries it in the port carries it
+in the ROM too - `0x22A4C8`/`0x22A3B8` take `field` per call site:
+
+* the tunnel: `0x21D0A0`'s head passes `*(0x27B448)`, the real field. Faithful.
+* the rods: all three of `0x22D920`'s FRAME pushes (`0x22BFD0(1,0,1)`,
+  `0x22C020(1,0,1)`, `0x22BFD0(0,1,1)`) pass `a2 = 1` = the real field.
+  Faithful.
+* **the cubes: `0x22BF58(1,0,0)` passes 0**, and nothing in `0x226D00` puts it
+  back - the whole cube stage, down to the blit that puts its result on the
+  screen, runs with **no** half pixel.  The port had them inheriting the
+  frame's.  **This is the one real bug in issue 3** and it is fixed
+  (`MenuBackMeshHalfOffset`, the same bracket 37efd18 gave the blur).
+
+Its practical importance is that the correct cubes are 3.2x bigger: the middle
+row of the table above shows what the size fix alone would have done to the
+flicker (1.22 -> 1.61).  With the bracket the ratio is back to HEAD's 1.24 with
+three times the cube area on screen.
+
+Also fixed, though too small to measure: `MeshEmitFace` read the **live**
+`evenOddField` for `0x22C4E0`'s `- field*0.5` on the V.  `SwapBuffers` flips
+that on the swap thread, so two objects of one frame could disagree - the exact
+race class of 37efd18.  It now uses menuback.c's per-frame snapshot
+(`MenuBackField()`), which is what the ROM's `*(0x27B448)` is.
+
+### What it is *not*
+
+* **The composite / blit chain (candidate b).**  `back=1` on the main menu -
+  tunnel, both `FullScreenBlit` copies and the tinted composite, no meshes -
+  shows no odd/even asymmetry in the 8x8 metric at all (1.2 / 1.5 / 1.2 %).
+  `BackHalfOffset(0)` already brackets every buffer-to-buffer blit; the only
+  consumer of `MenuBackBindScreenCopy` is a texture bind, which has no XYOFFSET.
+* **Z-state leakage (candidate c).**  `DrawKabe` is the only thing that writes Z
+  (`vif1SetZWrite(1)`, ZTST GREATER); the meshes and orbs all run ZWrite off /
+  ZTST ALWAYS, and `sceGsSetDefDBuff(..., SCE_GS_CLEAR)` clears Z to 0 each
+  frame.  The tunnel's projected z is 43..526 in 1/16 units against the cubes'
+  ~22000, so even the ROM's GEQUAL for the bump passes would pass everywhere.
+* **AA1.**  Forcing AA1 off entirely gives 0.620 / 0.664 / 0.402 - the same 1.60
+  ratio as with it on.  Not a factor either way.
+* **Tunnel aliasing (candidate d).**  Present but small and symmetric: the
+  `back=1` control's 0.173 / 0.134 is the wobble and the T scroll drifting, plus
+  the same half pixel the ROM applies.
+
+### The residue, and the hardware renderer
+
+After the fix the config screen's frame-to-frame difference is 0.50 mean block
+luminance against 0.42 for pure animation - a half-pixel-sized residue on the
+rods and the tunnel, both of which the ROM draws exactly the same way.  On the
+software renderer there is nothing left to fix without diverging from the ROM.
+
+The owner watches in the **hardware** renderer, and I could not reproduce that
+here: PCSX2 with `EmuCore/GS/Renderer=12` (OpenGL) never gets far enough on this
+Xvnc display to open its log file (no GL/GLX), so every number above is
+software-renderer only.  What is left as the standing hypothesis for a
+hardware-only flicker, in order:
+
+1. **the deinterlacer.**  Everything above is a genuine, ROM-faithful half-pixel
+   field offset on a full-screen high-frequency texture.  A blend/bob
+   deinterlacer turns that into visible shimmer where an interlaced CRT would
+   not.  Worth asking the owner to try `GS > Deinterlacing = Weave` or
+   `Progressive` and report back - that is a one-setting experiment that would
+   settle it.
+2. **the render-target/texture chain.**  Config mode adds, per frame: 16 tunnel
+   ribbons, two full-screen RT->RT copies, a tinted composite, five zoom-blur
+   ping-pongs, and then ~19 meshes that sample `extraBuf1` (a render target)
+   while drawing to the screen.  PCSX2's HW renderers resolve that with
+   heuristics the SW renderer does not need.  The main menu, which the owner does
+   *not* report as flickering, has only the five blur ping-pongs.
+
+---
+
+## Remaining deltas on this screen
+
+Unchanged from `docs/menu-config.md` 10.2 unless listed:
+
+* `0x22D2E8` loops 4-8 (`0x22CCE8`/`0x22CA68`, the wb3/wb4 ping-pong,
+  `0x22C100`'s half-width blit) and `0x226D00`'s tail (`0x22C088`, the
+  `0x22C2A0` work-buffer-3 blur, `0x22C190(0)`'s opaque blit back).  Porting
+  these is what would let the refraction sample the screen the way the ROM does
+  (§2d), and it is the biggest single remaining piece.
+* `0x22D920`'s TEXCBUMP loops for the **rods** (the per-face phase
+  `f21 + i * *(gp-32032)`, and the second one's `+ scene->+0xB0 = -0.008`).
+* `0x2267E8`'s two-pass additive bloom for the carousel records.
+* `0x22D920`'s `f12 > 0` arm (the front rod splitting along Y).
+* `0x226BB8`'s cursor: `MenuConfigSetCursor()` is exported and unused; menutext.c
+  needs one call for the selected cube to tint.
+* `0x227C20`'s CIRCLE arm, which is what would seed the -0.1 size kick the decay
+  now models.
+* `0x225BF8`'s split rate: the port uses 0.02, `*(gp-32164)` is **0.004**.
+  Untouched (it is the front rod's split, which feeds the unported arm above).
+* The port pushes `CLAMP_1 = CLAMP/CLAMP` once per frame in `MenuFrame` and the
+  glass overrides it to REPEAT per primitive, so an orb that sorts *behind* a rod
+  is sampled with REPEAT.  That is **not** a bug: `0x22AB90` -> `0x22AA88` forces
+  CLAMP_1 to 0 for the orbs' own binds too (docs/menu-backdrop.md 7 correction
+  4), so REPEAT is the ROM's state.  The once-per-frame CLAMP/CLAMP is the
+  divergence, and it is on the main menu's bit-stable path - left alone.
+
+---
+
+## Build and verification
+
+`ee-gcc 2.9-ee-991111 -O2`, freesce + sce_24 as before, clean, no warnings.
+
+* **Main menu bit-stable**: `menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`,
+  frame 60, 8x8 map identical to HEAD's - **0/2240 blocks differ**
+  (`logs/base-mm60.log` vs `logs/W-mm60.log`).  Everything new is behind the
+  cube timer or the `bumpCol != nil` argument, which only the cube path passes.
+* **Config, 3D layer**: `menu 12 34 56 0 1 128 145 0 1 0 10 0 1 0 1` - the
+  before/after maps in §1.
+* **Config, full**: `... 145 0 0 0 10 0 1 0 1` with b5d7163's 2D layer -
+  `logs/V-cfg145.log`.
+* **Leave path**: `... 220 0 0 0 10 0 1 140 1` - tunnel, rods and cubes gone,
+  black backdrop and the orb cluster back (`logs/V-leave220.log`).
+* **Flicker**: the five-run frame matrices in §3, plus the two control scenes.
+
+Logs in `logs/`; `cmpmap.py` (8x8 map differ) and `meandiff.py` (mean-block
+metric) are the two throwaway comparators.
+
+Cleanup: Xvnc `:98` killed, no pcsx2-qt left running, no cores, `PCSX2.ini`
+never touched (the hardware attempt used `-setting` only).

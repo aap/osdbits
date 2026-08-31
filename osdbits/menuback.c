@@ -461,6 +461,30 @@ BackHalfOffset(int on)
 	vif1SetXYOffset(backFrameField, on);
 }
 
+/* The same bracket for a stage outside this file.  0x22A4C8/0x22A3B8's
+ * `field' argument is per call site, and the mesh renderer's sites do not
+ * agree: the RODS' three FRAME pushes (0x22BFD0(1,0,1), 0x22C020(1,0,1),
+ * 0x22BFD0(0,1,1) in 0x22D920's 0x22E0EC arm) all pass a2 = 1, i.e. the
+ * real field, while the CUBES' first one (0x22BF58(1,0,0) in 0x22D2E8)
+ * passes 0 and nothing in 0x226D00 puts it back - the whole cube stage,
+ * down to 0x22C190(0)'s blit of the result over the screen, runs with no
+ * half pixel.  menuconfig.c needs the second of those. */
+void
+MenuBackMeshHalfOffset(int on)
+{
+	BackHalfOffset(on);
+}
+
+/* real: *(0x27B448), the module's own copy of the field, which every
+ * stage reads instead of the live register.  menuconfig.c's glass emit
+ * (0x22C4E0's `- field*0.5' on the V) needs the same value for every
+ * object of one frame, so hand it the snapshot. */
+int
+MenuBackField(void)
+{
+	return backFrameField;
+}
+
 /* real: the FRAME_1 half of 0x22A4C8 / 0x22A3B8.  0x22A4C8's third
  * argument is a clear-colour RECORD, not a flag: 0x21D0A0 passes NULL
  * for both work buffers, which drops the drawenv GIFtag's NLOOP from 14
