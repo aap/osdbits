@@ -527,3 +527,499 @@ main menu's look.
 
 **Build** - clean, no warnings, `ee-gcc 2.9-ee-991111 -O2`, freesce +
 sce_24 as before.
+
+---
+
+# The System Configuration screen's 2D layout, decoded and ported
+
+Written to fold into `docs/menu-config.md` as a replacement for its §3 and
+for the "item **labels'** positions" and "the config screen's own confirm
+button" rows of §10.2; §5 below also corrects `docs/menu-text.md` §4.1.
+
+Method as `docs/menu-config.md`: `objdump -D -b binary -m mips:5900 -EL
+--adjust-vma=0x200000` of `/u/aap/src/osdsys/expanded.bin`, every function
+read to its own `jr ra`, static data read straight out of the image,
+checked against PCSX2 readbacks of the port.  Everything is **[ok]**
+unless marked.
+
+---
+
+## 1. The verdict: three rows, one item at a time
+
+`docs/menu-config.md` §3 names `0x227D08` "the screen's draw slot".  It is
+not.  **`0x227D08` draws nothing** - it is the focus notify plus the
+dispatch to a pad handler:
+
+```
+0x227D08:
+    hdr = 0x27BE28                                  /* s0 = 0x27BE44, s0-28 */
+    if(!timerIsState(0x27BE44, 2) || !timerIsState(0x27EC40, 0)) {
+        if(*(gp-30404)) { hdr->items[hdr->cursor].fn28(item, 0);
+                          *(gp-30404) = 0; }
+        return;
+    }
+    if(!*(gp-30404)) { hdr->items[hdr->cursor].fn28(item, 1);
+                       *(gp-30404) = 1; }
+    if(hdr->mode == 0) tail 0x2279B8                 /* the item-list pad   */
+    if(hdr->mode == 1) tail 0x227BE8                 /* the value-list pad  */
+```
+
+The drawer is **`0x227560`**, the third of the four calls `0x227DE8`
+makes: `timerStep(0x27BE44)`, `0x227390` (the state machine),
+**`0x227560`**, tail `0x227D08`.
+
+And what it lays down is **three fixed rows**, all centred on x = 430 like
+the main menu's:
+
+| row | y (NTSC) | y (PAL) | colour | what |
+|---|---|---|---|---|
+| title | **88** | 101 | `0x27B860` = {110,110,0,128} | `osdGetString(hdr->title)` = 91 "System Configuration" |
+| label | **112** | 128 | `0x27B830` = {30,110,156,128} | the item's own string |
+| value | **130** | 149 | `0x27B850` = {96,96,96,128} | the item's widget (§4) |
+
+Three rows for five items, because **the screen shows exactly one item at
+a time**.  Each item's alpha is
+
+```
+a = (*(int*)(0x27F090 + i*48 + 0x24) * pageAlpha) >> 7
+```
+
+and `0x226BB8` (the cube stage's first half, `0x226FA8 -> 0x226CF8`)
+ramps that field **+8 a frame toward 128 for the item under the cursor
+and -8 toward 0 for the other four**.  It lives in the cube placement
+table because it is the same number that drives each cube's colour ease:
+the label is a cube's *caption*, not a row in a list.
+
+That is exactly what the port had wrong.  The stopgap drew all five
+labels at full alpha, hung off `MenuConfigItemPos()`'s projected cube
+positions, so they piled up wherever the cubes clustered - aap's "the
+text is all on top of each other".
+
+### 1.1 The y's
+
+```
+0x227560:
+    y = 0x204350() == 1 ? 101 : 88               ; 0x204350 = IsPAL
+    labelY = (int)((double)y + (IsPAL ? *(double*)0x2A4B40 : 24.0))
+    valueY = (int)((double)y + (IsPAL ? *(double*)0x2A4B48 : 42.0))
+```
+
+`0x2A4B40` = **27.6** and `0x2A4B48` = **48.3**, i.e. 24 and 42 times the
+1.15 base scale `do_load_font` hands `0x2080D0` on PAL (`docs/menu-text.md`
+§2.1), and 101 ≈ 88 × 1.15.  The ROM adds them as doubles and truncates,
+so the port's `(int)` casts are load-bearing.
+
+---
+
+## 2. `0x227560` in full
+
+```
+alpha = 0x2271B8()                                  /* the page alpha, §3 */
+if(timerIsState(0x27BE44, 0)) return                /* screen closed      */
+if(timerIsState(0x27EC40, 2)) return                /* a sub-screen is up */
+0x22A3B8(0x1F0A10, *(0x1F0C40), 0, *(0x27B448))     /* aim at the visible buffer */
+0x22A0C0(1, 2)                                      /* normal blend, ZTST GEQUAL */
+0x207F68(1.0)                                       /* scale 1 for the whole page */
+hdr = 0x27BE28 ; x = 430
+0x21DC88(430, titleY, 0x27B860, alpha, osdGetString(hdr->title))
+0x228708()                                          /* hdr->+0x0C = widest label, §5 */
+markW = 0x209998(gp-30416)                          /* "\7o020", the page marker  */
+gap   = 0x209998(0x2A79A8)                          /* " "                        */
+if(430 + markW + gap + hdr->maxw/2 >= screenW - 24)
+        x -= 430 + markW + gap + hdr->maxw/2 + 24 - screenW
+if(hdr->mode != 1 && timerIsState(0x27BE44, 2) && timerIsState(0x27EC40, 0)) {
+        k = (IsPAL() ? 50 : 60) * 31400 / 60
+        p = hdr->+0x34 * 31400 / k
+        0x21DC28(x + hdr->maxw/2 + gap, labelY, 0x27B850,
+                 |(int)(128.0 * sinf(p / *(gp-32140)))|, gp-30416)
+}
+for(i = 0; i < hdr->count; i++) {
+        a = (*(int*)(0x27F090 + i*48 + 0x24) * alpha) >> 7
+        s = osdGetString(hdr->items[i].strid)
+        ix = 430
+        if(430 + markW + gap + 0x209998(s)/2 >= screenW - 24)
+                ix -= 430 + markW + gap + 0x209998(s)/2 + 24 - screenW
+        if(a == 0) continue
+        if(hdr->mode == 1) {
+                0x21DC88(ix, labelY, 0x27B850, a, s)
+                (i == hdr->cursor ? items[i].fn1C : items[i].fn18)
+                        (&items[i], 430, valueY, a)
+        } else {
+                0x21DC88(ix, labelY, 0x27B830, a, s)
+                items[i].fn18(&items[i], 430, valueY, a)
+        }
+}
+```
+
+Three details worth keeping:
+
+* **only the label's column is clamped.**  The title and the value row
+  keep the literal 430; the marker's column is clamped off the header's
+  *widest* label and the label's off *this item's*, so the two clamps do
+  not agree when the widest item is not the selected one.
+* **the marker.**  `gp-30416` = `0x2A79A0` holds `"\7o020"` - escape `'o'`
+  (`0x2094AC`, 5 bytes) emits glyph **20** of the kind-2 table
+  (`0x271460`, 35 entries, the FNTEXOSD page).  `0x2A79A8` holds a single
+  space, whose measured width is the gap between label and marker.  The
+  marker's alpha is `|128 sin(phase/10000)|` where `phase` is the
+  header's **+0x34**, a sawtooth `0x227390`'s tail steps by **310** a
+  frame and folds at ±`refreshRate*31400/60` (±31400 NTSC, ~203 frames a
+  lap); `0x21EE50` (the items' +0x14) zeroes it on entering an item.
+  `*(gp-32140)` = **10000.0**, `0x253C08` = `sinf`.
+* `hdr->mode` is +0x18, 0 for the item list and 1 for one item expanded
+  into its value list.  Mode 1 dims the label to `0x27B850` and hands
+  the cursor item's row to the **+0x1C** widget instead of +0x18.
+
+---
+
+## 3. `0x2271B8` - the page alpha
+
+```
+c = timerCount(0x27BE44)
+v = clamp(c - (*(gp-30400) + *(gp-30380)), 0, *(gp-30396))    /* dur40+dur80, dur10 */
+a = (v << 7) / *(gp-30396)
+return a * clamp(*(gp-30396) - timerCount(0x27EC40), 0, *(gp-30396)) / *(gp-30396)
+```
+
+i.e. `MenuConfigAlpha()` as already ported (the port's extra `fadeAlpha`
+factor is not the ROM's, and the `0x27EC40` factor has no counterpart).
+Nothing is drawn for the first **120** frames of the entry; the whole
+page fades up over the last **10**.
+
+---
+
+## 4. The item records and their widgets
+
+`0x27BD10 + n*56`, with the fields the draw path touches:
+
+| n | +0x00 | +0x04 | +0x08 | +0x0C | +0x10 values | +0x14 enter | **+0x18 draw** | +0x1C mode 1 | +0x28 focus |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 106 `Clock Adjustment` | 6 | 0 | 0 | 0 | 0x21DF28 | **0x21E350** | 0x21EA20 | 0x21EB80 |
+| 1 | 107 `Screen Size` | 3 | 0 | 0 | 0x27BC20 | 0x21EE50 | **0x21EE78** | 0x21F080 | 0x21F160 |
+| 2 | 111 `\7r0.90DIGITAL OUT (OPTICAL)\7r0.00` | 2 | 0 | 1 | 0x27BCB0 | 0x21EE50 | **0x21EE78** | 0x21F080 | 0x21F160 |
+| 3 | 114 `Component Video Out` | 2 | 0 | 2 | 0x27BBC0 | 0x21EE50 | **0x21EE78** | 0x21F080 | 0x21F160 |
+| 4 | 117 `Language` | 0 | 0 | 3 | **0** | 0x21EE50 | **0x21EE78** | 0x21F168 | 0x21F160 |
+
++0x04 is the sub-entry count (six clock *fields* for item 0), +0x08 the
+current index, +0x0C a **setting id**: `0x21EDB8` re-syncs +0x08 from
+`*(int*)0x22B0E8(+0x0C)` every draw, and `0x22B0E8(n)` is just
+`0x352880 + n*4`, the settings array in BSS.
+
+The value lists are 48-byte records of which the draw path reads +0x00
+(the setting value) and +0x04 (its string id):
+
+| list | entries |
+|---|---|
+| `0x27BC20` Screen Size | {0, 108 `4:3`}, {1, 109 `Full`}, {2, 110 `16:9`} |
+| `0x27BCB0` Digital Out | {0, 112 `On`}, {1, 113 `Off`} |
+| `0x27BBC0` Component | {1, 116 `Y Cb/Pb Cr/Pr`}, {0, 115 `RGB`} - stored in that order, RGB second |
+
+**Language's list pointer is 0 in `.data` and nothing in Module U fills
+it in** (`0x21F168`, its +0x1C widget, reads the same field), so its
+value row has no source inside this module.  [ok]
+
+### 4.1 `0x21EE78` - the generic value row
+
+```
+0x21EDB8(item)
+tail 0x21DC88(x, y, 0x27B850, alpha,
+              osdGetString(item->values[item->+0x08].strid))
+```
+
+### 4.2 `0x21E350 -> 0x21DFF8` - the clock row
+
+`0x21E350` is `0x21DDC0(item); 0x21DFF8(item, x, y, alpha, edit = 0)`.
+(`0x21E3B0` is the same with `edit = 1`, which splits the colours into
+`0x27B830` for the field being edited and `0x27B840` for the rest - that
+is the Clock Adjustment *editor*, not this screen.  With `edit = 0`
+every field draws in `0x27B850`.)
+
+```
+0x21DFF8:
+    x -= 0x209998(0x203968() == 1 ? 0x2A47C8 : 0x2A47F0) / 2
+    for(n = 0; n < item->+0x04; n++) {
+        kind = *(int*)(0x27B870 + n*12)
+        0x209640("\7p@0")                        /* fixed width on '0' */
+        sprintf(buf, fmt[kind], *(int*)0x22B0E8(kind))
+        0x21DC28(x, y, col, alpha, buf) ; x += 0x209998(buf)
+        0x209640("\7p00")                        /* fixed width off */
+        separator[n]
+    }
+```
+
+* the centring template is `0x2A47F0` `"0000/00/00 00:00:00"`, or
+  `0x2A47C8` `"0000/00/00 00:00:00 \7r0.66AM\7r0.00"` when `0x203968()`
+  says twelve-hour.
+* `0x27B870` is six 12-byte `{kind, min, max}`: `{6,2000,2099}` year,
+  `{7,1,12}` month, `{8,1,31}` day, `{9,0,23}` hour, `{10,0,59}` minute,
+  `{11,0,59}` second.  The ranges belong to the editor.
+* formats (`0x2A4840`'s arms): year `"%04d"` (0x2A7858), month/day/minute/
+  second `"%02d"` (0x2A7860), **hour `"%2d"`** (0x2A7868) - space-padded,
+  and in twelve-hour mode `h = h%12 ? h%12 : 12`.
+* separators (`0x2A4860`'s arms), by field index: 0 and 1 `"/"`, **2 a
+  space that `0x21E27C` measures and advances over but never draws**, 3
+  and 4 `":"`, 5 the twelve-hour tail `" AM"` / `" PM"` at `\7r0.66`
+  (`0x2A4808` / `0x2A4820`), drawn without advancing.
+* the `\7p@0` / `\7p00` brackets are a no-op for the Latin face:
+  `'0'`..`'9'` are all `{5, 23}` in the `0x26FE60` metrics.
+
+---
+
+## 5. `0x228708` - the header's +0x0C is a WIDTH, not a row count
+
+```
+best = 0
+for(i = 0; i < 0x27BE28->count; i++)
+    best = max(best, 0x209998(osdGetString(items[i].strid)))
+0x27BE28->+0x0C = best
+```
+
+Hard-coded to the System Configuration header and re-run by `0x227560`
+every frame.  **This corrects `docs/menu-text.md` §4.1**, which reads
+`0x27BE90`'s +0x0C as "rows 3" - it is the same field, and the 3 in
+`.data` is only an initial value.  Nothing in Module U reads the main
+menu header's +0x0C at all.
+
+---
+
+## 6. `0x2279B8` - the item-list pad handler
+
+Read for the parts the port can honour:
+
+```
+0x1000 (up)    items[cursor].fn28(item,0); if(--cursor < 0) cursor = count-1;
+               items[cursor].fn28(item,1); 0x2287A8(20992,1,5)
+0x4000 (down)  items[cursor].fn28(item,0); if(++cursor >= count) cursor = 0;
+               items[cursor].fn28(item,1); 0x2287A8(20992,1,5)
+0x0020         items[cursor].fn14(item); hdr->mode = 1;
+               cursor == 0 ? 0x22B108() : 0x22B100(); 0x2287A8(20992,1,4)
+0x0080         tail 0x227028
+0x0040         tail 0x227338    /* timerClose(0x27BE44) + click 10 - leave */
+0x0010         only when cursor == 0: click 4, timerClose(0x27BE44),
+               tail 0x223658
+```
+
+**The cursor wraps at both ends here**, unlike the main menu's
+(`0x228278`, which clamps).  Ported.
+
+---
+
+## 7. Does the main menu's "System Configuration" label morph?
+
+No, and nothing cross-fades:
+
+* `0x228110` (the main menu's labels) bails on `0x227FC0`, which goes
+  false the instant `0x27BE44` leaves state 0 - the same frame `0x227268`
+  opens it.  The two labels are **cut**, not faded.
+* `0x227560` bails while `0x27BE44` *is* state 0, so the two screens
+  never draw together for even one frame.
+* the page title then fades in **120 frames later** (§3) and at a
+  different place: (430, 88) centred, against the main menu's item row at
+  (430, 114).  Different y, different colour ({110,110,0} vs
+  {30,110,156}), no shared state.
+
+Nothing to port; the port already had this right through
+`MenuConfigOpen()`.
+
+---
+
+## 8. What the port now does
+
+One file, `osdbits/menutext.c`.  Functions touched:
+
+| function | state |
+|---|---|
+| the file header comment | updated (what is and is not ported) |
+| `colDim` / `colTitle` | **new** - `0x27B850` / `0x27B860` |
+| `MenuTextDump` | diagnostic only: the readback window opens to x 224..640, y 80..152 while the config screen is up so all three rows fit.  The main menu's window is unchanged, so its dumps still compare byte for byte with older builds. |
+| `ConfigValue` / `ConfigItem` / `configItems` / `configMenu` | **new** - the `0x27BD10` records, the three value lists and the `0x27BE28` header, with `configCursor` now a `#define` onto `configMenu.cursor` |
+| `configItemAlpha[5]` | **new** - `*(0x27F090 + i*48 + 0x24)` |
+| `cfgClockField` / `cfgClockSep` / `cfgClockDate` / `cfgFmtNum` | **new** - `0x27B870`, the `0x2A4860` separators, and a small `%0Nd` |
+| `DrawItemClock` | **new** - `0x21E350` -> `0x21DFF8`, 24-hour arm |
+| `DrawItemValue` | **new** - `0x21EE78` |
+| `ConfigMenuWidest` | **new** - `0x228708` |
+| `ConfigMenuStepItems` | **new** - `0x226BB8`'s item-alpha share |
+| `DrawConfigMenu` | **rewritten** - `0x227560`; the `MenuConfigItemPos()` hack is gone |
+| `ConfigMenuInput` | the ROM's wrap added |
+| `InitMenuText` | derives `cfgTitleY` / `cfgLabelY` / `cfgValueY`, clears `configItemAlpha`, clamps `configCursor` against `configMenu.count` |
+| `MenuTextFrame` | calls `ConfigMenuStepItems()` first (the ROM runs `0x226BB8` a hub slot earlier than either 2D layer, and unconditionally) |
+
+`menuconfig.c` and `menuback.c` are untouched, as asked.
+`MenuConfigItemPos()` is now unused but still exported.
+
+### 8.1 Not ported, and where it would attach
+
+| what | real | note |
+|---|---|---|
+| the page marker and its pulse | `gp-30416` `"\7o020"`, `0x227560`'s middle block, `0x227390`'s +0x34 sawtooth | `\7o` emits a **kind-2 (FNTEXOSD)** glyph and the port uploads only FNTASCII, so there is nothing to draw.  Its measured width is 0 here, which is the only reason the port can leave the `markW` term out of the two right-margin clamps; at screenW 640 neither clamp fires for any of the five labels either way. |
+| the mode-1 arm (one item expanded into its value list) | `hdr->+0x18`, `0x21F080` / `0x21F168` / `0x21EA20` | not ported; `DrawConfigMenu` only has the mode-0 arm.  This is where the +0x1C widgets attach. |
+| the items' confirm callbacks | +0x14: `0x21DF28` (clock editor) and `0x21EE50` | not wired; `0x2279B8`'s CIRCLE arm would set `hdr->mode = 1` and call these. |
+| the focus callbacks | +0x28, latched through `*(gp-30404)` by `0x227D08` | not ported (all five are `0x21EB80`/`0x21F160`, and `0x21F160` is a bare `jr ra`). |
+| `0x21EDB8`'s setting sync | `*(int*)0x22B0E8(item->+0x0C)` | no settings in the port; every item keeps its `.data` value index 0, so the value rows read `4:3`, `On`, `Y Cb/Pb Cr/Pr`. |
+| the Language value row | item 4's +0x10 is NULL | drawn as nothing.  Whatever fills that pointer is outside Module U. |
+| the twelve-hour face and the date | `0x203968()`, `0x22B0E8(6..8)` | the port always draws the 24-hour face, and has no RTC date - `cfgClockDate` is the PS2's own epoch, `2000/01/01`.  Only hh:mm:ss are live (from `MenuClock*`). |
+| the `\7r` / `\7p` escapes | `0x209300` | still skipped by length, as before.  Harmless for these five items: `\7p` is a no-op on fixed-width digits, and id 111's `\7r0.90` only means DIGITAL OUT draws at full size instead of 90%. |
+
+### 8.2 For the menuconfig.c merge (do NOT apply here)
+
+Reading `0x226BB8` for the label ramp turned up two things about the
+**cubes** that `menuconfig.c` currently approximates:
+
+1. the cube colours are **not** the constant `{128,128,128,128}` the
+   `0x27F090` table holds.  `0x226BB8` eases each entry's +0x10 qword
+   through `0x22EC60` at rate 7 toward `0x27EC30` for the item under the
+   cursor and `0x27EC20` = **{100,100,100,128}** for the others, and
+   `0x27EC30` = {128,128,128,128} is itself eased at rate 1 toward
+   `0x27EC10` = **{0,150,200,128}**.  So the selected cube drifts blue
+   and the rest sit at flat grey.
+2. each entry's +0x20 bias is multiplied by `*(gp-32144)` = **0.95**
+   every frame.  All five are 0.0 in `.data`, so nothing visible today,
+   but `MenuConfigCubes()` treats `menuCubeBias[i]` as a constant.
+
+Also: `0x226BB8`'s loop bound is a literal **5**, not `hdr->count`, and
+`configItemAlpha[]` really belongs next to the cube table - the two
+should become one array in the merge.
+
+---
+
+## 9. Verification
+
+Headless PCSX2 (Xvnc :99, software renderer), `ee-gcc 2.9-ee-991111 -O2`,
+clean build, no warnings.  Logs in `logs/`.  "new" = this build, "ref" =
+the committed `896dc63` build at
+`/u/aap/src/ps2rev/osdsys/osdbits/main.elf`.
+
+### 9.1 The fix, before and after
+
+Both the known-good line `menu 12 34 56 0 1 128 145 0 0 0 10 0 1 0 1`
+(enter at frame 1, whole-frame 8x8 dump at 145), rows 12..19 of 28:
+
+**ref** - the five labels crushed into two 8-px rows:
+
+```
+|.................   ...   ====.********** *******+*************:::::::::--------|
+|.::::::::.......     ===:.--==-**********-*********************::::::::::-------|
+|---------:::--:::::::==:-%@+==--:-----------++-----:-:---------:-:---:----------|
+|==::::::::::..........===@@--=--------------++:---------------------------------|
+|...............      +++-%@@+=-----------------:----------.-----:-::::::::------|
+|................ ..::-:::=%@#%-------------------.........::::::::::::::--------|
+```
+
+**new** - the ROM's three rows, title / label / value:
+
+```
+|.................   ...   ====.:::-+++++++++++++.+++++++++++++++=+++++++++------|
+|.::::::::.......     ===:.:===....:+++++++++++++.+++++++++++++++++++++++++------|
+|---------:::--:::::::==:-%@+==....          ++:::::::::----::::::::::::::-------|
+|==::::::::::..........===@@#:*        **********::********************::--------|
+|...............      +++-%@@#=.       **********-*********************::::------|
+|................ ..::-:::=%@#%-. #######*##=###*##.###*##..#-##+#*#*#+#+*##-----|
+```
+
+### 9.2 The rows, read as glyphs
+
+`menu 12 34 56 160 1 128 0 0 0 145 10 0 1 0 0` (`textDump` at 145), the
+2x2-px band, cursor on item 0.  Trimmed at both ends; the `-`/`:` field
+is the TEXCKABE tunnel behind the text.
+
+Title row, y 88 - **System Configuration**:
+
+```
+::::::::: ++.   ++. --   .=: .====.  =++=.+=-===:::-=:==::==- ......-++....-+= . -===.. -=-==-..:=++- -= ..-==--- -=.:.-= :=:==...-===:::.=++=..
+......... -+=+++=:  =+-  ++  ++..++  :+=: .++-:=+= =+=:=+=:-++ .... =+.........:++:.=+= ++=:-++ .=+-. =+ .++--=++ =+.:.=+.-++=:. =+:.=+-:.:+=:.
+.........:=: ..-+++  =+:++:  -++-++.  +=  -+=---++ =+. :+:  ++ .... =+:.... =- =+... ++ ++ . ++ .-+:. =+ -+:.. ++ =+.:.=+.-+-.:: ++-==+-:: +=.:
+......... ++=:.:=++   +++-  .+=. -+=  ++  .++: -+- =+. :+:  ++ ......+++:.-++= -++..-++ ++ . ++ .-+:. =+ .++=-=++ =+-.-++.-+-.:::+=.:=+-::.++.:
+.........  -++++=:    .+=    :++++=   -++:  =+++-  =+  .+:. += .......:=+++=.....=+++-. =+ ..+= .:+:. =+  ----:++  =++==+ -+::::.-+++-++.:.=++:
+```
+
+Label row, y 112 - **Clock Adjustment**:
+
+```
+                         +******- =*-         .-*%@%*-:**.-------------.***.--------:+*.:.*+.-----------:::... *+.:::::::::::::::::::::
+                        **+   :**:=*-  -+**=  ..-***=:.**.:.++.-------.**-**.---.=**=+*.:.+= =+:-:=+.::+**+.. +**+. +-+*+.=**:::.-**+::.
+                       :**        =*- **+:=**:.**+:+*+ **:***:.:::::::=*+ **+:-.**=:+**...** **.-:**..**::** .-**:..**=-**+-**-.**=:+** 
+                       :**     :+-=*-.*+   .*+=*- .    +****:........:*******..=*-...+*.. ** **...**. +**+**:..** ..*+..**..-*==**===** 
+                        +**+::+**.=*- **= :**-.**-.-** +*. **+ ..... **-...:** :**-.=**.. ** **+.=**.:**..=**..**...*+..**..-*=:**-.=*+ 
+                          =****=  =*-  =****.  .+***+  +*.. +*-.....-*+.....+*:..****=*...**  ****+*..-****+.:.+**-.*=..**.:-*-:.+***=. 
+```
+
+Value row, y 130 - **2000/01/01 12:34:56** (the clock, `hh:mm:ss` from
+argv 12/34/56, date the epoch placeholder of §8.1):
+
+```
+    +#+=*#-  .*#++#*.  .*#++#*....*#++#*..-*#%++#::.*#++#*.......+#-.......+#:..*#++#*.......+#-............+#-:::.+#+=*#=:::::.+*+++*+.
+   =#+  .##  *#-  -#*  *#-  -#*  *#-  -#*.*%%++#*:.*#-::-#* ...+*##-..... +#*  *#-..-#* ...+*##-..........+*##-:::=#+...## .++ .#+ . *# 
+       :*#* .##    ##..## .. ##..## .. ##.%%++#+:-.##:-=:##.:::. =#-.... +#+...##....##..... =#-........:::.=#-:::.. .:*#*.::::::::***+ 
+    :***+:  .##    ##..## .. ##..## .. ##.%*+#+:--.##:--:##.----.=#-....+#+....## ...##..... =#-........:::.=#-:::::***+::::::.--...:*#=
+   =#*:::::  *#+::*#*  *#+::*#*  *#+::*#*.-+#+-++=:*#+::*#*:====:=#-::.+#+.... *#+::*#* .....=#-........:::.=#-:::=#*:::::..** +##-:=##=
+   +******* . -****- .. -****- .. -****- ..==:=++++--****-:----=-=*---.==.......-****-.......=*:.....::::::.=*:::.+******* ::::::+***+.:
+```
+
+The title is visibly dimmer than the other two, which is `0x27B860`'s
+{110,110,0} (mean 73) against {30,110,156} (99) and {96,96,96} (96).
+
+### 9.3 A different item
+
+Same run with the cursor on item 3.  Only one item is ever up, and both
+its rows change together - label **Component Video Out**, value
+**Y Cb/Pb Cr/Pr**:
+
+```
+                  =**:   +*+  .=**+:  =+-**-:+*+  ++-**+.:+*==**+:-.++=**+.--:+**=:--+-+**-:.+**+:-----.**---.**: =+ ..=**=+*...-**+::::
+                  **.        -**-:*** ***:+**-=** ***:-**- -**-:*** ***-=** ***:-**:=**=-**-.-**-.-----:.**..+*+: **..**=:+**..**=:+** 
+...
+                                  . =#* .. *#-*#%#*=.+*+****- .#+ ..........+#:.##+++**- +#.............-****+*+
+                                  .. +** :##=+%%%#+.*#+:--:##:.#++++= .... +#* .#*....## +#:**+:.......=##:.:.=#+ =+=*+.
+```
+
+**Caveat, and a real find:** `cfgCursor` is `OsdArgInt(15)`, i.e. gameargs
+token **16** - and PCSX2 delivers **at most 16 argv entries**.  A 17-token
+`-gameargs` arrives as `argc = 16` with the last token dropped, so
+`OsdArgInt(15)` always takes its default and **argv slot 16 is
+unreachable**.  This run was therefore made from a build whose only
+change was `OsdArgInt(15, 3)`; the delivered build has `OsdArgInt(15, 0)`
+back.  (`docs/menu-config.md` §11's `... 0 2` config run has the same
+problem - it was really a cursor-0 run.)  Fixing it means freeing a slot
+in `main.c`, which is outside this task's file budget.
+
+### 9.4 The main menu is unchanged
+
+* `menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1` (the known-good line), whole
+  8x8 frame at 60: **`diff` of new vs ref is empty**.
+* `menu 12 34 56 200 1 0 0 0 0 140 10 0 0 0 1` (fade allowed to run, so the
+  labels are actually up; 2x2 text band at 140): **`diff` of new vs ref is
+  empty**.  Both show the two labels, `Browser` bright and
+  `System Configuration` dim:
+
+```
+                                                           ********.
+                                                           **    +*- ****+  -**+*+  +*. :*+  ** :**+**.  +*+**- -*+**.
+                                                           **===**+  **+.  =*+  -** :** ***:-*+ +*+:.+= **-..**==**:
+                                                           **    :** **    +*.   **  +*-*-****  .-***** *******==*=
+                                                           ********+ **    :**+=***   *** +**-  ***=+** +**++**:=*=
+            :-------                    -:                             :--::---.                   .-:: :-
+            --.   ::. --   .-. ::::::  :--:. .:::::  :-::::::--.      :--    .--  .:::-:  --::--. .---: :-  .:::::- :-   :- .-:-:  .:::::
+            .:--::-:  .-:  --  --. ::   -:  .--  .-- :-. .-:  --      :-         :-:  .-- --.  --  .-.  :- .--  .-- :-   :- .--.   --  :-:
+           .-:    :--  :-:--    ::-:-.  -:  :-:::::: :-  .-.  --      :-:     -- :-    -- --   --  .-.  :- .-:   -- :-   :- .-.   .-::::-:
+            ---:::--:   :--.  .--:.:-:  --:  ---::-: :-  .-.  --       :---::--. .--:.--: --   --  .-.  :-  ----:-- :--::-- .-.   .--:::--
+```
+
+### 9.5 The leave path
+
+`menu 12 34 56 0 1 128 220 0 0 0 10 0 1 140 1` (enter 1, leave 140, dump
+220): tunnel, rods, cubes and all three text rows gone, black backdrop
+and the orb cluster back - the same end state
+`docs/menu-config.md` §11 records.
+
+---
+
+## 10. Deliverables
+
+* `cfgtext.diff` - `diff -ru` of `/u/aap/src/ps2rev/osdsys/osdbits`
+  against `cfgtext/osdbits`, excluding `*.o *.elf res gsdump* core* *.png
+  *.orig *.ai-reference *.annotated *.map`.  **Only `menutext.c`.**
+* `ascii.sh` - the config harness with one change: it kills only the
+  `pcsx2-qt` whose command line names our own ELF (a parallel agent had
+  one of its own running), and takes `ELF=` from the environment so the
+  committed build can be run through the same path.
+* `logs/` - every run above.

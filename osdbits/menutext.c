@@ -25,11 +25,15 @@
  * What is here: the ASCII half of 0x209640 (draw) and 0x209998
  * (measure), the glyph emitter 0x2086A0, the scale/pen/colour setters,
  * the centred wrapper 0x21DC88, the main menu's draw loop 0x228110,
- * its open/close state machine 0x228050 and its alpha 0x227E18.
+ * its open/close state machine 0x228050 and its alpha 0x227E18, and the
+ * System Configuration screen's 0x227560 with the two item widgets it
+ * reaches on that screen (0x21EE78 and 0x21E350 -> 0x21DFF8).
  * What is NOT: the two-byte (Shift-JIS) path and its VRAM glyph cache
  * (0x208460's kinds 1..3, 0x208C60's 72-slot LRU), the 0x07 escape
- * sequences beyond skipping them, the button hint bar (0x21D7F8), the
- * clock (0x21D3A0), and every screen other than the main menu.
+ * sequences beyond skipping them (which costs the config screen its
+ * page marker, an FNTEXOSD glyph), the button hint bar (0x21D7F8), the
+ * clock (0x21D3A0), the config items' value sub-screens (each item's
+ * +0x14 and +0x1C callbacks), and every other screen.
  *
  * Extra argv (menu mode), continuing menu.c's list:
  *     main.elf menu hh mm ss framelimit fromOpening fadeAlpha
@@ -415,9 +419,13 @@ static struct
 
 static MtTimer mainMenuAnim;	/* real: 0x27BEA8 */
 
-/* real 0x27B830 / 0x27B840 - selected (blue) and unselected (grey) */
+/* real 0x27B830 / 0x27B840 - selected (blue) and unselected (grey), and
+ * 0x27B850 / 0x27B860, which only the System Configuration screen uses:
+ * the dim grey of its value rows and the olive of its page title */
 static const int colSelected[4] = { 30, 110, 156, 128 };
 static const int colUnselected[4] = { 44, 44, 44, 128 };
+static const int colDim[4] = { 96, 96, 96, 128 };
+static const int colTitle[4] = { 110, 110, 0, 128 };
 
 /* real *(gp-30396) = refreshRate/6, set by 0x228460 alongside the Anim's
  * duration - both 10 on NTSC.  0x228050 uses it as the fade offset at
@@ -436,6 +444,14 @@ static int menuTextDumpFrame;	/* NOT original: argv[9] */
 #define TDX1 608
 #define TDY0 88
 #define TDY1 136
+/* the System Configuration screen's three rows are 88 / 112 / 130 and its
+ * clock value is wider than any main-menu label, so the window opens up
+ * while that screen is up.  The main menu's stays exactly as it was, so
+ * its readback is still comparable byte for byte with older builds. */
+#define TCX0 224
+#define TCX1 640
+#define TCY0 80
+#define TCY1 152
 
 /* called from DoMenuScene right after WaitNextFrame (swap-thread quiet
  * window - see menu.c); par = the parity of the buffer just drawn */
@@ -452,7 +468,13 @@ MenuTextDump(int par)
 	sceGsStoreImage si;
 	u32 *px;
 	int x, y, i, j, l, best;
-	char line[(TDX1-TDX0)/2 + 2];
+	int x0, x1, y0, y1;
+	char line[(TCX1-TCX0)/2 + 2];
+
+	x0 = TDX0; x1 = TDX1; y0 = TDY0; y1 = TDY1;
+	if(MenuConfigOpen()) {
+		x0 = TCX0; x1 = TCX1; y0 = TCY0; y1 = TCY1;
+	}
 
 	sceGsSyncPath(0, 0);
 	sceGsSetDefStoreImage(&si, par == 0 ? 0 : (screenW*screenH)/64,
@@ -463,9 +485,9 @@ MenuTextDump(int par)
 	sceDevVif1Reset();	/* clear the reversed FIFO - see DumpFrameAscii */
 
 	px = UNCACHED(TEXTFBDUMP);
-	printf("text band x %d..%d y %d..%d, 2x2 px blocks:\n", TDX0, TDX1, TDY0, TDY1);
-	for(y = TDY0; y < TDY1; y += 2) {
-		for(x = TDX0; x < TDX1; x += 2) {
+	printf("text band x %d..%d y %d..%d, 2x2 px blocks:\n", x0, x1, y0, y1);
+	for(y = y0; y < y1; y += 2) {
+		for(x = x0; x < x1; x += 2) {
 			best = 0;
 			for(j = 0; j < 2; j++)
 				for(i = 0; i < 2; i++) {
@@ -474,9 +496,9 @@ MenuTextDump(int par)
 					if(l > best)
 						best = l;
 				}
-			line[(x-TDX0)/2] = ramp[best*10/256];
+			line[(x-x0)/2] = ramp[best*10/256];
 		}
-		line[(TDX1-TDX0)/2] = 0;
+		line[(x1-x0)/2] = 0;
 		printf("|%s|\n", line);
 	}
 }
@@ -496,52 +518,318 @@ MainMenuAlpha(int fadeAlpha)
 
 /* ================= the System Configuration item list =================
  *
+ * The screen's drawer is 0x227560, the third of the four calls 0x227DE8
+ * makes (timerStep, 0x227390's state machine, 0x227560's draw, and the
+ * tail 0x227D08, which is only the focus notify plus the dispatch to a
+ * pad handler - 0x2279B8 for mode 0, 0x227BE8 for mode 1).
+ *
  * Its page header is static data at 0x27BE28 - {title 91 "System
- * Configuration", items 0x27BD10, count 5, rows 0, cursor 0} - and the
- * five 56-byte item records give the string ids below plus each item's
- * own widget callbacks (0x21DF28 and friends, none of them ported).
- * The five cubes menuconfig.c draws are these five items. */
+ * Configuration", items 0x27BD10, count 5, ...} - and +0x0C is NOT a row
+ * count: 0x228708, which 0x227560 calls right after the title, rewrites
+ * it every frame with the WIDEST item label's measured width.  +0x18 is
+ * the mode (0 = the item list, 1 = one item expanded into its value
+ * list), +0x34 a free-running phase counter (below).
+ *
+ * The layout 0x227560 lays down is three fixed rows, all centred on
+ * x = 430 like the main menu's:
+ *
+ *     y = 88            the page title, colour 0x27B860
+ *     y = 88 + 24       the item label,  colour 0x27B830
+ *     y = 88 + 42       the item value,  colour 0x27B850
+ *
+ * (101 / +27.6 / +48.3 on PAL - i.e. the same 88, 24 and 42 times the
+ * 1.15 base scale, added as doubles and truncated.)  Three rows for five
+ * items, because the ROM shows exactly ONE item at a time: each item's
+ * label alpha is `(itemAlpha[i] * pageAlpha) >> 7' where itemAlpha[i] is
+ * *(0x27F090 + i*48 + 0x24), which 0x226BB8 ramps +8 per frame toward
+ * 128 for the item under the cursor and -8 toward 0 for the other four.
+ * The five cubes menuconfig.c draws are these five items, and their
+ * colours come off the same ramp; the label is the cube's caption, not a
+ * row in a list.  (This is what the previous stopgap got wrong: it drew
+ * all five labels at once, hung off the cubes' projected positions, so
+ * they piled up wherever the cubes clustered.)
+ *
+ * Each item's own value row is its widget at +0x18 - 0x21EE78 for four
+ * of the five (look the current setting up in the item's value list and
+ * draw its string centred) and 0x21E350 for Clock Adjustment (the six
+ * clock fields with their separators).  The +0x1C widget is the mode-1
+ * drawer (the expanded value list) and +0x14 the confirm callback that
+ * opens the item; neither is ported - each is a whole sub-screen. */
 
-/* real: 0x27BD10 + n*56 + 0x00 */
-static const int configItemStr[5] = { 106, 107, 111, 114, 117 };
-static int configCursor;
-
-/* Where the labels go is NOT the ROM's: 0x227D08 hands the drawing to
- * each item's own widget, and those are unported.  The port hangs each
- * label off its cube's projected position instead, which at least keeps
- * the two halves of the screen consistent with each other. */
-static void
-DrawConfigMenu(int fadeAlpha)
+/* real: the value lists at 0x27BC20 / 0x27BCB0 / 0x27BBC0, 48-byte
+ * records of which the draw path reads only +0x00 (the setting value)
+ * and +0x04 (its string id).  Component Video Out really is stored in
+ * that order, RGB second. */
+typedef struct ConfigValue ConfigValue;
+struct ConfigValue
 {
-	const int *col;
-	float x, y;
-	int i, alpha;
+	int value;		/* real +0x00 */
+	int strid;		/* real +0x04 */
+};
 
-	alpha = MenuConfigAlpha(fadeAlpha);
-	if(alpha < 16)
-		return;
-	osdTextSetScale(1.0f);
-	for(i = 0; i < 5; i++) {
-		if(!MenuConfigItemPos(i, &x, &y))
-			return;
-		col = i == configCursor ? colSelected : colUnselected;
-		drawTextL(screenW/2 + (int)x + 24, screenH/2 + (int)y - 10,
-			col, alpha, osdGetString(configItemStr[i]));
+static const ConfigValue cfgScreenSize[3] =	/* real: 0x27BC20 */
+	{ { 0, 108 }, { 1, 109 }, { 2, 110 } };
+static const ConfigValue cfgDigitalOut[2] =	/* real: 0x27BCB0 */
+	{ { 0, 112 }, { 1, 113 } };
+static const ConfigValue cfgComponent[2] =	/* real: 0x27BBC0 */
+	{ { 1, 116 }, { 0, 115 } };
+
+/* real: the 56-byte item records at 0x27BD10 + n*56, with the fields the
+ * draw path touches.  The six callbacks live at +0x14..+0x28; `draw' is
+ * +0x18.  0x21EDB8, which every widget runs first, re-syncs +0x08 from
+ * the live setting *(int*)0x22B0E8(+0x0C) - the port has no settings, so
+ * +0x08 keeps the .data value (0 for all five). */
+typedef struct ConfigItem ConfigItem;
+struct ConfigItem
+{
+	int strid;			/* real +0x00 */
+	int nvalues;			/* real +0x04 */
+	int value;			/* real +0x08 */
+	int setting;			/* real +0x0C */
+	const ConfigValue *values;	/* real +0x10 */
+	void (*draw)(struct ConfigItem*, int, int, int);	/* real +0x18 */
+};
+
+static void DrawItemValue(ConfigItem*, int, int, int);	/* real: 0x21EE78 */
+static void DrawItemClock(ConfigItem*, int, int, int);	/* real: 0x21E350 */
+
+static ConfigItem configItems[5] = {
+	{ 106, 6, 0, 0, nil,           DrawItemClock },
+	{ 107, 3, 0, 0, cfgScreenSize, DrawItemValue },
+	{ 111, 2, 0, 1, cfgDigitalOut, DrawItemValue },
+	{ 114, 2, 0, 2, cfgComponent,  DrawItemValue },
+	{ 117, 0, 0, 3, nil,           DrawItemValue },
+};
+
+/* real: 0x27BE28 */
+static struct
+{
+	int title;		/* +0x00 */
+	ConfigItem *items;	/* +0x04 */
+	int count;		/* +0x08 */
+	int maxw;		/* +0x0C, rewritten by 0x228708 every frame */
+	int cursor;		/* +0x10 */
+	int top;		/* +0x14 */
+	int mode;		/* +0x18 */
+} configMenu = { 91, configItems, 5, 0, 0, 0, 0 };
+
+#define configCursor configMenu.cursor
+
+/* real: *(0x27F090 + i*48 + 0x24), ramped by 0x226BB8 (the cube stage's
+ * first half, 0x226FA8 -> 0x226CF8).  It lives in the cube placement
+ * table because it is the same number that drives each cube's colour
+ * ease; the port keeps it here because menuconfig.c is not this task's
+ * to touch, and the merge should fold the two together. */
+static int configItemAlpha[5];
+
+/* real: 0x227560's three row positions, derived in InitMenuText */
+static int cfgTitleY, cfgLabelY, cfgValueY;
+
+/* real: 0x27B870, six 12-byte {field kind, min, max} records.  Only the
+ * kind reaches the draw path; the ranges belong to the editor 0x21E3B8. */
+static const int cfgClockField[6][3] = {
+	{  6, 2000, 2099 },	/* year   */
+	{  7,    1,   12 },	/* month  */
+	{  8,    1,   31 },	/* day    */
+	{  9,    0,   23 },	/* hour   */
+	{ 10,    0,   59 },	/* minute */
+	{ 11,    0,   59 },	/* second */
+};
+
+/* real: the separator jump table at 0x2A4860.  The one after the day is
+ * the odd one out - 0x21E27C measures " " and advances the pen without
+ * ever drawing it. */
+static const struct { const char *s; int draw; } cfgClockSep[6] = {
+	{ "/", 1 }, { "/", 1 }, { " ", 0 }, { ":", 1 }, { ":", 1 }, { nil, 0 }
+};
+
+/* NOT original: the ROM's clock fields come from *(int*)0x22B0E8(6..8),
+ * the RTC snapshot; osdbits has hh:mm:ss from argv and no date at all,
+ * so the date reads as the PS2's own epoch. */
+static const int cfgClockDate[3] = { 2000, 1, 1 };
+
+/* real: the ROM sprintfs each field with "%04d" (year), "%2d" (hour) or
+ * "%02d" (the rest) - 0x2A7858 / 0x2A7868 / 0x2A7860. */
+static void
+cfgFmtNum(char *p, int v, int width, int zero)
+{
+	char tmp[12];
+	int n;
+
+	if(v < 0)
+		v = 0;
+	n = 0;
+	do {
+		tmp[n++] = '0' + v%10;
+		v /= 10;
+	} while(v && n < 11);
+	while(n < width)
+		tmp[n++] = zero ? '0' : ' ';
+	while(n > 0)
+		*p++ = tmp[--n];
+	*p = 0;
+}
+
+/* real: 0x21DFF8, reached through item 0's +0x18 widget 0x21E350 with
+ * its edit flag clear, so every field draws in 0x27B850 and the focused
+ * one is not picked out (0x21E3B0 passes 1 and splits the colours into
+ * 0x27B830 for the field being edited and 0x27B840 for the rest - that
+ * is the Clock Adjustment editor, not this screen).
+ *
+ * The whole string is centred by measuring the template at 0x2A47F0,
+ * "0000/00/00 00:00:00", and stepping a left-aligned pen from there.
+ * 0x203968() returns 1 for the twelve-hour face, which swaps in the
+ * longer template at 0x2A47C8 and appends " AM"/" PM" at 66% size after
+ * the seconds (0x2A4808 / 0x2A4820); the port has no such setting and
+ * always draws the 24-hour face.  The ROM also brackets every field with
+ * \7p@0 / \7p00 (fixed-width on the width of '0'), which is a no-op for
+ * the Latin face - '0'..'9' are all {5, 23} in the 0x26FE60 metrics. */
+static void
+DrawItemClock(ConfigItem *it, int x, int y, int alpha)
+{
+	char buf[16];
+	int i;
+
+	x -= osdTextWidth("0000/00/00 00:00:00")/2;
+	for(i = 0; i < it->nvalues; i++) {
+		switch(cfgClockField[i][0]) {
+		case 6:  cfgFmtNum(buf, cfgClockDate[0], 4, 1); break;
+		case 7:  cfgFmtNum(buf, cfgClockDate[1], 2, 1); break;
+		case 8:  cfgFmtNum(buf, cfgClockDate[2], 2, 1); break;
+		case 9:  cfgFmtNum(buf, (int)MenuClockHours(), 2, 0); break;
+		case 10: cfgFmtNum(buf, (int)MenuClockMinutes(), 2, 1); break;
+		default: cfgFmtNum(buf, (int)MenuClockSeconds(), 2, 1); break;
+		}
+		drawTextL(x, y, colDim, alpha, buf);
+		x += osdTextWidth(buf);
+		if(cfgClockSep[i].s == nil)
+			continue;
+		if(cfgClockSep[i].draw)
+			drawTextL(x, y, colDim, alpha, cfgClockSep[i].s);
+		x += osdTextWidth(cfgClockSep[i].s);
 	}
 }
 
-/* real: the System Configuration screen's own share of 0x2279B8's
- * UP/DOWN arms.  Confirm is not wired: each item's widget callback
- * (0x27BD10 + n*56 + 0x14) is a whole sub-screen and none are ported. */
+/* real: 0x21EE78 - 0x21EDB8, then the item's current value's string,
+ * centred, in 0x27B850.  Language's list pointer is 0 in .data and
+ * nothing in Module U fills it in (0x21F168, its +0x1C widget, reads the
+ * same pointer), so the port draws no value row for it. */
+static void
+DrawItemValue(ConfigItem *it, int x, int y, int alpha)
+{
+	if(it->values == nil || (u32)it->value >= (u32)it->nvalues)
+		return;
+	drawTextC(x, y, colDim, alpha, osdGetString(it->values[it->value].strid));
+}
+
+/* real: 0x228708 - the widest item label, into the header's +0x0C */
+static int
+ConfigMenuWidest(void)
+{
+	int i, w, best;
+
+	best = 0;
+	for(i = 0; i < configMenu.count; i++) {
+		w = osdTextWidth(osdGetString(configMenu.items[i].strid));
+		if(w > best)
+			best = w;
+	}
+	return best;
+}
+
+/* real: 0x226BB8's share of the cube stage - the per-item ramp that
+ * makes the screen a one-item-at-a-time display.  (The rest of 0x226BB8
+ * eases each cube's colour toward 0x27EC10 for the item under the cursor
+ * and 0x27EC20 for the others through 0x22EC60, and decays the entry's
+ * +0x20 bias by *(gp-32144) = 0.95 a frame; that half belongs to
+ * menuconfig.c.) */
+static void
+ConfigMenuStepItems(void)
+{
+	int i, a;
+
+	for(i = 0; i < configMenu.count; i++) {
+		a = configItemAlpha[i] + (i == configCursor ? 8 : -8);
+		configItemAlpha[i] = clamp(a, 0, 128);
+	}
+}
+
+/* real: 0x227560.  Note that only the LABEL's column is pulled left when
+ * it would overrun the right margin; the title and the value rows keep
+ * the literal 430, and the marker's column is clamped off the header's
+ * widest-label field instead of this item's. */
+static void
+DrawConfigMenu(int fadeAlpha)
+{
+	const char *label;
+	int i, alpha, a, x, right, gap;
+
+	/* real: 0x227560 bails on timerIsState(0x27BE44, 0), and also on
+	 * timerIsState(0x27EC40, 2) - a value sub-screen fully up hides the
+	 * item list.  0x27EC40 has no counterpart here. */
+	if(!MenuConfigOpen())
+		return;
+	alpha = MenuConfigAlpha(fadeAlpha);
+
+	/* real: 0x22A3B8(0x1F0A10, evenOddFrame, 0, field) then
+	 * 0x22A0C0(1, 2), exactly as the main menu's 0x228110 does */
+	osdTextSetScale(1.0f);			/* real: 0x207F68(1.0) */
+
+	drawTextC(430, cfgTitleY, colTitle, alpha,
+		osdGetString(configMenu.title));
+	configMenu.maxw = ConfigMenuWidest();	/* real: 0x228708 */
+
+	/* real: s7, the width of the one-space string at 0x2A79A8, which is
+	 * the gap between the label and the page marker.  The marker itself
+	 * is the string at gp-30416, "\7o020" - escape 'o' emits glyph 20 of
+	 * the kind-2 (FNTEXOSD) table, which this port does not upload, so
+	 * the marker is NOT drawn.  0x227560 puts it left-aligned at
+	 * x = 430 + maxw/2 + gap on the label row, in 0x27B850, at an alpha
+	 * of |128 * sinf(header->+0x34 / 10000)|; the header's +0x34 is a
+	 * sawtooth that 0x227390's tail steps by 310 a frame and folds at
+	 * +-31400 (refreshRate*31400/60), and 0x21EE50 zeroes on entering an
+	 * item.  Its width is 0 here, which is the only reason the clamp
+	 * below can leave it out. */
+	gap = osdTextWidth(" ");
+
+	for(i = 0; i < configMenu.count; i++) {
+		/* real: (itemAlpha * pageAlpha) >> 7, with the ROM's round-to-
+		 * zero fixup for a negative product that cannot happen here */
+		a = configItemAlpha[i] * alpha / 128;
+		label = osdGetString(configMenu.items[i].strid);
+
+		x = 430;
+		right = x + gap + osdTextWidth(label)/2;
+		if(right >= screenW - 24)
+			x -= right + 24 - screenW;
+
+		if(a == 0)
+			continue;
+		/* real: mode 1 draws the label in 0x27B850 and hands the row to
+		 * the +0x1C widget for the cursor item; mode 0 is this arm */
+		drawTextC(x, cfgLabelY, colSelected, a, label);
+		configMenu.items[i].draw(&configMenu.items[i], 430, cfgValueY, a);
+	}
+}
+
+/* real: the System Configuration screen's own share of 0x2279B8 (the
+ * mode-0 pad handler 0x227D08 dispatches to).  The cursor WRAPS at both
+ * ends there, unlike the main menu's, and each move fires the item's
+ * +0x28 focus callback twice, off the old item and onto the new one.
+ * Confirm is not wired: 0x2279B8's CIRCLE arm calls the item's +0x14
+ * (0x21DF28 for Clock Adjustment, 0x21EE50 for the rest) and sets the
+ * header's mode to 1, which is a whole sub-screen. */
 static void
 ConfigMenuInput(void)
 {
 	if(!MenuConfigOpen())
 		return;
-	if((pad.dirPress & PAD_UP) && configCursor > 0)
-		configCursor--;
-	if((pad.dirPress & PAD_DOWN) && configCursor < 4)
-		configCursor++;
+	if(pad.dirPress & PAD_UP)
+		if(--configCursor < 0)
+			configCursor = configMenu.count-1;
+	if(pad.dirPress & PAD_DOWN)
+		if(++configCursor >= configMenu.count)
+			configCursor = 0;
 	/* real: 0x2279B8's TRIANGLE arm leaves the screen (0x2210C8) */
 	if(pad.press & PAD_TRIANGLE)
 		MenuLeaveConfig();
@@ -630,7 +918,17 @@ InitMenuText(void)
 
 	mainMenu.cursor = clamp(OsdArgInt(7, 0), 0, mainMenu.count-1);
 	/* real: 0x27BE28's cursor, moved by 0x2279B8's UP/DOWN arms */
-	configCursor = clamp(OsdArgInt(15, 0), 0, 4);
+	configCursor = clamp(OsdArgInt(15, 0), 0, configMenu.count-1);
+	memset(configItemAlpha, 0, sizeof(configItemAlpha));
+
+	/* real: 0x227560's own three rows.  The title's y is a literal 88,
+	 * or 101 when 0x204350() (IsPAL) says so, and the two rows under it
+	 * are that plus the doubles 24.0 / 42.0, or 27.6 / 48.3 on PAL - the
+	 * same two numbers times the 1.15 base scale do_load_font hands
+	 * 0x2080D0.  The ROM adds them as doubles and truncates. */
+	cfgTitleY = IsPAL() ? 101 : 88;
+	cfgLabelY = (int)((double)cfgTitleY + (IsPAL() ? 27.6 : 24.0));
+	cfgValueY = (int)((double)cfgTitleY + (IsPAL() ? 48.3 : 42.0));
 
 	printf("osdsys: menu text, cursor %d (\"%s\")\n",
 		mainMenu.cursor, osdGetString(mainMenuItems[mainMenu.cursor].strid));
@@ -684,6 +982,9 @@ MenuTextFrame(int fadeMode, int fadeAlpha)
 {
 	if(!menuTextEnable)
 		return;
+	/* real: 0x226BB8, from the cube stage 0x226FA8 - one hub slot ahead
+	 * of both 2D layers, and running whether or not the screen is open */
+	ConfigMenuStepItems();
 	mtStep(&mainMenuAnim);
 	MainMenuStep(fadeMode, fadeAlpha);
 	MainMenuInput();
