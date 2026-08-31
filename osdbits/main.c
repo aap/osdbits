@@ -9,7 +9,6 @@
 #include <libvu0.h>
 #include <sifdev.h>
 #include <sifrpc.h>
-#include <libpad.h>
 
 #include "inc.h"
 #include "res.h"
@@ -180,6 +179,11 @@ main(int argc, char *argv[])
 	}
 
 	LoadResources();
+
+	/* before the opening thread exists: InitPad brings up the SIF RPC
+	 * layer and waits on the IOP's loadfile server, and nothing that
+	 * runs after this point should be doing that mid-frame */
+	InitPad();
 
 	MakeOpeningThread();	// this is not quite accurate
 

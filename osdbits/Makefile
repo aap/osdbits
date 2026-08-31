@@ -19,6 +19,7 @@ OBJS        = crt0.o \
               menu.o \
               menuback.o \
               menutext.o \
+              pad.o \
               towerchain.o \
               $(TARGET).o
 
@@ -28,11 +29,15 @@ LCFILE      = $(LIBDIR)/app.cmd
 # freesce's libvu0.c loses the branch-delay-slot instructions (no .set
 # noreorder around the asm blocks), so e.g. sceVu0MulMatrix writes all
 # four columns to column 0 - flip back to $(LIBDIR) once that's fixed.
+# libopad is the SDK 2.0 libpad and the only one that accepts the boot
+# ROM's padman 3.6 (rom0:XPADMAN) - it goes with pad.c's rom0: module
+# loading and with nothing else.  freesce is the only tree that has it.
 LIBS        = $(LIBDIR)/libgraph.a \
               $(SCETOP)/lib/libvu0.a \
               $(LIBDIR)/libdma.a \
               $(SCETOP)/lib/libpkt.a \
-              $(SCETOP)/lib/libdev.a
+              $(SCETOP)/lib/libdev.a \
+              $(LIBDIR)/libopad.a
 
 PREFIX      = ee
 AS          = $(PREFIX)-gcc

@@ -1063,6 +1063,10 @@ DrawFadeCurtain(void)
 static void
 MenuFrame(void)
 {
+	/* NOT original: the pad, read once per frame before anything looks
+	 * at it (menutext.c's MainMenuInput is the only consumer so far).
+	 * The real menu's buttons come in from the OSD system module. */
+	UpdatePad();
 	/* real: the CLAMP_1 = CLAMP/CLAMP the TEXC bind (0x22AB90 ->
 	 * 0x262308) pushes with every texture; osdbits' vif1SetTexture
 	 * leaves the GS default (REPEAT), which would wrap the halo's
@@ -1202,4 +1206,19 @@ DoMenuScene(void)
 			Exit(0);
 		}
 	}
+}
+
+/* NOT original (a hook, not a reconstruction): where the main menu's
+ * confirm button ends up.  n is the item index - 0 Browser, 1 System
+ * Configuration - i.e. what the ROM's 0x228278 turns into a screen
+ * change (the System Configuration entry is also what opens the timers
+ * the 12-rod carousel and the TEXCKABE tunnel are gated on, 0x27EB00 and
+ * the never-opened 0x27F190).
+ *
+ * Deliberately empty: the System Configuration screen is being built in
+ * parallel and the two get wired together at merge. */
+void
+MenuSelectItem(int n)
+{
+	(void)n;
 }

@@ -11,7 +11,8 @@
 #include <libvu0.h>
 #include <sifdev.h>
 #include <sifrpc.h>
-#include <libpad.h>
+/* the pad library's own header is libopad.h and it belongs to pad.c
+ * alone - see the header comment there for why it is not libpad.h */
 
 #define nil NULL
 typedef u_long128 u128;
@@ -156,3 +157,47 @@ void MenuZoomBlur(void);
 /* ---- menutext.c: the menu's 2D text/item layer ---- */
 void InitMenuText(void);
 void MenuTextFrame(int fadeMode, int fadeAlpha);
+
+/* ---- pad.c: the port-0 controller (NOT original - the retail OSDSYS
+ * gets its buttons from the OSD system module) ---- */
+enum {
+	PAD_L2       = 0x0001,
+	PAD_R2       = 0x0002,
+	PAD_L1       = 0x0004,
+	PAD_R1       = 0x0008,
+	PAD_TRIANGLE = 0x0010,
+	PAD_CIRCLE   = 0x0020,
+	PAD_CROSS    = 0x0040,
+	PAD_SQUARE   = 0x0080,
+	PAD_SELECT   = 0x0100,
+	PAD_L3       = 0x0200,
+	PAD_R3       = 0x0400,
+	PAD_START    = 0x0800,
+	PAD_UP       = 0x1000,
+	PAD_RIGHT    = 0x2000,
+	PAD_DOWN     = 0x4000,
+	PAD_LEFT     = 0x8000
+};
+
+typedef struct Pad Pad;
+struct Pad
+{
+	int connected;		/* padman answered a read this frame */
+	u16 btns;		/* held right now */
+	u16 press;		/* went down this frame */
+	u16 release;		/* went up this frame */
+	u16 dirs;		/* the four directions, dpad OR left stick */
+	u16 dirPress;		/* their edges, plus the held-key repeat */
+	/* sticks, -1..1 with the deadzone applied; down/right positive.
+	 * Zero unless the pad is in analog mode. */
+	float lx, ly;
+	float rx, ry;
+};
+
+extern Pad pad;			/* the pad in port 0 */
+
+int InitPad(void);		/* brings up the SIF RPC layer too */
+void UpdatePad(void);		/* once per frame */
+
+/* ---- menu.c: what the menu's confirm button ends up calling ---- */
+void MenuSelectItem(int n);

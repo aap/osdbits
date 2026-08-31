@@ -34,8 +34,8 @@
  * Extra argv (menu mode), continuing menu.c's list:
  *     main.elf menu hh mm ss framelimit fromOpening fadeAlpha
  *                   debugFrame [cursor [notext]]
- * cursor (default 0) picks the highlighted item - osdbits has no pad,
- * so this stands in for 0x228278's UP/DOWN handling.  notext = 1
+ * cursor (default 0) picks the item the highlight STARTS on; the pad
+ * (pad.c, MainMenuInput below) moves it from there.  notext = 1
  * suppresses the whole 2D layer (for the orbs-only regression run);
  * textDump is a frame number at which to read the item band back out of
  * GS memory and print it at 2x2 px per character, fine enough to read
@@ -575,9 +575,45 @@ InitMenuText(void)
 		mainMenu.cursor, osdGetString(mainMenuItems[mainMenu.cursor].strid));
 }
 
+/* the counterpart of 0x228278, the ROM's main-menu pad handler, on top
+ * of osdbits' own pad layer (pad.c): up/down walk the item list, the
+ * confirm button opens the item.  Only while the menu is fully open -
+ * the ROM's handler is equally unreachable until then.
+ *
+ * The retail cursor is not known to wrap and this one does not either;
+ * argv[7] still picks where it starts.  The confirm button is X or
+ * Circle: which of the two the ROM takes depends on the region flag
+ * 0x204318 reads, and osdbits has no region, so both work. */
+static void
+MainMenuInput(void)
+{
+	int moved = 0;
+
+	if(!mtIsState(&mainMenuAnim, 2))
+		return;
+
+	if((pad.dirPress & PAD_UP) && mainMenu.cursor > 0) {
+		mainMenu.cursor--;
+		moved = 1;
+	}
+	if((pad.dirPress & PAD_DOWN) && mainMenu.cursor < mainMenu.count-1) {
+		mainMenu.cursor++;
+		moved = 1;
+	}
+	if(moved)
+		printf("menu: cursor %d (\"%s\")\n", mainMenu.cursor,
+			osdGetString(mainMenu.items[mainMenu.cursor].strid));
+
+	if(pad.press & (PAD_CROSS|PAD_CIRCLE)) {
+		printf("menu: select item %d (\"%s\")\n", mainMenu.cursor,
+			osdGetString(mainMenu.items[mainMenu.cursor].strid));
+		MenuSelectItem(mainMenu.cursor);
+	}
+}
+
 /* real: 0x2283A0, the main menu's slot in the per-screen hub 0x2283F0 -
  * step the Anim, run the open/close logic, draw.  (0x228278, the pad
- * input, has no counterpart: osdbits reads argv instead.) */
+ * input, is MainMenuInput above.) */
 void
 MenuTextFrame(int fadeMode, int fadeAlpha)
 {
@@ -585,6 +621,7 @@ MenuTextFrame(int fadeMode, int fadeAlpha)
 		return;
 	mtStep(&mainMenuAnim);
 	MainMenuStep(fadeMode, fadeAlpha);
+	MainMenuInput();
 	DrawMainMenu(fadeAlpha);
 	/* the readback itself moved to DoMenuScene's post-swap window */
 }
