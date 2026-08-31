@@ -28,12 +28,21 @@
  * its open/close state machine 0x228050 and its alpha 0x227E18, and the
  * System Configuration screen's 0x227560 with the two item widgets it
  * reaches on that screen (0x21EE78 and 0x21E350 -> 0x21DFF8).
+ * Also here, the "OSD chrome" - stages 6, 7 and 8 of the frame body,
+ * which sit on top of every screen: the letterbox bars (0x21D368), the
+ * date/time header (0x21D3A0) and the button hint bar (0x21DA68 ->
+ * 0x21D7F8), plus the second font page FNTEXOSD that the config
+ * screen's page marker comes off.  Two surprises there: the hint bar's
+ * coloured button glyphs are NOT font glyphs but TEXCMARU sprites
+ * (0x21D590), and its fourth hint - triangle "Options" - is not in the
+ * table at all: it comes from Clock Adjustment's focus callback
+ * arming the caller-supplied set (0x21EB80 -> 0x21D768).
+ *
  * What is NOT: the two-byte (Shift-JIS) path and its VRAM glyph cache
- * (0x208460's kinds 1..3, 0x208C60's 72-slot LRU), the 0x07 escape
- * sequences beyond skipping them (which costs the config screen its
- * page marker, an FNTEXOSD glyph), the button hint bar (0x21D7F8), the
- * clock (0x21D3A0), the config items' value sub-screens (each item's
- * +0x14 and +0x1C callbacks), and every other screen.
+ * (0x208460's kinds 1 and 3, 0x208C60's 72-slot LRU), the 0x07 escapes
+ * other than \7oNNN and \7rN.NN, the config items' value sub-screens
+ * (each item's +0x14 and +0x1C callbacks), the right-edge strip
+ * (0x21DB18), and every other screen.
  *
  * Extra argv (menu mode), continuing menu.c's list:
  *     main.elf menu hh mm ss framelimit fromOpening fadeAlpha
@@ -61,11 +70,25 @@
  *                            language table 0x26ECE0 points at) */
 #include "res/FONTDATA.inc"
 
-/* real: 0x2041B8, minus its two regional swaps (ids 85/86 trade places
- * when 0x204318() says so) */
+/* real: 0x204318 - non-zero on the consoles where the CROSS button
+ * confirms.  It reads a region/version word (0x204238) the port has no
+ * counterpart for, so it is a switch: argv[16], default 1, which is the
+ * arrangement the retail screenshots show (cross "Enter", circle
+ * "Back").  It is used in exactly two places, both below - osdGetString
+ * and 0x21D768 - and they undo each other; see HintSetCustom. */
+static int textRegionSwap = 1;
+
+/* real: 0x2041B8, including its two regional swaps: with the flag set,
+ * ids 85 and 86 trade places, so asking for "Back" yields "Enter". */
 static const char *
 osdGetString(int id)
 {
+	if(textRegionSwap) {
+		if(id == 86)
+			id = 85;
+		else if(id == 85)
+			id = 86;
+	}
 	if((u32)id >= (u32)osdStringTableLen || osdStringTable[id] == nil)
 		return "";
 	return osdStringTable[id];
@@ -87,10 +110,45 @@ osdGetString(int id)
 #define CELLCOLS 8		/* real: the divisor 8 for kind 0 */
 #define NASCII 97		/* real: the `(u32)(c-32) < 97' bound */
 
+/* Slot 3 of the same four-page table: FNTEXOSD, 512x80, PSMT4, TBW 8,
+ * TW 9, TH 7, and the SAME 16-entry CLUT - the symbol page.  It is the
+ * "kind 2" font: 0x2086A0's kind-2 arm is character for character the
+ * ASCII arm with `div 16' instead of `div 8' and the 35-entry metric
+ * table at 0x271460 instead of 0x26FE60, so the page is 16 columns of
+ * the very same 32x40 cell, two rows.  Its glyphs are arrows, triangles,
+ * (R), "(PS2)", a brightness sun and two up/down markers; nothing on it
+ * is coloured - the pen colour supplies that, exactly as for ASCII.
+ * Glyph 20 is the config screen's page marker, glyph 4 the (R) in
+ * string 93 "PlayStation\7o004", glyph 19 the clock's optional prefix. */
+#define OSDFONTW 512
+#define OSDFONTH 80
+#define OSDCOLS 16		/* real: the divisor 16 for kind 2 */
+#define NOSDGLYPH 35		/* real: the 0x271460 table's extent */
+
 static Texture fontTexture = {
 	nil, RESID_FNTASCII, fontClut, 3, { 0, 0, FONTW, FONTH },
 	0, 0, SCE_GS_PSMT4, 0, { 0 }
 };
+
+static Texture fontOsdTexture = {
+	nil, RESID_FNTEXOSD, fontClut, 3, { 0, 0, OSDFONTW, OSDFONTH },
+	0, 0, SCE_GS_PSMT4, 0, { 0 }
+};
+
+/* one row of the ROM's page table at 0x271578 plus the metrics that go
+ * with the kind - everything 0x2086A0 needs once the kind is decided */
+typedef struct GlyphFont GlyphFont;
+struct GlyphFont
+{
+	Texture *tex;
+	const int (*met)[2];
+	int n;
+	int cols;
+	int kind;
+};
+
+static const GlyphFont fontAscii = { &fontTexture, fontAsciiMetrics, NASCII, CELLCOLS, 0 };
+static const GlyphFont fontOsd = { &fontOsdTexture, fontOsdMetrics, NOSDGLYPH, OSDCOLS, 2 };
 
 /* ==================== the text engine's pen state ====================
  *
@@ -108,8 +166,12 @@ static Texture fontTexture = {
 static int textPenX, textPenY;			/* real 0x271858/0x27185C */
 static int textColR, textColG, textColB, textColA;	/* real 0x2DDC20.. */
 static float textBaseScale = 1.0f;		/* real 0x2DDC40 */
-static float textScale = 1.0f;			/* real 0x2DDC44/0x2DDC48 */
+static float textScale = 1.0f;			/* real 0x2DDC44 */
+static float textScaleBase = 1.0f;		/* real 0x2DDC48 */
 static int textGlyphH16;			/* real 0x2DDC50 */
+static int textW16;				/* real 0x2DDC4C */
+static int textPct;				/* real 0x271564 */
+static int textShiftX, textShiftY;		/* real 0x27186C/0x271870 */
 static int textGap = -3;			/* real 0x271860 */
 static int textYBias = -7*8;			/* real 0x271864 */
 static int textAdvMul = 1;			/* real 0x27156C */
@@ -117,15 +179,41 @@ static int textAdvMul = 1;			/* real 0x27156C */
 /* real: 0x207F68.  The ROM's chain of truncations matters - the height
  * is (int)(scale*16) rounded to a whole pixel BEFORE the 1.25 and the
  * base scale are applied, so 1.0 gives exactly 320 (20 px) on NTSC and
- * 368 (23 px) on PAL, not 400 and 460. */
+ * 368 (23 px) on PAL, not 400 and 460.
+ *
+ * The second half is the `\7rN.NN' percentage (0x271564), which the ROM
+ * folds in AFTER the whole-pixel rounding and then splits into a scale
+ * for the advance (0x2DDC44) and two shift terms (0x27186C/0x271870)
+ * that keep the shrunken glyph sitting on the same baseline.  Only
+ * 0x271870 reaches the sprite; 0x27186C is derived and never read on
+ * this path, and is kept only because the arithmetic is one expression.
+ * String 111 "\7r0.90DIGITAL OUT (OPTICAL)\7r0.00" is the reason this is
+ * ported at all: without it that label measures ~11 % too wide, and the
+ * page marker's column is clamped off the WIDEST label. */
 static void
 osdTextSetScale(float scale)
 {
-	int h;
+	int h, w, a2, a4, a5;
 
-	textScale = scale;
+	textScale = textScaleBase = scale;
 	h = (int)(scale*32.0f*0.5f) << 4;
-	textGlyphH16 = (int)((float)h * 1.25f * textBaseScale);
+	w = (int)(scale*32.0f*0.909091f*0.5f) << 4;
+	h = (int)((float)h * 1.25f * textBaseScale);
+	w = (int)((float)w * textBaseScale);
+	textGlyphH16 = h;
+	textW16 = w;
+	if(textPct == 0) {
+		textShiftX = textShiftY = 0;
+		return;
+	}
+	a2 = h*textPct/100;
+	a5 = w*textPct/100;
+	a4 = ((h >= 0 ? h : h+15) >> 4) * textPct / 100;
+	textScale = scale * (float)textPct / 100.0f;
+	textShiftX = w - a5;
+	textShiftY = (h - a2) - a4;
+	textGlyphH16 = a2;
+	textW16 = a5;
 }
 
 /* real: 0x2080D0 - set the base scale, then re-derive from the current
@@ -158,13 +246,13 @@ osdTextSetPos(int x, int y)
  * bounds-checks; a byte outside 32..128 that is not a Shift-JIS lead
  * therefore reads past the table in the ROM.  Guarded here.) */
 static int
-osdGlyphAdvance(int c)
+osdGlyphAdvance(const GlyphFont *f, int g)
 {
 	int w;
 
-	if((u32)(c-32) >= (u32)NASCII)
+	if((u32)g >= (u32)f->n)
 		return 0;
-	w = fontAsciiMetrics[c-32][1];
+	w = f->met[g][1];
 	return (int)(textScale * (float)w * (float)textAdvMul);
 }
 
@@ -180,32 +268,55 @@ osdGlyphAdvance(int c)
  * term the ROM adds is exactly the XYOFFSET_1 the draw environment
  * subtracts, so screen (0,0) is the top-left.  The vertical half-texel
  * insets (+8 / +632 over a 40-row cell) are the ROM's, not mine. */
+static int textBound;	/* real: 0x209640's sp+4, 0x2086A0's `bound' */
+
+/* real: the tail of 0x208460 - the page bind, TCC 1 / MODULATE / CLD 1
+ * and TEX1 = 97 (LINEAR both ways).  osdbits' vif1SetTexture is the same
+ * pair; CLAMP comes with it because 0x262308 always writes CLAMP/CLAMP. */
 static void
-osdDrawGlyph(int c)
+osdBindFont(const GlyphFont *f)
 {
-	int g, col, row;
+	vif1SetTexture(f->tex);
+	vif1SetCLAMP_1(1, 1, 0, 0, 0, 0);
+}
+
+static void
+osdDrawGlyph(const GlyphFont *f, int g)
+{
+	int col, row;
 	int x0, y0, x1, y1;
 	int u0, u1;
 	int xoff16, yoff16;
 	int w16;
 
-	g = c - 32;
-	if((u32)g >= (u32)NASCII)
+	if((u32)g >= (u32)f->n)
 		return;
-	col = g % CELLCOLS;
-	row = g / CELLCOLS;
+	/* real: 0x2086A0's three arms.  Kind 0 binds only when the caller's
+	 * flag is clear and then sets it (one bind per string); kinds 1 and
+	 * 2 bind unconditionally, and 0x209640 clears the flag afterwards,
+	 * so the Latin glyph after a \7o rebinds FNTASCII. */
+	if(f->kind == 0) {
+		if(!textBound) {
+			osdBindFont(f);
+			textBound = 1;
+		}
+	} else
+		osdBindFont(f);
+
+	col = g % f->cols;
+	row = g / f->cols;
 
 	xoff16 = ((4096 - screenW)/2) << 4;
 	yoff16 = ((4096 - screenH)/2) << 4;
 
 	x0 = textPenX + xoff16;
-	y0 = textPenY + yoff16 + (int)(textScale * (float)textYBias);
-	w16 = (int)(textScale * (float)(fontAsciiMetrics[g][1]*textAdvMul)) << 4;
+	y0 = textPenY + yoff16 + (int)(textScaleBase * (float)textYBias) + textShiftY;
+	w16 = (int)(textScale * (float)(f->met[g][1]*textAdvMul)) << 4;
 	x1 = x0 + w16;
 	y1 = y0 + textGlyphH16;
 
-	u0 = col*CELLW + fontAsciiMetrics[g][0];
-	u1 = u0 + fontAsciiMetrics[g][1];
+	u0 = col*CELLW + f->met[g][0];
+	u1 = u0 + f->met[g][1];
 
 	vif1Begin();
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 1, 0, 1, 0, 1, 0, 0));
@@ -224,8 +335,8 @@ osdDrawGlyph(int c)
  * (0x209300 - colour, scale, fixed width, ...); a Shift-JIS lead byte
  * (0x81..0x9F or 0xE0..0xEF - the ROM spells those as
  * `(u8)(c+127) < 31' and `(u8)(c+32) < 16') takes the two-byte path;
- * everything else is one ASCII glyph.  Only the ASCII arm is ported,
- * and the escapes are skipped rather than obeyed - see the header. */
+ * everything else is one ASCII glyph.  The two-byte arm is not ported;
+ * of the escapes, the two the shipped Latin strings actually use are. */
 
 #define ISSJISLEAD(c) ((u8)((c)+127) < 31 || (u8)((c)+32) < 16)
 #define ISESCAPE(c) ((c) == 7 || (c) == 9 || (c) == 10)
@@ -234,42 +345,70 @@ osdDrawGlyph(int c)
  * handled at 0x2095A8); 0x07 introduces a letter that indexes the
  * 25-entry jump table at 0x2A3CB0, and each arm consumes a different
  * number of bytes.  The lengths below are read off each arm's final
- * `*(s) = ...' - they are exact; what the arms DO (set the colour, the
- * size, the fixed width, or emit a kind-2 button glyph) is not ported.
- * Unlisted letters fall through to 0x2095A0 and consume nothing but
- * the introducer. */
+ * `*(s) = ...'.  Two arms are obeyed, both because Module U's own data
+ * needs them:
+ *
+ *   \7oNNN  (0x2094AC) three decimal digits; RETURNS the kind-2 glyph,
+ *           which 0x209640/0x209998 then emit/measure through
+ *           0x2086A0(2, ...) / 0x208610.  "\7o020" (gp-30416) is the
+ *           System Configuration page marker; string 93 ends "\7o004".
+ *   \7rN.NN (0x209400) the percentage size at 0x271564, then re-runs
+ *           0x207F68 on the SAVED scale so the percentages do not
+ *           compound.  String 111 is "\7r0.90...\7r0.00".
+ *
+ * The rest still only advance the pointer.  Unlisted letters fall
+ * through to 0x2095A0 and consume nothing but the introducer. */
 static int
-osdEscapeLen(const char *s)
+osdEscape(const char **ps)
 {
-	if(*s != 7)
-		return 1;		/* 0x09 newline / 0x0A tab */
-	switch(s[1]) {
-	case 'g': case 's':	return 2;	/* 0x2094EC / 0x209558 */
-	case 'c': case 'w':	return 3;	/* 0x20936C / 0x209584 */
-	case 'p':		return 4;	/* 0x20939C */
-	case 'a': case 'o':
-	case 'y':		return 5;	/* 0x209514 / 0x2094AC / 0x209454 */
-	case 'r':		return 6;	/* 0x209400 */
+	const char *s = *ps;
+
+	if(*s != 7) {			/* 0x09 newline / 0x0A tab */
+		*ps = s+1;
+		return -1;
 	}
-	return 1;
+	s++;				/* real: 0x209334 eats the 0x07 */
+	switch(*s) {
+	case 'o':						/* 0x2094AC */
+		*ps = s+4;
+		return (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+	case 'r':						/* 0x209400 */
+		textPct = (s[1]-'0')*100 + (s[3]-'0')*10 + (s[4]-'0');
+		osdTextSetScale(textScaleBase);
+		*ps = s+5;
+		return -1;
+	case 'g': case 's':	*ps = s+1; return -1;	/* 0x2094EC/0x209558 */
+	case 'c': case 'w':	*ps = s+2; return -1;	/* 0x20936C/0x209584 */
+	case 'p':		*ps = s+3; return -1;	/* 0x20939C */
+	case 'a': case 'y':	*ps = s+4; return -1;	/* 0x209514/0x209454 */
+	}
+	*ps = s;			/* real: 0x2095A0 */
+	return -1;
 }
 
-/* real: 0x209998 */
+/* real: 0x209998, whose escape arm measures a returned kind-2 glyph with
+ * 0x208610 - the same expression as 0x208540 against the 0x271460
+ * table.  So "\7o020" is 26 - 3 = 23 px wide, not 0. */
 static int
 osdTextWidth(const char *s)
 {
 	int total = 0;
+	int g;
 
 	while(*s) {
 		if(ISESCAPE(*s)) {
-			s += osdEscapeLen(s);
+			g = osdEscape(&s);
+			if(g >= 0)
+				total += osdGlyphAdvance(&fontOsd, g) +
+					(int)(textScale * (float)textGap);
 			continue;
 		}
 		if(ISSJISLEAD(*s)) {
 			s += 2;
 			continue;
 		}
-		total += osdGlyphAdvance((u8)*s) + (int)(textScale * (float)textGap);
+		total += osdGlyphAdvance(&fontAscii, (u8)*s - 32) +
+			(int)(textScale * (float)textGap);
 		s++;
 	}
 	return total;
@@ -282,24 +421,36 @@ osdTextWidth(const char *s)
 static void
 osdTextDraw(const char *s)
 {
+	int g;
+
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);
-	vif1SetTexture(&fontTexture);
-	/* the ROM's CLAMP_1 comes with the bind (0x262308 always writes
-	 * CLAMP/CLAMP); osdbits' vif1SetTexture leaves the GS default */
-	vif1SetCLAMP_1(1, 1, 0, 0, 0, 0);
+	/* real: 0x209640 clears its own `bound' before the loop, so the
+	 * first glyph binds; the bind itself moved into osdDrawGlyph so a
+	 * kind-2 glyph can take the page away and give it back */
+	textBound = 0;
 
 	while(*s) {
 		if(ISESCAPE(*s)) {
-			s += osdEscapeLen(s);
+			g = osdEscape(&s);
+			if(g < 0)
+				continue;
+			osdDrawGlyph(&fontOsd, g);
+			textPenX += (osdGlyphAdvance(&fontOsd, g) +
+				(int)(textScale * (float)textGap)) << 4;
+			/* real: 0x2096C8's delay slot - the flag is cleared so
+			 * the next Latin glyph rebinds FNTASCII */
+			textBound = 0;
 			continue;
 		}
 		if(ISSJISLEAD(*s)) {
 			s += 2;
 			continue;
 		}
-		osdDrawGlyph((u8)*s);
-		textPenX += (osdGlyphAdvance((u8)*s) + (int)(textScale * (float)textGap)) << 4;
+		g = (u8)*s - 32;
+		osdDrawGlyph(&fontAscii, g);
+		textPenX += (osdGlyphAdvance(&fontAscii, g) +
+			(int)(textScale * (float)textGap)) << 4;
 		s++;
 	}
 	sceGsSyncPath(0, 0);		/* real: 0x262418, the same tail */
@@ -452,6 +603,15 @@ static int menuTextDumpFrame;	/* NOT original: argv[9] */
 #define TCX1 640
 #define TCY0 80
 #define TCY1 152
+/* the two chrome bands: the letterbox' top bar with the date/time header
+ * inside it, and the bottom bar with the button hints.  Full width, so
+ * the hint columns can be read straight off the ruler. */
+#define THX0 0
+#define THX1 640
+#define TTY0 0
+#define TTY1 40
+#define TBY0 184
+#define TBY1 224
 
 /* called from DoMenuScene right after WaitNextFrame (swap-thread quiet
  * window - see menu.c); par = the parity of the buffer just drawn */
@@ -461,31 +621,14 @@ MenuTextDumpFrame(void)
 	return menuTextDumpFrame;
 }
 
-void
-MenuTextDump(int par)
+static void
+MenuTextDumpBand(u32 *px, const char *name, int x0, int x1, int y0, int y1)
 {
 	static const char ramp[] = " .:-=+*#%@";
-	sceGsStoreImage si;
-	u32 *px;
+	char line[(THX1-THX0)/2 + 2];
 	int x, y, i, j, l, best;
-	int x0, x1, y0, y1;
-	char line[(TCX1-TCX0)/2 + 2];
 
-	x0 = TDX0; x1 = TDX1; y0 = TDY0; y1 = TDY1;
-	if(MenuConfigOpen()) {
-		x0 = TCX0; x1 = TCX1; y0 = TCY0; y1 = TCY1;
-	}
-
-	sceGsSyncPath(0, 0);
-	sceGsSetDefStoreImage(&si, par == 0 ? 0 : (screenW*screenH)/64,
-		screenW/64, SCE_GS_PSMCT32, 0, 0, screenW, screenH);
-	FlushCache(0);
-	sceGsExecStoreImage(&si, TEXTFBDUMP);
-	sceGsSyncPath(0, 0);
-	sceDevVif1Reset();	/* clear the reversed FIFO - see DumpFrameAscii */
-
-	px = UNCACHED(TEXTFBDUMP);
-	printf("text band x %d..%d y %d..%d, 2x2 px blocks:\n", x0, x1, y0, y1);
+	printf("%s band x %d..%d y %d..%d, 2x2 px blocks:\n", name, x0, x1, y0, y1);
 	for(y = y0; y < y1; y += 2) {
 		for(x = x0; x < x1; x += 2) {
 			best = 0;
@@ -501,6 +644,39 @@ MenuTextDump(int par)
 		line[(x1-x0)/2] = 0;
 		printf("|%s|\n", line);
 	}
+}
+
+void
+MenuTextDump(int par)
+{
+	sceGsStoreImage si;
+	u32 *px;
+	int x0, x1, y0, y1;
+
+	x0 = TDX0; x1 = TDX1; y0 = TDY0; y1 = TDY1;
+	if(MenuConfigOpen()) {
+		x0 = TCX0; x1 = TCX1; y0 = TCY0; y1 = TCY1;
+	}
+
+	sceGsSyncPath(0, 0);
+	sceGsSetDefStoreImage(&si, par == 0 ? 0 : (screenW*screenH)/64,
+		screenW/64, SCE_GS_PSMCT32, 0, 0, screenW, screenH);
+	FlushCache(0);
+	sceGsExecStoreImage(&si, TEXTFBDUMP);
+	sceGsSyncPath(0, 0);
+	sceDevVif1Reset();	/* clear the reversed FIFO - see DumpFrameAscii */
+
+	px = UNCACHED(TEXTFBDUMP);
+	/* the item band keeps its exact old window so its readback is still
+	 * comparable line for line with pre-chrome builds */
+	MenuTextDumpBand(px, "text", x0, x1, y0, y1);
+	/* the chrome spans the whole width, and 320 characters is past what
+	 * the emulator's log will keep on one line, so each bar comes out in
+	 * two halves */
+	MenuTextDumpBand(px, "chrome topL", THX0, THX1/2, TTY0, TTY1);
+	MenuTextDumpBand(px, "chrome topR", THX1/2, THX1, TTY0, TTY1);
+	MenuTextDumpBand(px, "chrome botL", THX0, THX1/2, TBY0, TBY1);
+	MenuTextDumpBand(px, "chrome botR", THX1/2, THX1, TBY0, TBY1);
 }
 
 /* real: 0x227E18, with the parts that read the System Configuration and
@@ -611,9 +787,18 @@ static struct
 	int cursor;		/* +0x10 */
 	int top;		/* +0x14 */
 	int mode;		/* +0x18 */
-} configMenu = { 91, configItems, 5, 0, 0, 0, 0 };
+	int phase;		/* +0x34, the page marker's pulse */
+} configMenu = { 91, configItems, 5, 0, 0, 0, 0, 0 };
 
 #define configCursor configMenu.cursor
+
+/* real: gp-30416 = 0x2A79A0.  Escape 'o' emits glyph 20 of the kind-2
+ * table - the up/down chevron pair on FNTEXOSD's second row. */
+static const char cfgMarker[] = "\7o020";
+
+/* real: 0x227390's tail - the marker's sawtooth, +310 a frame, folded at
+ * +-refreshRate*31400/60 (203 frames a lap on NTSC) */
+static int cfgPhaseFold;
 
 /* real: *(0x27F090 + i*48 + 0x24), ramped by 0x226BB8 (the cube stage's
  * first half, 0x226FA8 -> 0x226CF8).  It lives in the cube placement
@@ -758,6 +943,14 @@ ConfigMenuStepItems(void)
 		a = configItemAlpha[i] + (i == configCursor ? 8 : -8);
 		configItemAlpha[i] = clamp(a, 0, 128);
 	}
+
+	/* real: 0x227390's tail steps the header's +0x34 by 310 and folds it
+	 * back by a whole lap once it passes +-cfgPhaseFold */
+	configMenu.phase += 310;
+	if(configMenu.phase > cfgPhaseFold)
+		configMenu.phase -= 2*cfgPhaseFold;
+	else if(configMenu.phase < -cfgPhaseFold)
+		configMenu.phase += 2*cfgPhaseFold;
 }
 
 /* real: 0x227560.  Note that only the LABEL's column is pulled left when
@@ -768,7 +961,7 @@ static void
 DrawConfigMenu(int fadeAlpha)
 {
 	const char *label;
-	int i, alpha, a, x, right, gap;
+	int i, alpha, a, x, right, gap, markw;
 
 	/* real: 0x227560 bails on timerIsState(0x27BE44, 0), and also on
 	 * timerIsState(0x27EC40, 2) - a value sub-screen fully up hides the
@@ -786,17 +979,31 @@ DrawConfigMenu(int fadeAlpha)
 	configMenu.maxw = ConfigMenuWidest();	/* real: 0x228708 */
 
 	/* real: s7, the width of the one-space string at 0x2A79A8, which is
-	 * the gap between the label and the page marker.  The marker itself
-	 * is the string at gp-30416, "\7o020" - escape 'o' emits glyph 20 of
-	 * the kind-2 (FNTEXOSD) table, which this port does not upload, so
-	 * the marker is NOT drawn.  0x227560 puts it left-aligned at
-	 * x = 430 + maxw/2 + gap on the label row, in 0x27B850, at an alpha
-	 * of |128 * sinf(header->+0x34 / 10000)|; the header's +0x34 is a
-	 * sawtooth that 0x227390's tail steps by 310 a frame and folds at
-	 * +-31400 (refreshRate*31400/60), and 0x21EE50 zeroes on entering an
-	 * item.  Its width is 0 here, which is the only reason the clamp
-	 * below can leave it out. */
+	 * the gap between the label and the page marker; s6 = markW, the
+	 * width of the marker string at gp-30416, "\7o020" - escape 'o'
+	 * emits glyph 20 of the kind-2 (FNTEXOSD) table, the up/down
+	 * chevron pair.  Both clamps below count it. */
 	gap = osdTextWidth(" ");
+	markw = osdTextWidth(cfgMarker);
+
+	/* real: 0x227560's middle block.  Left-aligned at
+	 * x + maxw/2 + gap on the LABEL row, in 0x27B850, at an alpha of
+	 * |128 sin(phase/10000)| where phase is the header's +0x34 - a
+	 * sawtooth 0x227390's tail steps by 310 a frame and folds at
+	 * +-refreshRate*31400/60 (+-31400 NTSC, ~203 frames a lap).
+	 * 0x21EE50 (the items' +0x14) zeroes it on entering an item.
+	 * The ROM guards it with `mode != 1 && screen fully open'. */
+	x = 430;
+	right = x + markw + gap + configMenu.maxw/2;
+	if(right >= screenW - 24)
+		x -= right + 24 - screenW;
+	if(configMenu.mode != 1 && alpha >= 128) {
+		a = (int)(128.0f * sinf((float)configMenu.phase / 10000.0f));
+		if(a < 0)
+			a = -a;
+		drawTextL(x + configMenu.maxw/2 + gap, cfgLabelY, colDim, a,
+			cfgMarker);
+	}
 
 	for(i = 0; i < configMenu.count; i++) {
 		/* real: (itemAlpha * pageAlpha) >> 7, with the ROM's round-to-
@@ -805,7 +1012,7 @@ DrawConfigMenu(int fadeAlpha)
 		label = osdGetString(configMenu.items[i].strid);
 
 		x = 430;
-		right = x + gap + osdTextWidth(label)/2;
+		right = x + markw + gap + osdTextWidth(label)/2;
 		if(right >= screenW - 24)
 			x -= right + 24 - screenW;
 
@@ -825,17 +1032,29 @@ DrawConfigMenu(int fadeAlpha)
  * Confirm is not wired: 0x2279B8's CIRCLE arm calls the item's +0x14
  * (0x21DF28 for Clock Adjustment, 0x21EE50 for the rest) and sets the
  * header's mode to 1, which is a whole sub-screen. */
+static void ConfigItemFocus(int, int);	/* real: the items' +0x28 */
+
 static void
 ConfigMenuInput(void)
 {
+	int old;
+
 	if(!MenuConfigOpen())
 		return;
+	old = configCursor;
 	if(pad.dirPress & PAD_UP)
 		if(--configCursor < 0)
 			configCursor = configMenu.count-1;
 	if(pad.dirPress & PAD_DOWN)
 		if(++configCursor >= configMenu.count)
 			configCursor = 0;
+	/* real: 0x2279B8 calls items[old].fn28(&items[old], 0) and then
+	 * items[new].fn28(&items[new], 1) on every move - which is what
+	 * hands the button hint bar over between items */
+	if(configCursor != old) {
+		ConfigItemFocus(old, 0);
+		ConfigItemFocus(configCursor, 1);
+	}
 	/* real: 0x2279B8's TRIANGLE arm leaves the screen (0x2210C8) */
 	if(pad.press & PAD_TRIANGLE)
 		MenuLeaveConfig();
@@ -891,6 +1110,423 @@ DrawMainMenu(int fadeAlpha)
 	}
 }
 
+/* ======================== the OSD chrome ========================
+ *
+ * Stages 6, 7 and 8 of the frame body 0x21CF20 - drawn after every 2D
+ * screen and in this order: 0x21D368 (the letterbox bars), 0x21D3A0
+ * (the date/time header) and 0x21DA68 -> 0x21D7F8 (the button hint
+ * bar).  All three read the screen-size setting through 0x22B0E8(0);
+ * the port has no settings block, so they read the Screen Size item's
+ * own +0x08, which is the same number (0x21EDB8 re-syncs it from
+ * there every frame). */
+
+/* real: uiModel[0] - 0 = 4:3, 1 = Full, 2 = 16:9 */
+static int
+osdScreenType(void)
+{
+	return configItems[1].value;
+}
+
+/* real: 0x27B450, the pixel aspect 0x21C9D0 stores (0x27B44C, its
+ * divisor, is always 1.0).  Every "how tall is a field line" fudge in
+ * the module is this pair of constants. */
+#define PIXASPECT (IsPAL() ? 0.5405f : 0.47f)
+#define PALSTRETCH (0.5405/0.47)
+
+/* real: 0x2299C0 on an untextured record - 0x27B4F0's +0x30..+0x3C are
+ * all zero, so 0x2298A8 emits a flat SPRITE with no TME. */
+static void
+osdFlatRect(int x0, int y0, int x1, int y1, const int *col, int alpha)
+{
+	int xoff16, yoff16;
+
+	xoff16 = ((4096 - screenW)/2) << 4;
+	yoff16 = ((4096 - screenH)/2) << 4;
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 0, 0, 1, 0, 0, 0, 0));
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], alpha, 0x3f800000));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(x0 + xoff16, y0 + yoff16, 1));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(x1 + xoff16, y1 + yoff16, 1));
+	vif1End();
+}
+
+/* real: 0x27B4F0's colour - opaque black */
+static const int colBlack[4] = { 0, 0, 0, 128 };
+
+/* real: 0x27B750 - the hint labels' and the clock's colour */
+static const int hintTextCol[4] = { 96, 96, 96, 128 };
+
+/* real: 0x21D368 -> 0x21D1F8.  The gate is uiModel[0] == 0 || == 2, so
+ * the bars are there in 4:3 AND in 16:9 and only "Full" loses them; on
+ * a 640x224 NTSC field the content band is 640*0.5625*0.47 = 169.2
+ * lines and each bar is 27.4.  Note the two bars are NOT computed
+ * symmetrically in the ROM - the top one truncates (bar*16) and the
+ * bottom one truncates ((h - bar)*16) - so they can differ by one
+ * sixteenth of a pixel.  Reproduced. */
+static void
+DrawLetterbox(void)
+{
+	float content, bar;
+	int t;
+
+	t = osdScreenType();
+	if(t != 0 && t != 2)
+		return;
+
+	/* real: 0x22A0C0(1, 1) - normal blend, ZTST ALWAYS */
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 4, 128);
+
+	content = (float)screenW * 0.0625f * 9.0f * PIXASPECT;
+	bar = ((float)screenH - content) * 0.5f;
+	osdFlatRect(0, 0, screenW << 4, (int)(bar * 16.0f), colBlack, 128);
+	osdFlatRect(0, (int)(((float)screenH - bar) * 16.0f),
+		screenW << 4, screenH << 4, colBlack, 128);
+}
+
+/* real: 0x2A3EC8 / 0x2A3F38, the two format strings 0x20A998 and
+ * 0x20AAA0 pick when the date format is 0 (Y/M/D) and the clock face is
+ * 24-hour.  The ROM brackets each field with \7p@0 / \7p00 (fixed width
+ * on '0'), a no-op for the Latin face, and sprintf()s the time into
+ * "%s %s" (0x2A7830) behind a prefix that is empty unless 0x203928()
+ * says so - hence the leading space.  The other two date orders
+ * (0x2039A8 = 1 or 2) and the 12-hour face are not ported: the port has
+ * no settings to select them. */
+static void
+cfgFmtClockLine(char *p, int date)
+{
+	char num[12];
+
+	if(date) {
+		cfgFmtNum(num, cfgClockDate[0], 4, 1); strcpy(p, num); p += strlen(num);
+		*p++ = '/';
+		cfgFmtNum(num, cfgClockDate[1], 2, 1); strcpy(p, num); p += strlen(num);
+		*p++ = '/';
+		cfgFmtNum(num, cfgClockDate[2], 2, 1); strcpy(p, num); p += strlen(num);
+		*p = 0;
+		return;
+	}
+	*p++ = ' ';			/* real: the "%s %s" with an empty %s */
+	cfgFmtNum(num, (int)MenuClockHours(), 2, 0); strcpy(p, num); p += strlen(num);
+	*p++ = ':';
+	cfgFmtNum(num, (int)MenuClockMinutes(), 2, 1); strcpy(p, num); p += strlen(num);
+	*p++ = ':';
+	cfgFmtNum(num, (int)MenuClockSeconds(), 2, 1); strcpy(p, num); p += strlen(num);
+	*p = 0;
+}
+
+/* real: 0x21D3A0 - the date at the left margin and the time at the
+ * right, both at scale 0.83 (gp-32220) in 0x27B750's grey, on one row
+ * whose y is 14 unless the screen is 16:9, when it is 32.
+ *
+ * Its alpha is 0x226A60, which is 128 while the timer 0x27C258 is open
+ * and otherwise ramps with the SYSTEM CONFIGURATION screen's own timer
+ * 0x27BE44 - so on the bare main menu the header is invisible, and it
+ * fades up with System Configuration.  That ramp is byte for byte
+ * MenuConfigAlpha(), which is why the port can just call it.
+ *
+ * NOT original: the ROM reads Y/M/D and h/m/s out of uiModel[6..11],
+ * the RTC snapshot.  osdbits has hh:mm:ss from argv and no date, so the
+ * date reads 2000/01/01 - the same fixed date the Clock Adjustment
+ * value row already shows (cfgClockDate). */
+static void
+DrawTopBar(int fadeAlpha)
+{
+	char buf[32];
+	int alpha, y;
+
+	alpha = MenuConfigAlpha(fadeAlpha);	/* real: 0x226A60 */
+	y = osdScreenType() == 2 ? 32 : 14;
+	if(IsPAL())
+		y = (int)((double)y * PALSTRETCH);
+
+	osdTextSetScale(0.83f);			/* real: 0x207F68(gp-32220) */
+	cfgFmtClockLine(buf, 1);
+	drawTextL(22, y, hintTextCol, alpha, buf);
+	cfgFmtClockLine(buf, 0);
+	drawTextL(screenW - osdTextWidth(buf) - 22, y, hintTextCol, alpha, buf);
+	osdTextSetScale(1.0f);
+}
+
+/* ------------------------- the hint bar -------------------------
+ *
+ * The glyphs are NOT font glyphs: 0x21D590 (DrawIcon) binds texture
+ * slot 8 or 9 - TEXCSTSL (START/SELECT, 64x32) or TEXCMARU (the four
+ * shape buttons, 64x64) - and emits one 25x25 sprite, drawn at half
+ * height because the OSD renders one field.  Both are plain PSMCT32
+ * with their colour IN the texture (pink square, green triangle, blue
+ * cross, red circle), so there is no per-glyph CLUT and no vertex
+ * colour: the record's RGB is a flat 128,128,128 and only its alpha is
+ * the argument.  The slot table is 0x27F1C0 (12-byte {ptr, log2w,
+ * log2h} records, slot i <- resource 45+i) and 0x27F280 (the VRAM
+ * bases), filled by 0x229698/0x229750. */
+
+static Texture maruTexture = {
+	nil, RESID_TEXCMARU, nil, 0, { 0, 0, 64, 64 },
+	0, 0, SCE_GS_PSMCT32, 0, { 0 }
+};
+
+/* real: 0x27B570 - six glyph rects.  0/1 are START and SELECT inside
+ * TEXCSTSL; 2..5 are TEXCMARU's 2x2 grid: square, triangle, cross,
+ * circle (in that memory order). */
+static const int iconUV[6][4] = {
+	{  0,  0, 32, 32 }, { 32,  0, 64, 32 },
+	{  0,  0, 32, 32 }, { 32,  0, 64, 32 },
+	{  0, 32, 32, 64 }, { 32, 32, 64, 64 }
+};
+
+/* real: 0x27B7E0 - the glyph each of the four hint slots uses, i.e.
+ * square, cross, circle, triangle from left to right */
+static const int hintGlyph[4] = { 2, 4, 5, 3 };
+
+/* real: 0x21D590.  The record is 0x27B530; `w' and `h' are 28 for the
+ * TEXCSTSL pair and 25 for the shape buttons, and the sprite is only
+ * h/2 tall (one field), stretched by 0.5405/0.47 on PAL. */
+static void
+DrawIcon(int glyph, int x, int y, int alpha)
+{
+	const int *uv;
+	int w, h, x0, y0, x1, y1, xoff16, yoff16;
+
+	if((u32)glyph >= 6)
+		return;
+	/* real: 0x22AB90(8, 0, 1) for glyphs 0..1.  Neither of the two
+	 * screens ported here ever asks for START or SELECT, so TEXCSTSL is
+	 * not uploaded and those two glyphs are dropped. */
+	if(glyph < 2)
+		return;
+	w = h = 25;
+
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 4, 128);
+	vif1SetTexture(&maruTexture);
+	vif1SetCLAMP_1(1, 1, 0, 0, 0, 0);
+
+	uv = iconUV[glyph];
+	xoff16 = ((4096 - screenW)/2) << 4;
+	yoff16 = ((4096 - screenH)/2) << 4;
+	x0 = x << 4;
+	y0 = y << 4;
+	x1 = (x + w) << 4;
+	y1 = (y + h/2) << 4;
+	if(IsPAL())
+		y1 = y0 + (int)((double)(y1 - y0) * PALSTRETCH);
+
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 1, 0, 1, 0, 1, 0, 0));
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(128, 128, 128, alpha, 0x3f800000));
+	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(uv[0]*16 + 8, uv[1]*16 + 8));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(x0 + xoff16, y0 + yoff16, 1));
+	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(uv[2]*16 + 8, uv[3]*16 + 8));
+	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(x1 + xoff16, y1 + yoff16, 1));
+	vif1End();
+}
+
+/* real: 0x27B5E8 - nine 20-byte hint sets of {4 string ids, pad mask};
+ * id 1 means "this slot has no button".  The second block is the same
+ * table 180 bytes on, taken when 0x204318() is true - the region where
+ * the cross confirms.  Sets 3..6 belong to screens this port does not
+ * have; they are kept because the table is one object. */
+static const int hintSet[2][9][5] = {
+	{			/* real: 0x27B5E8 */
+		{  1,  1,  1,  1, 0x0000 },
+		{  1,  1, 86, 95, 0x5000 },	/* main menu */
+		{ 94, 85, 86,  1, 0x5000 },	/* System Configuration */
+		{  1, 85,  1, 87, 0x5000 },
+		{  1, 85,  1,  1, 0x5000 },
+		{  1, 85, 86,  1, 0x5000 },
+		{ 94,  1,  1,  1, 0x0000 },
+		{  1, 85, 86,  1, 0x5000 },
+		{  0,  0,  0,  0, 0x0000 }
+	}, {			/* real: 0x27B69C */
+		{  1,  1,  1,  1, 0x0000 },
+		{  1, 85,  1, 95, 0x5000 },	/* main menu */
+		{ 94, 85, 86,  1, 0x5000 },	/* System Configuration */
+		{  1,  1, 86, 87, 0x5000 },
+		{  1,  1, 86,  1, 0x5000 },
+		{  1, 85, 86,  1, 0x5000 },
+		{ 94,  1,  1,  1, 0x0000 },
+		{  1, 85, 86,  1, 0x5000 },
+		{  0,  0,  0,  0, 0x0000 }
+	}
+};
+
+/* real: 0x27B760 - eight languages x four slot x positions.  Slot 3's
+ * column is dead data: 0x21D7F8 right-anchors that slot on the screen
+ * edge instead. */
+static const int hintX[8][4] = {
+	{ 20, 226, 332, 508 },	/* Japanese */
+	{ 24, 213, 335, 441 },	/* English */
+	{ 24, 188, 302, 483 },	/* French */
+	{ 24, 197, 343, 471 },	/* Spanish */
+	{ 24, 193, 333, 477 },	/* German */
+	{ 24, 233, 350, 483 },	/* Italian */
+	{ 24, 193, 362, 477 },	/* Dutch */
+	{ 24, 164, 313, 500 }	/* Portuguese */
+};
+
+/* real: 0x27B5D0 plus its three setters 0x21D748 (arm, gp-30768),
+ * 0x21D750 (alpha, gp-30772) and 0x21D758 (the pad mask) */
+static int hintCustom[5] = { 1, 1, 1, 1, 0 };
+static int hintCustomOn;
+static int hintCustomAlpha = 128;
+
+/* real: 0x21D768(a, b, c, d).  Its region arm is the confirm/cancel
+ * swap, and it is subtle: it puts argument c on the CROSS slot and
+ * argument b on the CIRCLE slot, rewriting 86 -> 85 and 85 -> 86 on the
+ * way so that osdGetString's own 85/86 exchange (which fires under the
+ * same flag) restores the intended words.  Net effect with the usual
+ * (b, c) = (85, 86): flag clear -> cross "Back", circle "Enter"; flag
+ * set -> cross "Enter", circle "Back", which is what the retail
+ * screenshots show. */
+static void
+HintSetCustom(int a, int b, int c, int d)
+{
+	hintCustom[0] = a;
+	if(textRegionSwap) {
+		hintCustom[1] = c == 86 ? 85 : c;
+		hintCustom[2] = b == 85 ? 86 : b;
+	} else {
+		hintCustom[1] = b;
+		hintCustom[2] = c;
+	}
+	hintCustom[3] = d;
+}
+
+/* real: 0x21EB80 - item 0 (Clock Adjustment)'s +0x28 focus callback,
+ * and the ONLY reason the config screen's bar has four hints instead of
+ * set 2's three: the other four items' +0x28 is 0x21F160, a bare
+ * `jr ra'.  Move the cursor off Clock Adjustment on retail and the
+ * triangle/"Options" hint goes away with it. */
+static void
+ConfigItemFocus(int i, int on)
+{
+	if(i != 0)
+		return;
+	if(!on) {
+		hintCustomOn = 0;	/* real: 0x21D748(0) */
+		return;
+	}
+	HintSetCustom(94, 85, 86, 87);	/* Display / Back / Enter / Options */
+	hintCustom[4] = 0x5000;		/* real: 0x21D758(0x5000), TRIANGLE|CROSS */
+	hintCustomOn = 1;		/* real: 0x21D748(1) */
+}
+
+/* real: gp-30404, 0x227D08's "already notified" latch */
+static int cfgFocusNotified;
+
+/* real: the head of 0x227D08 - fire the cursor item's +0x28 with 1 on
+ * the frame the screen becomes fully open (state 2 with no sub-screen
+ * up) and with 0 when it stops being. */
+static void
+ConfigFocusNotify(int fadeAlpha)
+{
+	if(MenuConfigAlpha(fadeAlpha) >= 128) {
+		if(!cfgFocusNotified) {
+			ConfigItemFocus(configCursor, 1);
+			cfgFocusNotified = 1;
+		}
+	} else if(cfgFocusNotified) {
+		ConfigItemFocus(configCursor, 0);
+		cfgFocusNotified = 0;
+	}
+}
+
+/* real: 0x228660 - the six-entry jump table at 0x2A4B50, one per-screen
+ * alpha function, and then `movn v0, zero, (v0 < 128)'.  That is NOT a
+ * clamp above 127 as docs/menu-draw.md 9.1 has it: it ZEROES anything
+ * below 128, so the hint sets never cross-fade - a set appears only
+ * while its screen is fully up.  Set 0 is unreachable (the table is
+ * indexed by set-1 and bounded at 6). */
+static int
+HintSetAlpha(int set, int fadeAlpha)
+{
+	int a;
+
+	switch(set) {
+	case 1:				/* real: 0x227E18 */
+		/* the ROM's 0x227E18 also multiplies in
+		 * clamp(dur10 - timerCount(0x27BE44), 0, dur10), which is 0
+		 * from ten frames into System Configuration's entry - the same
+		 * thing DrawMainMenu's MenuConfigOpen() guard does here */
+		if(MenuConfigOpen())
+			return 0;
+		a = MainMenuAlpha(fadeAlpha);
+		break;
+	case 2:				/* real: 0x2271B8 */
+		a = MenuConfigAlpha(fadeAlpha);
+		break;
+	default:			/* screens this port does not have */
+		return 0;
+	}
+	return a < 128 ? 0 : a;
+}
+
+/* real: 0x21D7F8(set, alpha, y) */
+static void
+DrawHintSet(int set, int alpha, int y)
+{
+	const int *ids;
+	const int *xs;
+	const char *s;
+	int i, id, w;
+
+	ids = set == 8 ? hintCustom : hintSet[textRegionSwap ? 1 : 0][set];
+	xs = hintX[clamp(GetLanguage(), 0, 7)];
+
+	osdTextSetScale(0.8f);		/* real: 0x207F68(gp-32216) */
+	for(i = 0; i < 4; i++) {
+		id = ids[i];
+		if(id == 1)		/* real: 1 = no button in this slot */
+			continue;
+		s = osdGetString(id);
+		if(i < 3) {
+			DrawIcon(hintGlyph[i], xs[i], y, alpha);
+			drawTextL(xs[i] + 28, y, hintTextCol, alpha, s);
+		} else {
+			/* real: slot 3 is right-anchored on the screen edge */
+			w = osdTextWidth(s) + 24;
+			DrawIcon(hintGlyph[3], screenW - w - 28, y, alpha);
+			drawTextL(screenW - w, y, hintTextCol, alpha, s);
+		}
+	}
+	osdTextSetScale(1.0f);		/* real: the tail 0x207F68(1.0) */
+}
+
+/* real: 0x21D9E0 - the bar's row, 182 in 16:9 and 200 otherwise */
+static int
+HintBarY(void)
+{
+	int y;
+
+	y = osdScreenType() == 2 ? 182 : 200;
+	if(IsPAL())
+		y = (int)((double)y * PALSTRETCH);
+	return y;
+}
+
+/* real: 0x21DA68 - the caller-supplied set wins outright; otherwise
+ * every set whose screen is fully open gets drawn (in practice exactly
+ * one, since 0x228660 zeroes anything under 128).  The middle arm,
+ * `else if (0x226A48()) 0x21D7F8(7, 128, y)', tests *(0x27BE40), a mode
+ * flag 0x228460 clears and nothing on these two screens sets. */
+static void
+DrawHintBar(int fadeAlpha)
+{
+	int i, y, a;
+
+	y = HintBarY();
+	if(hintCustomOn) {
+		DrawHintSet(8, hintCustomAlpha, y);
+		return;
+	}
+	for(i = 0; i < 7; i++) {
+		a = HintSetAlpha(i, fadeAlpha);
+		if(a > 0)
+			DrawHintSet(i, a, y);
+	}
+}
+
 /* ============================== entry ============================== */
 
 /* real: the text-engine part of 0x21CE58 - do_load_font (0x21DBA0) and
@@ -905,12 +1541,22 @@ InitMenuText(void)
 	if(!menuTextEnable)
 		return;
 
+	/* NOT original: argv[16] stands in for 0x204318's region word */
+	textRegionSwap = OsdArgInt(16, 1);
+
+	/* real: 0x20A3C8's four 0x20A280 uploads, of which the port needs
+	 * the first (FNTASCII, slot 0) and the last (FNTEXOSD, slot 3);
+	 * FNTEX000/001 are the two-byte pages.  TEXCMARU is not a font page
+	 * at all - it is texture slot 9, uploaded by 0x22A9B8's own loop. */
 	InitTexture(&fontTexture);
+	InitTexture(&fontOsdTexture);
+	InitTexture(&maruTexture);
 
 	/* real: 0x209FD0's defaults, then do_load_font's tail */
 	textGap = -3;			/* 0x207F38(-3) */
 	textYBias = -7*8;		/* 0x207F48(-7) */
 	textAdvMul = 1;			/* .data at 0x27156C */
+	textPct = 0;			/* real: 0x271564 */
 	osdTextSetColor(128, 128, 128, 128);
 	osdTextSetScale(1.0f);
 	osdTextSetBaseScale(IsPAL() ? 1.15f : 1.0f);
@@ -921,6 +1567,13 @@ InitMenuText(void)
 	mainMenuDur = rate/6;
 	memset(&mainMenuAnim, 0, sizeof(mainMenuAnim));
 	mainMenuAnim.duration = mainMenuDur;
+
+	/* real: 0x227390's tail folds the marker's phase at
+	 * refreshRate*31400/60 - 31400 on NTSC, ~203 frames a lap */
+	cfgPhaseFold = rate*31400/60;
+	configMenu.phase = 0;
+	cfgFocusNotified = 0;
+	hintCustomOn = 0;
 
 	mainMenu.cursor = clamp(OsdArgInt(7, 0), 0, mainMenu.count-1);
 	/* real: 0x27BE28's cursor, moved by 0x2279B8's UP/DOWN arms */
@@ -994,9 +1647,19 @@ MenuTextFrame(int fadeMode, int fadeAlpha)
 	mtStep(&mainMenuAnim);
 	MainMenuStep(fadeMode, fadeAlpha);
 	MainMenuInput();
+	/* real: 0x227D08's head, which runs after 0x227560's draw and before
+	 * the pad handler it dispatches to */
+	ConfigFocusNotify(fadeAlpha);
 	ConfigMenuInput();
 	DrawMainMenu(fadeAlpha);
 	/* real: 0x227DE8's tail 0x227D08, one slot earlier in 0x2283F0 */
 	DrawConfigMenu(fadeAlpha);
+
+	/* real: stages 6, 7 and 8 of 0x21CF20, in this order and after every
+	 * 2D screen.  (Stage 9, 0x21DB18's right-edge strip 0x27B7F0, is not
+	 * ported - it draws nothing on either of these two screens.) */
+	DrawLetterbox();		/* real: 0x21D368 */
+	DrawTopBar(fadeAlpha);		/* real: 0x21D3A0 */
+	DrawHintBar(fadeAlpha);		/* real: 0x21DA68 */
 	/* the readback itself moved to DoMenuScene's post-swap window */
 }

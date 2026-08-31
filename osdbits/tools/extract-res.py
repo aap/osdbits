@@ -108,6 +108,9 @@ def write_inc(path, symbol, data):
 #   0x26FE60  97 x {u32 xoff; u32 width}  the ASCII glyph metrics
 #             (glyph i = character 32+i; the cell is 32x40 and xoff is
 #             the glyph's left inset inside it)
+#   0x271460  35 x {u32 xoff; u32 width}  the KIND-2 glyph metrics - the
+#             FNTEXOSD symbol page the \7oNNN escape draws from.  Same
+#             40-px cell height, but 16 columns of 32 px instead of 8.
 #   0x2715E0  16 x u32 RGBA                the font CLUT (grey ramp with
 #                                          alpha - the antialiasing)
 #   0x298B08  299 x char *                 the English osdGetString table
@@ -119,6 +122,8 @@ def write_inc(path, symbol, data):
 OSDSYS_LOAD = 0x200000
 FONT_METRICS_VA = 0x26FE60
 FONT_METRICS_N = 97
+OSD_METRICS_VA = 0x271460
+OSD_METRICS_N = 35
 FONT_CLUT_VA = 0x2715E0
 STRINGS_VA = 0x298B08
 STRINGS_N = 299
@@ -151,6 +156,7 @@ def write_font_tables(path, img):
         return img[o:o+n]
 
     met = struct.unpack("<%dI" % (FONT_METRICS_N*2), rd(FONT_METRICS_VA, FONT_METRICS_N*8))
+    omet = struct.unpack("<%dI" % (OSD_METRICS_N*2), rd(OSD_METRICS_VA, OSD_METRICS_N*8))
     clut = struct.unpack("<16I", rd(FONT_CLUT_VA, 64))
     ptrs = struct.unpack("<%dI" % STRINGS_N, rd(STRINGS_VA, STRINGS_N*4))
 
@@ -179,6 +185,14 @@ def write_font_tables(path, img):
             c = 32 + i
             f.write("\t{ %3d, %3d },\t/* %s */\n" %
                 (met[i*2], met[i*2+1], repr(chr(c)) if 32 <= c < 127 else "0x%02x" % c))
+        f.write("};\n\n")
+        f.write("/* real 0x271460: the kind-2 (FNTEXOSD) glyph metrics.  The page is\n"
+                " * 512x80 = 16 columns x 2 rows of the same 32x40 cell, so glyph g is\n"
+                " * at (g%%16)*32, (g/16)*40.  Entry 17 overlaps entry 16's \"(PS2)\",\n"
+                " * which is 60 px wide and spans two cells; 22..34 are all {0,13}. */\n")
+        f.write("const int fontOsdMetrics[%d][2] = {\n" % OSD_METRICS_N)
+        for i in range(OSD_METRICS_N):
+            f.write("\t{ %3d, %3d },\t/* %2d */\n" % (omet[i*2], omet[i*2+1], i))
         f.write("};\n\n")
         f.write("/* real 0x2715e0: the 16-entry font CLUT (RGBA, 0x80 = opaque) */\n")
         f.write("unsigned int fontClut[16] = {\n")

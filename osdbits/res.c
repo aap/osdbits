@@ -2,6 +2,8 @@
 #include "res.h"
 
 #include "res/FNTASCII_EXP.inc"
+#include "res/FNTEXOSD_EXP.inc"
+#include "res/TEXCMARU_EXP.inc"
 #include "res/TEXCBLUR_EXP.inc"
 #include "res/TEXCBUMP_EXP.inc"
 #include "res/TEXCKABE_EXP.inc"
@@ -186,6 +188,13 @@ LoadResources(void)
 	/* the OSD text engine's Latin font page (menutext.c) */
 	resources[RESID_FNTASCII].data = FNTASCII_EXP;
 	resources[RESID_FNTASCII].size = FNTASCII_EXP_len;
+	/* its symbol page - the kind-2 glyphs the \7oNNN escape draws, of
+	 * which the config screen's page marker is glyph 20 (menutext.c) */
+	resources[RESID_FNTEXOSD].data = FNTEXOSD_EXP;
+	resources[RESID_FNTEXOSD].size = FNTEXOSD_EXP_len;
+	/* the four shape-button icons the hint bar draws (menutext.c) */
+	resources[RESID_TEXCMARU].data = TEXCMARU_EXP;
+	resources[RESID_TEXCMARU].size = TEXCMARU_EXP_len;
 }
 
 u8*

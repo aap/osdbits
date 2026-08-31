@@ -1959,3 +1959,661 @@ second walk's black pass, `0x22C088`, `0x22C2A0` and `0x22C190(1)` are all in.
   job's runs.
 * The real tree `/u/aap/src/ps2rev/osdsys` is untouched and clean at eba5595;
   nothing was committed.
+
+---
+
+# The OSDSYS "chrome", reversed and ported (2026-08-31)
+
+Confidence convention as `docs/menu-draw.md`: **[ok]** = read out of
+`ee-objdump -m mips:5900` of `/u/aap/src/osdsys/expanded.bin`
+(VA = offset + 0x200000, gp = 0x2AF070) and cross-checked against the
+retail screenshots or a headless run; **[tnt]** = partial; **[?]** =
+guess.  Everything below is [ok] unless marked.
+
+Scope: stages **6, 7 and 8** of the frame body `0x21CF20` - the parts
+that sit on top of every screen - plus the second font page the config
+screen's page marker comes off.
+
+```
+| # | call                    | what                          |
+|---|-------------------------|-------------------------------|
+| 5 | 0x2283F0()              | the per-screen 2D renderers   |  <- already ported
+| 6 | 0x21D368() -> 0x21D1F8() | the letterbox bars           |  <- new
+| 7 | 0x21D3A0()              | the date/time header          |  <- new
+| 8 | 0x21DA68() -> 0x21D7F8() | the button hint bar          |  <- new
+| 9 | 0x21DB18()              | a right-edge strip            |  not ported
+```
+
+---
+
+## 0. Two corrections to the brief before anything else
+
+**FNTEXOSD does not power the hint bar.**  The brief calls it "the
+symbol font that powers it".  It does not: `0x21D7F8` draws its coloured
+button glyphs through **`DrawIcon` (0x21D590)**, which binds texture
+slot 8 or 9 - **TEXCSTSL** or **TEXCMARU** - and emits a plain sprite.
+FNTEXOSD is the text engine's *kind-2* glyph page, reached only through
+the `\7oNNN` escape, and on these two screens it draws exactly one
+thing: the System Configuration **page marker**.  Both are ported; they
+are simply unrelated mechanisms.
+
+**`0x228660` is not a clamp.**  `docs/menu-draw.md` §9.1 reads its tail
+as "clamps to 0 above 127", and concludes "several hint sets cross-fade
+simultaneously".  The instruction pair is
+
+```
+2286f4: slti v1, v0, 128        ; v1 = (alpha < 128)
+2286fc: movn v0, zero, v1       ; if (alpha < 128) alpha = 0
+```
+
+i.e. it **zeroes anything below 128**.  The hint sets never cross-fade:
+a set is drawn only while its screen is *fully* up, which is why
+`0x21DA68`'s loop over seven sets emits at most one.  §9.1 wants
+amending.
+
+---
+
+## 1. FNTEXOSD - the kind-2 glyph page
+
+### 1.1 It is the ASCII font again, with one number changed
+
+`0x2086A0(kind, &bound, code)` has three arms and they differ in almost
+nothing:
+
+| kind | binds | metrics table | columns | bounds check |
+|---|---|---|---|---|
+| 0 | slot 0 FNTASCII, **only if `!*bound`**, then sets it | 0x26FE60, 97 entries | `div 8` | `(u32)(c-32) < 97` |
+| 1 | slot 1/2 FNTEX000/001, always | 0x270160 / 0x270AE0 | `div 16` | none |
+| 2 | **slot 3 FNTEXOSD, always** | **0x271460, 35 entries** | **`div 16`** | none |
+
+Everything after the arm is shared: `col = g % cols`, `row = g / cols`,
+`u0 = col*32 + inset`, `u1 = u0 + width`, `v = row*40`, the same
+half-texel insets (`+8` / `+632`), the same `0x2DDC50` drawn height.  So
+FNTEXOSD is **the same 32x40 cell as FNTASCII, laid out 16 columns
+wide instead of 8**, and there is no second decoder to write.
+
+Page record, slot 3 of the four-record table at **0x271578** (stride 24:
+`+0` tbp, `+4` blocks, `+8` tbw, `+12` tw, `+16` th, `+20` clut tbp):
+`{ -, 128, 8, 9, 7, - }` - 512x80, TBW 8, TW 9, TH 7, 128 blocks.
+`0x208460` hardcodes **PSM = 0x14 (PSMT4)**, TCC 1, TFX MODULATE,
+CLD 1, CSM1/PSMCT32 CLUT, TEX1 = 97 (LINEAR/LINEAR).  The CLUT is
+**0x2715E0 - the very same 16-entry grey ramp FNTASCII uses**; nothing
+on the page is coloured, the pen colour supplies that.
+
+The resource expands to exactly **20480 = 512*80/2**, confirming plain
+uncompressed 4-bit indexed.
+
+### 1.2 The page, rendered
+
+16 columns x 2 rows, glyph `g` at `(g%16)*32, (g/16)*40`:
+
+```
+row 0:  0 down-arrow   1 right-arrow  2 left-tri    3 right-tri
+        4 (R) large    5 (R) small    6 up-tri      7 down-tri
+        8 left-tri sm  9 right-tri sm 10..13 four grey button blobs
+       14 cycle-arrow 15 up/down chevrons
+row 1: 16 "(PS2)" (60 px, spans two cells)          17 dead (overlaps 16)
+       18 filled square  19 brightness sun
+       20 UP/DOWN CHEVRONS  <- the page marker
+       21 up/down chevrons (variant)   22..34 all {0,13}, unused
+```
+
+Verified numerically: the ink runs measured off the decoded page agree
+with the 0x271460 metrics cell for cell, e.g. glyph 20 `{3, 26}` ->
+u 131..157, ink 132..155.  Entry **17 `{0,30}` is dead data** - its cell
+is the right half of glyph 16's "(PS2)".
+
+Consumers in the shipped Latin strings:
+
+* `gp-30416` = `0x2A79A0` = `"\7o020"` - the config page marker.
+* string 93 `"PlayStation\7o004"` - the (R).
+* `0x2A4750` = `"\7r0.88\7o019\7r0.00"` - the clock's optional
+  brightness prefix, used when `0x203928()` (bit 29 of `0x2A8700`) is
+  set.  Not reachable in the port.
+
+### 1.3 Two escapes are now obeyed, not skipped
+
+`0x209300`'s 25-arm jump table (0x2A3CB0).  The port previously skipped
+every arm by length; two are now executed, because Module U's own data
+needs them:
+
+* **`\7oNNN`** (`0x2094AC`, 5 bytes) - three decimal digits; **returns**
+  the glyph, which `0x209640` emits with `0x2086A0(2, ...)` and
+  `0x209998` measures with `0x208610` (the same expression as
+  `0x208540` against 0x271460).  So `"\7o020"` measures **23**
+  (26 - 3 gap), not 0 - `docs/menu-config.md`'s note that "its width is
+  0 here" no longer applies, and both of `0x227560`'s right-margin
+  clamps now carry the term the ROM gives them.
+  After emitting one, `0x209640` **clears the caller's `bound` flag**
+  (the delay slot at 0x2096C8), so the next Latin glyph rebinds
+  FNTASCII.  Ported literally.
+* **`\7rN.NN`** (`0x209400`, 6 bytes) - digits at `s[1] s[3] s[4]`, into
+  `0x271564`, then `0x207F68(*(0x2DDC48))` - **the saved scale**, so
+  percentages do not compound.  `0x207F68`'s second half then splits the
+  percentage into a scale for the advance (`0x2DDC44`), a height
+  (`0x2DDC50`) and two shift terms (`0x27186C`, `0x271870`) that keep the
+  shrunken glyph on the baseline; only `0x271870` reaches the sprite.
+  Note the emitter takes the **y bias from `0x2DDC48`** (unscaled) and
+  the **width from `0x2DDC44`** (scaled) - that asymmetry is load-bearing.
+
+  This matters for exactly one string: id 111
+  `"\7r0.90DIGITAL OUT (OPTICAL)\7r0.00"`.  Without it that label
+  measures 355 instead of **322** and, being the widest of the five, it
+  is what `0x228708` puts in the header's `+0x0C` - so the page marker
+  would sit ~16 px too far right.
+
+### 1.4 Pipeline
+
+`tools/extract-res.py --tables` grew the 0x271460 table
+(`fontOsdMetrics[35][2]` in `res/FONTDATA.inc`); the page itself comes
+from the existing `--container FNTIMAGE` path.  `res.c` wires
+`RESID_FNTEXOSD`.  Upload is the plain `InitTexture()` path FNTASCII
+already uses (PSMT4 + the same 16-entry CLUT).
+
+---
+
+## 2. The button hint bar - `0x21DA68` / `0x21D7F8`
+
+### 2.1 Layout, exact
+
+```
+y    = 0x21D9E0() = (uiModel[0] == 2) ? 182 : 200,  * 0.5405/0.47 on PAL
+scale = *(gp-32216) = 0.8
+ids  = (set == 8) ? 0x27B5D0 : 0x27B5E8 + set*20 + (0x204318() ? 180 : 0)
+xs   = 0x27B760 + GetLanguage()*16
+for (i = 0; i < 4; i++) {
+    if (ids[i] == 1) continue;                 /* 1 = no button here */
+    if (i < 3) { DrawIcon(0x27B7E0[i], xs[i], y, alpha);
+                 0x21DC28(xs[i] + 28, y, 0x27B750, alpha, osdGetString(ids[i])); }
+    else       { w = 0x209998(s) + 24;         /* slot 3 is right-anchored */
+                 DrawIcon(0x27B7E0[3], screenW - w - 28, y, alpha);
+                 0x21DC28(screenW - w, y, 0x27B750, alpha, s); }
+}
+```
+
+* **`0x27B7E0` = `{2, 4, 5, 3}`** - square, cross, circle, triangle.
+* **`0x27B750` = `{96, 96, 96, 128}`** - the label colour, shared with
+  the clock.
+* **`0x27B760`** English row = `{24, 213, 335, 441}`.  The fourth column
+  of every language row is **dead data** - slot 3 never reads it.
+* Icon at `xs[i]`, label at `xs[i] + 28`.
+
+Measured against `ss-real1.png` (640x480, i.e. a 640x224 field scaled
+2.1428x vertically, 1:1 horizontally):
+
+| | ROM says | retail ink | our build |
+|---|---|---|---|
+| square icon | sprite x 24..49 | 27..46 | 27..46 |
+| "Display" | pen x 52 | 55..135 | 54..132 |
+| cross icon | sprite x 213..238 | 216..235 | 216..234 |
+| "Enter" | pen x 241 | 244..302 | 244..302 |
+| circle icon | sprite x 335..360 | 338..357 | 338..354 |
+| "Back" | pen x 363 | 365..421 | 364..412 |
+| triangle icon | `640 - 113 - 28` = 499 | 502..521 | 502..518 |
+| "Options" | `640 - 113` = 527 | 529..616 | 528..616 |
+
+(the last two follow from `osdTextWidth("Options") = 89` at scale 0.8;
+the readback's right edges run a block or two short because the 2x2
+block takes the max of four pixels and the antialiased tail falls below
+the ramp's first step.)
+
+### 2.2 The glyphs are TEXCMARU sprites, and the colour is in the texture
+
+`DrawIcon` = `0x21D590`:
+
+```
+if (0 <= glyph < 2) { w = h = 28; 0x22AB90(8, 0, 1); }   /* TEXCSTSL */
+else                { w = h = 25; 0x22AB90(9, 0, 1); }   /* TEXCMARU */
+rec = 0x27B530                       /* RGB 128,128,128, alpha = argument */
+rec.x0 = x<<4 ; rec.x1 = (x+w)<<4
+rec.y0 = y<<4 ; rec.y1 = (y + h/2)<<4       /* half height: one field */
+uv = 0x27B570 + glyph*16 ; rec.u = uv*16 + 8 (all four)
+if (IsPAL()) rec.y1 = y0 + (y1-y0)*0.5405/0.47
+0x2299C0(rec)
+```
+
+The slot numbers resolve through `0x2297B8`/`0x2297A0`: slot record
+`0x27F1C0 + slot*12` = `{ptr, log2w, log2h}`, VRAM base
+`0x27F280[slot]`, and `0x229698` fills slot *i*'s pointer from
+**resource `45 + i`** - so slot 8 = **53 TEXCSTSL**, slot 9 =
+**54 TEXCMARU**, both declared 64x64 and both **PSMCT32**.  TEXCMARU
+expands to exactly **16384 = 64*64*4**; TEXCSTSL to 8192, i.e. it is
+really 64x32 (its two glyph rects both live in rows 0..32).
+
+**Answering the brief's question directly: the colours are neither a
+per-glyph CLUT nor a vertex colour - they are RGBA texels.**  TEXCMARU's
+2x2 grid, sampled at each quadrant centre:
+
+```
+0x27B570 rects        TEXCMARU 64x64 PSMCT32, alpha 0x80 = opaque
+                                                  brightest texel RGB
+glyph 2 {0,0,32,32}   top-left      PINK square      (249, 138, 202)
+glyph 3 {32,0,64,32}  top-right     GREEN triangle   ( 26, 211, 111)
+glyph 4 {0,32,32,64}  bottom-left   BLUE cross       (140, 149, 252)
+glyph 5 {32,32,64,64} bottom-right  RED circle       (255,  90,  90)
+```
+
+Each is a coloured ring/outline on a dark (40,40,40) disc; the retail
+screenshot's per-hint average colours - (163,97,135), (95,100,156),
+(174,71,71), (32,138,81) - are those four rings averaged against their
+discs, in the same left-to-right order the `{2,4,5,3}` glyph table gives.
+
+The record's RGB is a flat 128,128,128 and MODULATE passes the texel
+through unchanged; only the alpha is the caller's.  Only TEXCMARU is
+uploaded here - nothing on these two screens asks for START or SELECT,
+and `DrawIcon` returns early for glyphs 0..1 with a comment saying so.
+
+### 2.3 Which set each screen shows
+
+`0x21DA68`:
+
+```
+if (*(gp-30768))      0x21D7F8(8, *(gp-30772), y);   /* caller-supplied */
+else if (0x226A48())  0x21D7F8(7, 128, y);           /* *(0x27BE40) == 1 */
+else for (i = 0; i < 7; i++) { a = 0x228660(i); if (a > 0) 0x21D7F8(i, a, y); }
+```
+
+`0x228660(set)` dispatches through the 6-entry table at 0x2A4B50 -
+`set 1 -> 0x227E18` (main menu), `2 -> 0x2271B8` (System Configuration),
+`3 -> 0x221060(1)`, `4 -> 0x221060(0)`, `5 -> 0x21F980`,
+`6 -> 0x226FD0` - and then zeroes anything under 128 (§0).  Set 0 is
+unreachable (the table is indexed by `set-1`, bounded at 6).
+
+The nine 20-byte records at **0x27B5E8**, `{4 string ids, pad mask}`,
+and the second block 180 bytes on:
+
+```
+      block A (0x204318 == 0)          block B (0x204318 != 0)
+set 0 {  1,  1,  1,  1, 0x0000 }       {  1,  1,  1,  1, 0x0000 }
+set 1 {  1,  1, 86, 95, 0x5000 }       {  1, 85,  1, 95, 0x5000 }   main menu
+set 2 { 94, 85, 86,  1, 0x5000 }       { 94, 85, 86,  1, 0x5000 }   SysConfig
+set 3 {  1, 85,  1, 87, 0x5000 }       {  1,  1, 86, 87, 0x5000 }
+set 4 {  1, 85,  1,  1, 0x5000 }       {  1,  1, 86,  1, 0x5000 }
+set 5 {  1, 85, 86,  1, 0x5000 }       {  1, 85, 86,  1, 0x5000 }
+set 6 { 94,  1,  1,  1, 0x0000 }       { 94,  1,  1,  1, 0x0000 }
+set 7 {  1, 85, 86,  1, 0x5000 }       {  1, 85, 86,  1, 0x5000 }
+set 8 {  0,  0,  0,  0, 0x0000 }       {  0,  0,  0,  0, 0x0000 }   (never read)
+```
+
+ids: 85 "Back", 86 "Enter", 87 "Options", 94 "Display", 95 "Version".
+
+So **the main menu does have a hint bar**: circle (or cross, per region)
+"Enter" and triangle "Version".  It has no clock (§4).
+
+### 2.4 Where the fourth hint comes from - a real find
+
+The retail config screen shows **four** hints (Display / Enter / Back /
+Options).  **No set in the table has four.**  Set 2 has three; slot 3 is
+empty.
+
+The fourth comes from the *caller-supplied* set 8 at **0x27B5D0**,
+armed by **`0x21EB80`** - and `0x21EB80` is **Clock Adjustment's
+`+0x28` focus callback**, the only one of the five config items whose
+`+0x28` is not the bare `jr ra` at `0x21F160`:
+
+```
+0x21EB80(item, focused):
+    if (!focused) { 0x21D748(0); return; }        /* disarm */
+    0x21D768(94, 85, 86, 87);                     /* Display/Back/Enter/Options */
+    0x21D758(0x5000);                             /* pad mask TRIANGLE|CROSS */
+    0x21D748(1);                                  /* arm */
+```
+
+It is fired by **`0x227D08`**, the config screen's tail, which keeps a
+latch in `gp-30404`:
+
+```
+open = timerIsState(0x27BE44, 2) && timerIsState(0x27EC40, 0)
+if (open)  { if (!*(gp-30404)) { items[cursor].fn28(&items[cursor], 1); *(gp-30404) = 1; }
+             hdr->mode == 0 ? 0x2279B8() : 0x227BE8(); }
+else       { if ( *(gp-30404)) { items[cursor].fn28(&items[cursor], 0); *(gp-30404) = 0; } }
+```
+
+and again, twice, by `0x2279B8` on every cursor move (off the old item,
+onto the new one - `lw v1, 40(a0); jalr v1` at 0x2279F0/0x227A28 for UP
+and 0x227A78/0x227AB0 for DOWN).
+
+**Consequence, and it is testable: move the cursor off Clock Adjustment
+and the triangle/"Options" hint disappears**, leaving set 2's three.
+Reproduced - see §7.3.
+
+### 2.5 The region swap
+
+`0x204318()` (via `0x204238`, a region/version word) selects both the
+hint block *and* `osdGetString`'s own 85/86 exchange.  `0x21D768` adds a
+third twist:
+
+```
+0x27B5D0[0] = a;  0x27B5D0[3] = d
+if (0x204318()) { 0x27B5D0[1] = (c == 86) ? 85 : c;      /* cross slot  */
+                  0x27B5D0[2] = (b == 85) ? 86 : b; }    /* circle slot */
+else            { 0x27B5D0[1] = b; 0x27B5D0[2] = c; }
+```
+
+It puts **argument c on the cross slot and argument b on the circle
+slot**, renaming 86->85 and 85->86 so that `osdGetString`'s exchange
+(which fires under the same flag) undoes the renaming.  Net, with the
+usual `(b, c) = (85, 86)`:
+
+* flag clear -> cross "Back", circle "Enter"  (the Japanese arrangement)
+* flag set   -> cross "Enter", circle "Back"  (what the screenshots show)
+
+The port has no region word.  `textRegionSwap` is `OsdArgInt(16, 1)` -
+default 1, the retail arrangement - and it is the only hook.  Both
+values verified (§7.4).
+
+---
+
+## 3. The page marker
+
+`0x227560`'s middle block, now that FNTEXOSD exists:
+
+```
+markW = 0x209998(gp-30416)       /* "\7o020"  -> 23 */
+gap   = 0x209998(0x2A79A8)       /* " "       -> 10 */
+x = 430
+if (x + markW + gap + hdr->maxw/2 >= screenW - 24)
+        x -= x + markW + gap + hdr->maxw/2 + 24 - screenW
+if (hdr->mode != 1 && screen fully open)
+        0x21DC28(x + hdr->maxw/2 + gap, labelY, 0x27B850,
+                 |(int)(128 * sinf(hdr->+0x34 / 10000.0))|, gp-30416)
+```
+
+`hdr->+0x34` is a sawtooth `0x227390`'s tail steps by **310** a frame
+and folds at **+-refreshRate*31400/60** (+-31400 NTSC, ~203 frames a
+lap); `0x21EE50` zeroes it on entering an item.
+
+With `maxw = 322` (id 111 at its 90 % size), `right = 430+23+10+161 =
+624 >= 616`, so **the clamp fires**: `x = 422` and the marker lands
+left-aligned at **593**.  Retail ink measured 594..617 in `ss-real2.png`
+(the glyph is 26 px wide with a 1 px ink inset).  Ours: 592/594.
+
+Note the two clamps still disagree by design - the marker's is computed
+off the header's *widest* label and each label's off *its own*.
+
+---
+
+## 4. The date/time header - `0x21D3A0`
+
+```
+y = (uiModel[0] == 2) ? 32 : 14                    /* * 0.5405/0.47 on PAL */
+0x22A3B8(0x1F0A10, evenOddFrame, 0, field)
+0x207F68(*(gp-32220) = 0.83)
+0x208110(96, 96, 96, 0x226A60())
+0x207E98(22, y);            0x209640(0x20A998(Y, M, D))
+prefix = 0x203928() ? "\7r0.88\7o019\7r0.00" : ""
+sprintf(buf, "%s %s", prefix, 0x20AAA0(h, m, s))
+0x207E98(screenW - 0x209998(buf) - 22, y);  0x209640(buf)
+```
+
+* the date format is `0x2039A8()` = the low 2 bits of `0x2B8704`: 0 ->
+  `"%04d/%02d/%02d"` (Y/M/D), 1 -> M/D/Y, 2 -> D/M/Y.  Only 0 is ported.
+* the clock face is `0x203968()` = bit 30 of `0x2B8700`: 24-hour is
+  `"\7p@0%2d\7p00:%02d:%02d"` (the `\7p` fixed-width bracket is a no-op
+  for the Latin face - '0'..'9' are all `{5,23}`); 12-hour appends
+  `" \7r0.80\7p@AA\7p00M\7r0.00"`.  Only 24-hour is ported.
+* the `"%s %s"` with an empty prefix gives the time string a **leading
+  space**, which is measured, so the pen lands 10 px further left than a
+  bare "18:27:45" would.  Reproduced.
+
+**Which screens show it.**  `0x226A60`:
+
+```
+a = 128
+if (timerIsState(0x27C258, 0)) {                  /* that screen closed */
+    if (!timerIsState(0x27DA70, 0)) return 0;     /* the wizard */
+    v = clamp(timerCount(0x27BE44) - (dur40 + dur80), 0, dur10)
+    a = (v << 7) / dur10
+}
+return a * getFadeAlpha() / 128
+```
+
+so on the **bare main menu the header is invisible** (0x27BE44's count is
+0) and it **fades up over the last ten frames of System Configuration's
+130-frame entry**.  That ramp is byte for byte the port's existing
+`MenuConfigAlpha()`, so `DrawTopBar` just calls it.
+
+Retail measurements (`ss-real1.png`, "2026/08/31" / "18:27:45"):
+date ink from x 26 (pen 22, matching '2' inset 4); time right edge 617
+against `screenW - 22 = 618`.  Ours: date 26, time ink from 510 against
+retail 510.
+
+**Data source.**  The ROM reads `uiModel[6..11]` (the RTC snapshot).
+osdbits has `hh:mm:ss` from argv and no date, so the port draws
+`cfgClockDate` = **2000/01/01** - the same fixed date the Clock
+Adjustment value row already shows.  That is the one visible divergence
+from retail in the header.
+
+---
+
+## 5. The letterbox - `0x21D368` -> `0x21D1F8`
+
+```
+0x21D368: t = uiModel[0]; if (t == 0 || t == 2) 0x21D1F8()
+```
+
+so the bars are drawn in **4:3 (0) and 16:9 (2)**, and only "Full" (1)
+loses them.
+
+```
+0x22A3B8(0x1F0A10, evenOddFrame, 0, 0);  0x22A0C0(1, 1)
+content = screenW / *(0x27B44C) * 0.0625*9.0 * *(0x27B450)
+bar     = (screenH - content) * 0.5
+top:    (0,0) .. (screenW<<4, (int)(bar*16))
+bottom: (0, (int)((screenH - bar)*16)) .. (screenW<<4, screenH<<4)
+record 0x27B4F0, RGBA (0,0,0,128), untextured
+```
+
+`0x21C9D0` writes `0x27B44C = 1.0` unconditionally and
+`0x27B450 = 0.5405` (PAL) or **`0.47`** (NTSC) - `docs/menu-draw.md`
+§9.3 used the PAL constant for its NTSC worked example and got 14.7 px.
+The right answer on a 640x224 NTSC field is
+
+```
+content = 640 * 0.5625 * 0.47 = 169.2
+bar     = (224 - 169.2)/2     = 27.4
+```
+
+Checked against `ss-real1.png`: the top black band is rows 0..57 of 480,
+i.e. 58 / 2.1428 = **27.1** field lines.  Our readback puts the top bar
+at y 0..27 and the bottom edge at y ~196.6, both exact.
+
+Note the ROM does **not** compute the two bars symmetrically - the top
+truncates `bar*16` and the bottom truncates `(screenH - bar)*16` - so
+they can differ by 1/16 px.  Reproduced rather than tidied.
+
+---
+
+## 6. What the port does
+
+All of it is in `osdbits/menutext.c` (plus two lines of `res.c` and one
+table in `tools/extract-res.py`); **no other file is touched**, and the
+merge needs **no hook in `menu.c`** - the three stages are called from
+the tail of `MenuTextFrame()`, which `menu.c` already calls at exactly
+the right point in the frame (after the 2D screens, before the swap), so
+the ROM's stage order 5-6-7-8 comes out right for free.
+
+New/changed, in the order they appear:
+
+| | real |
+|---|---|
+| `textRegionSwap`, `osdGetString`'s 85/86 exchange | 0x204318, 0x2041B8 |
+| `fontOsdTexture`, `GlyphFont`, `fontAscii` / `fontOsd` | 0x271578 slots 0 and 3 |
+| `osdTextSetScale` second half (the `\7r` percentage) | 0x207F68 |
+| `textBound`, `osdBindFont`, `osdDrawGlyph(font, g)` | 0x208460, 0x2086A0 |
+| `osdEscape()` replacing `osdEscapeLen()` | 0x209300, 0x2094AC, 0x209400 |
+| `osdTextWidth` / `osdTextDraw` kind-2 arms | 0x209998 / 0x209640 |
+| `configMenu.phase`, `cfgPhaseFold`, `cfgMarker` | 0x27BE28+0x34, 0x227390, 0x2A79A0 |
+| `DrawConfigMenu`'s marker block and `markw` clamps | 0x227560 |
+| `ConfigMenuInput`'s focus pair | 0x2279B8 |
+| `osdScreenType`, `osdFlatRect`, `DrawLetterbox` | 0x22B0E8(0), 0x2299C0, 0x21D368/0x21D1F8 |
+| `cfgFmtClockLine`, `DrawTopBar` | 0x20A998/0x20AAA0, 0x21D3A0 |
+| `maruTexture`, `iconUV`, `DrawIcon` | slot 9, 0x27B570, 0x21D590 |
+| `hintSet`, `hintX`, `hintGlyph`, `hintTextCol`, `hintCustom` | 0x27B5E8, 0x27B760, 0x27B7E0, 0x27B750, 0x27B5D0 |
+| `HintSetCustom`, `ConfigItemFocus`, `ConfigFocusNotify` | 0x21D768, 0x21EB80, 0x227D08 |
+| `HintSetAlpha`, `DrawHintSet`, `HintBarY`, `DrawHintBar` | 0x228660, 0x21D7F8, 0x21D9E0, 0x21DA68 |
+| `MenuTextDumpBand` + two chrome bands | not original, diagnostic |
+
+`osdScreenType()` returns `configItems[1].value` - the Screen Size item's
+own `+0x08`, which *is* `uiModel[0]` in the ROM (`0x21EDB8` re-syncs one
+from the other every frame).  So the letterbox, the header's row and the
+hint bar's row all follow that item, as they should.
+
+### Resources
+
+`res/FNTEXOSD_EXP.inc` (126 KB) and `res/TEXCMARU_EXP.inc` (101 KB) are
+**left in the scratch `osdbits/res/`** for the session owner to copy, as
+with MENUGEOM/TEXCBUMP.  `res/FONTDATA.inc` was regenerated and gains
+`fontOsdMetrics[35][2]`.  To reproduce:
+
+```
+python3 tools/extract-res.py <bios.bin> res --tables
+python3 tools/extract-res.py <bios.bin> /tmp/x --container FNTIMAGE   # FNTEXOSD
+python3 tools/extract-res.py <bios.bin> /tmp/x --container TEXIMAGE   # TEXCMARU
+cp /tmp/x/FNTEXOSD_EXP.inc /tmp/x/TEXCMARU_EXP.inc res/
+```
+
+Both `scph39001.bin` and `PS2 Bios 30004R V6 Pal.bin` in the PCSX2 bios
+directory give byte-identical output for all four resources, and
+FNTASCII from either matches the committed `res/FNTASCII_EXP.inc`
+(md5 33e67de9c2feea76779df069bb9ee3d0).
+
+---
+
+## 7. Verification
+
+Headless PCSX2, software renderer, on the already-running Xvnc `:99`
+(not started by me, not killed).  Clean `-Wall` build, no warnings.
+`chrome.diff` `git apply -p1 --check`s and round-trips.
+
+The readback (`MenuTextDump`) now prints the old item band **with its
+exact old window** plus four new half-width chrome bands - full width
+would exceed the emulator log's 254-character line limit and lose rows.
+
+Full transcripts: `evidence-cfg.txt`, `evidence-main.txt`,
+`evidence-cfg-cursor1.txt`, `evidence-cfg190.txt`,
+`evidence-cfg-noswap.txt`; raw logs in `logs/`.
+
+### 7.1 The main menu is bit-identical, and gains chrome
+
+`menu 12 34 56 200 1 0 0 0 0 140 10 0 0 0 1` against a pristine build of
+HEAD 509a89b (`../base/`):
+
+```
+main140 text band: IDENTICAL
+```
+
+New on the main menu, both from the ROM:
+
+* the **letterbox** (invisible in the readback there - the backdrop is
+  black at the top and bottom of the main menu at frame 140, so the bars
+  land on black; the config run below proves the geometry);
+* a **two-hint bar**: cross "Enter" at x 216/244 and, right-anchored,
+  triangle "Version" at 501/529.
+
+```
+chrome botL (x 0..320)                       chrome botR (x 320..640)
+ ......      ++++++.                          ..:...     .+:   -+.        +-
+.+*=..**:    #+.... --=+=  =#+-  -++.  -.+-  ...===...    ##   #*   ++=  --=+  -++-  -.  -++: .-:++:
+..-****...   #*==== *#=:#* :#=..##.-#*.##-.  ..==.==:..   .#* *#  +#=.##.*#*: =#=.#- #- #*:-#*.#*:+#.
+.:*****+..   #=     *#  #*  #- .#=====.#:    .==----=-.    -#-#-  *#====.*#   +*=*## #- #+  #*.#. .#:
+ *+...:*-    ##****:*#  #*  #*- -#+**..#:     ::::::::      *#+    *#+*+ *#   .#+=#= #- -*+** .#. .#:
+   ^cross           E n t e r                    ^triangle    V e r s i o n
+```
+
+**No clock on the main menu** - the whole `chrome top` band is black,
+as `0x226A60` says it should be.  This is a real change to the main
+menu's rendered frame; the *item band* used for regression is untouched.
+
+### 7.2 The config screen: all four pieces at once
+
+`menu 18 27 45 0 1 128 0 0 0 145 10 0 1 0 1 0`, readback at frame 145.
+Against the pristine build the item band **differs only by the page
+marker** (14 lines, all in columns 180..200 of the band = x 584..624):
+
+```
+chrome top (letterbox + header)
+|                                                       |  y 0..15  black bar
+|             *#***#. -#***#-  *#**#*  -#***#- ...      |  "2000/01/01" from x 26
+|             ======.  .===.    -==-    .===.  ...      |
+                              (topR, x 320..640)
+|          -+##   +#*+*#- .-  *#***#. *****#+ .-    ### |  "18:27:45" from x 510
+|          ::*#   +#*=##= -+. *+  +#-    *#=  -+. -***# |
+|            -=    -===.      ======.  :=.           == |
+
+text band, label row, columns 180..200        frame 145      frame 190
+                                              ::::---::*###+   :::::--:-=====-:
+                                              ::::::=**#####*+ ::::-:-========-
+                                              :::::::.....:::  ::::---:::::::::
+                                              :::::.:*#######= --::::-========-
+                                              :::::::.+#####=: --:::::::=====:
+```
+
+- the marker is the **up/down chevron pair**, ink from x 592, exactly
+  where §3's arithmetic puts it;
+- its **alpha pulses**: bright at frame 145 (`#`, predicted 125) and
+  dim at frame 190 (`=`, predicted 48) - the 310/frame sawtooth folded
+  at +-31400, through `|128 sin(phase/10000)|`.
+
+The bottom bar carries all four hints, at the columns tabulated in §2.1.
+
+### 7.3 Moving the cursor off Clock Adjustment drops "Options"
+
+Same run from a build whose only change is `OsdArgInt(15, 1)` (argv slot
+16 is unreachable - see §8), i.e. cursor on Screen Size:
+
+```
+chrome botL   square "Display"   cross "Enter"
+chrome botR   circle "Back"      <nothing right-anchored>
+```
+
+exactly set 2's three hints, confirming §2.4.
+
+### 7.4 The region hook, both ways
+
+Same run from a build with `textRegionSwap` defaulted to 0:
+
+```
+swap = 1 (default)   cross x213 "Enter"   circle x335 "Back"     <- retail
+swap = 0             cross x213 "Back"    circle x335 "Enter"
+```
+
+---
+
+## 8. Remaining gaps
+
+* **argv slot 16 is unreachable.**  PCSX2 delivers at most 16 `argv`
+  entries, so `OsdArgInt(15)` (`cfgCursor`) and `OsdArgInt(16)`
+  (`textRegionSwap`) always take their defaults - the same trap
+  `cfgtext/notes.md` hit.  Both §7.3 and §7.4 therefore came from
+  one-line temporary builds, reverted before the final build.  If either
+  is wanted at runtime the argv list needs a slot freed (or packing two
+  flags into one token).
+* **The date is 2000/01/01**, not the RTC - the port has no `uiModel`.
+  Consistent with the Clock Adjustment value row, which already does
+  this.  Wiring both to one clock source is a merge-time job.
+* **Date order and the 12-hour face** (`0x2039A8`, `0x203968`) are not
+  ported: no settings to select them.  Their format strings are in §4 if
+  they are ever wanted.
+* **`0x203928()`'s clock prefix** (`"\7r0.88\7o019\7r0.00"`, the
+  brightness sun, glyph 19) is never emitted - the flag has no
+  counterpart.  The glyph itself is on the uploaded page and would draw.
+* **TEXCSTSL is not uploaded**; `DrawIcon` returns early for glyphs
+  0 and 1.  Neither screen asks for START or SELECT.  Add the resource
+  and drop the early-out if a screen that does gets ported.
+* **Escapes other than `\7o` and `\7r`** still only advance the pointer.
+  The remaining arms of `0x209300` set the colour (`\7c`), the fixed
+  width (`\7p`), and so on; `\7p` is a genuine no-op for the Latin face,
+  the others are unused by the strings these screens draw.
+* **`0x21DB18`** (stage 9, the right-edge strip sprite at 0x27B7F0) is
+  not ported - it draws nothing on either screen, but it was not read.
+* **Hint sets 3..6** are in the table but their alpha functions
+  (`0x221060`, `0x21F980`, `0x226FD0`) belong to screens the port does
+  not have; `HintSetAlpha` returns 0 for them.
+* **The `0x226A48()` arm** of `0x21DA68` (set 7 at a flat 128) tests
+  `*(0x27BE40)`, a mode flag `0x228460` clears and nothing on these two
+  screens sets.  Left out with a comment.
+* The letterbox reads `configItems[1].value`, which is always 0 in the
+  port (no settings block), so only the 4:3 branch is ever exercised at
+  runtime.  The 16:9 branch (bars + header at y 32 + hint bar at y 182)
+  is ported but untested.
