@@ -366,6 +366,7 @@ DrawKabe(sceVu0FMATRIX cam, sceVu0FMATRIX vs)
 
 static u32 backScreenTbp;	/* TBP0 blocks of this frame's draw buffer */
 static int backFrameParity;
+static int backFrameField;
 
 /* real: the extents patch at the head of 0x21D0A0 and 0x22C190's, both
  * of which write x1/y1 = w<<4, h<<4 and u1/v1 = (w<<4)+8, (h<<4)+8 into
@@ -397,6 +398,26 @@ FullScreenBlit(u32 tbp, u32 psm, Color *col)
 	 * composite are opaque overwrites, and the ALPHA_1 0x22A0C0 pushes
 	 * around them never takes effect */
 	vif1SetTexRect(&full, &full, col, 0, 0);
+}
+
+/* real: 0x22A4C8 and 0x22A3B8 push XYOFFSET_1 next to FRAME_1 off a
+ * `field' argument, and every work-buffer site passes 0 for it -
+ * 0x22C3C0's 0x22A4C8(1,0,0) and 0x22A3B8(dbuff,evenOddFrame,0,0),
+ * 0x21D0A0's 0x22A4C8(0,0,0)/(1,0,0) - where only the scene's own
+ * 0x22A3B8(dbuff, evenOddFrame, 0x27B4A0, field) passes the real field.
+ * A retail dump of a half-offset frame shows exactly that: orbs and text
+ * at OFY 1936.5, all ten blur blits and the composite's at 1936.0.
+ *
+ * The half pixel is a per-field correction for the DISPLAY, so it must
+ * not ride along on a buffer-to-buffer resample.  Left in, the shrink
+ * lands 0.5 px off and the stretch magnifies that by 223/149.25 and adds
+ * another 0.5: 1.247 px per pass, 6.24 px over the five, on one field
+ * only - a second copy of the whole 3D layer alternating at 60 Hz.
+ * opening.c's DrawToExtraBuf2 brackets its own capture the same way. */
+static void
+BackHalfOffset(int on)
+{
+	vif1SetXYOffset(backFrameField, on);
 }
 
 /* real: the FRAME_1 half of 0x22A4C8 / 0x22A3B8.  0x22A4C8's third
@@ -470,6 +491,7 @@ ZoomBlur(int n)
 
 	vif1SetZWrite(0);
 	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) - ZTST ALWAYS */
+	BackHalfOffset(0);			/* real: 0x22BF58/0x22C020 pass field = 0 */
 	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 = 0x44, unused (ABE 0) */
 	x = 5108;
 	y = 2388;
@@ -489,6 +511,8 @@ ZoomBlur(int n)
 		x -= 32;
 		y -= 16;
 	}
+	/* real: the next 0x22A3B8 (the 2D layer's) puts the field back */
+	BackHalfOffset(1);
 	/* real: 0x22A0C0(1, 3) at the tail leaves ALPHA_1 = 0x44 and ZTST
 	 * GREATER; the port already holds 0x44 and the next stage
 	 * (menutext.c) sets both itself, so there is nothing to re-push. */
@@ -518,6 +542,7 @@ MenuBackFrameStart(void)
 	sceGsDrawEnv1 *env;
 
 	backFrameParity = evenOddFrame;
+	backFrameField = evenOddField;
 	env = backFrameParity == 0 ? &db.draw0 : &db.draw1;
 	backScreenTbp = env->frame1.FBP * 32;
 }
@@ -610,6 +635,7 @@ MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode)
 	 * matters to the zoom blur and to 0x2267E8's carousel bloom. */
 	vif1SetZWrite(0);
 	vif1SetZTest(0);
+	BackHalfOffset(0);	/* real: 0x22A4C8(...,field=0), as the blur */
 	SetTarget(extraBuf1);
 	FullScreenBlit(backScreenTbp, SCE_GS_PSMCT24, &whiteColor);
 	SetTarget(extraBuf2);
@@ -621,6 +647,7 @@ MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode)
 	 * the alpha each blit stores, which nothing downstream reads. */
 	SetScreenTarget();
 	FullScreenBlit(extraBuf1, SCE_GS_PSMCT32, &compositeColor);
+	BackHalfOffset(1);
 
 	backFrame++;	/* real: 0x2287D0, a separate stage of 0x21CF20 */
 }
