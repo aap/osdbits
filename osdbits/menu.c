@@ -881,6 +881,17 @@ DrawOrb(Orb *o)
 	zscale = o->trail[o->head].pos[2] * 6.5e-06f;	/* real *(gp-31992) */
 	baseAlpha = TimerInterp(&orbTrailTimer, 128);
 
+	/* real: 0x22F0CC, the FIRST thing 0x22EFF0 does -
+	 * 0x22A3B8(0x1F0A10, *(0x1F0C40), 0, *(0x27B448)), i.e. aim FRAME at
+	 * the visible buffer with the module's own field.  It looks
+	 * redundant on the main menu, where nothing else moves FRAME, and
+	 * that is exactly why it is here: 0x226700's sorted walk interleaves
+	 * orbs and carousel rods, and 0x22D920 leaves FRAME on work buffer 3
+	 * (its pass 5) without restoring it.  Every orb that sorts after a
+	 * rod would be drawn into a work buffer if it did not re-aim first.
+	 * The port needs it now that MeshDrawRod ports that chain. */
+	MenuBackScreenTarget(MenuBackField());
+
 	/* real: 0x22A0C0(0, 3) - additive, depth GREATER.  osdbits draws
 	 * the whole scene with the depth test off (as opening.c's DrawLights
 	 * does); with nothing but additive primitives in the scene the

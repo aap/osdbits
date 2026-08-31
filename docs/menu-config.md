@@ -2617,3 +2617,541 @@ swap = 0             cross x213 "Back"    circle x335 "Enter"
   port (no settings block), so only the 4:3 branch is ever exercised at
   runtime.  The 16:9 branch (bars + header at y 32 + hint bar at y 182)
   is ported but untested.
+
+---
+
+# Three glass problems on System Configuration, round two
+
+Scratch tree `/u/aap/.claude/jobs/58e316f8/tmp/glass2/osdbits`, on top of
+**509a89b**.  Deliverable diff: `glass2.diff` (`menu.c`, `menuconfig.c`;
++309/-35), `git apply -p1` from the repo root — checked with
+`git apply --check`.  `inc.h` and `menuback.c` are byte-identical to HEAD and
+not in the diff; `menutext.c`, `res.c` and `tools/extract-res.py` were never
+touched (the parallel workstream moved all three in the real tree while this
+job ran, so the diff deliberately excludes them).
+
+One new **untracked** resource: `res/TEXCREFA_EXP.inc`.  Regenerate it with the
+existing tool, unchanged —
+`python3 tools/extract-res.py <bios.bin> osdbits/res` — exactly as
+`res/TEXCBUMP_EXP.inc` is regenerated today (verified: the tool's TEXCBUMP
+output is byte-identical to the copy already in the tree).
+
+Method: `objdump -D -b binary -m mips:5900 -EL --adjust-vma=0x200000
+/u/aap/src/osdsys/expanded.bin`, every function read to its own `jr ra`;
+**live retail EE RAM and live retail GS local memory** out of the two
+savestates; headless PCSX2 software-renderer readbacks of the port, including
+a temporary full-frame RGB download so port and retail could be compared as
+images rather than as ASCII.  `gp = 0x2AF070`.  Everything below is **[ok]**
+unless marked.
+
+---
+
+## 0. The verdict in five lines
+
+| the owner's words | root cause | status |
+|---|---|---|
+| "there are black seams now" | `0x22CFA8`'s winding test was **inverted**, so every pass drew on the wrong face set | fixed |
+| "the refraction seems a bit backwards, as if the faces were rendered in the wrong order" | the same one line | fixed |
+| "the clock currently has no refraction either" | the rods' five-pass chain was collapsed to two passes on the screen | fixed (`MeshDrawRod`) |
+| the clock ring's orientation | **not a bug** — the ring is time-driven and the two screenshots were 2.4 s apart | proved, no change |
+| the big DARK sphere where retail glows | the same inverted winding | fixed |
+
+Two more found on the way, both quantified against retail's GS memory: the
+cubes were ~3.5x too dark (the un-ported `0x22CD78` reflection, now ported),
+and `0x22D920` leaves FRAME on work buffer 3 — which is safe, because every
+later stage pushes its own (§5).
+
+---
+
+## 1. The tools that made this tractable
+
+Both are new here and worth keeping.
+
+### 1.1 Live EE RAM
+
+`zipfile.ZipFile(p).read('eeMemory.bin')` — 32 MB, virtual addresses below
+`0x2000000` map 1:1 to file offsets.  `ram.py` in this directory wraps it.
+What it settled, at the exact instant of `ss-real1.png` (18:27:45):
+
+```
+0x34E6C0  carousel header   offset 6   spin -15635   tilt -32768
+0x34E6D0 + slot*48          progress 1.0, split 0.5373 on slot 6 only
+0x27E950  rod scene         +0x80 {45,96,102,128}  +0x90 160  +0xA0 {8,8,8,128}
+                            +0xB0/+0xB4 -0.0080     +0xB8 1.0  +0xC0 {60,60,60,128}
+0x27EFB0  cube scene        +0x60 0x352800  +0x64 0x352840 (identity, confirmed)
+                            +0x80 {100,100,100,128} +0x90 200 +0xA0 {8,8,8,128}
+                            +0xB0/+0xB4 +0.0100     +0xC0 {120,120,120,128}
+0x27F090  cube table        cursor cube {0,150,200,128} alpha 128, the other four
+                            {100,100,100,128} alpha 0 - i.e. 0x226BB8 as ported
+0x3529D0  face bank         cube 4's six faces, cull = 0,1,0,0,1,1
+0x34E980  the sorted list   19 records: 12 type-0 rods at |t| = 20.00 exactly,
+                            7 type-1 orbs at |t| = 13.34
+```
+
+The last line is the one that settled §4: **the port's `CarouselMatrix` already
+reproduces the ROM's rod world matrices to three decimals.**
+
+### 1.2 Live GS local memory
+
+`GS.bin` in the savestate is 4194813 bytes: PCSX2's register block, then the
+**4 MB of GS local memory at offset 425**, then a short tail.  `gsmem.py`
+de-swizzles PSMCT32 (page 8192 B / 64x32 px, `blockTable32`, `columnTable32`)
+and dumps any TBP as a PNG.  The offset was found by scanning 0..509 for the
+one that makes TBP 0 decode as a smooth image and match `ss-real1.png`
+pixel-for-pixel (offset 425: 5 sample points agree to a mean of 5 levels,
+including the alpha channel; 424 and 426 are byte-rotations of it).
+
+The buffer layout falls straight out of `0x22A198`/`0x22A290`
+(`w*h/64`, `3*w*h/64`, `w*h/16` in blocks) and is `2240`-block strides:
+
+| TBP | what |
+|---|---|
+| 0 | screen buffer 0 |
+| 2240 | screen buffer 1 |
+| 4480 | the Z buffer (all zeros this frame — nothing writes Z) |
+| **6720** | **work buffer 3** |
+| **8960** | **work buffer 4** |
+
+`gs_wb3.png` and `gs_wb4.png` in this directory are retail's two work buffers
+at 18:27:45.  Being able to read them is what turned three of the findings
+below from argument into arithmetic.
+
+---
+
+## 2. Issue 2 — "the refraction seems backwards": the winding test was inverted
+
+**One line, and it is the biggest fix in the diff.**
+
+`0x22CFA8`'s tail, read instruction by instruction:
+
+```
+22d1e4  a1 = *(sp+216)              ; v[2].proj   (22d0f0: v0 = s2+192)
+22d1ec  jal 0x2676f8 SubVector(sp+176, v[2].proj, v[0].proj)   ; e2
+22d1f4  a1 = *(sp+212)              ; v[1].proj   (22d0e0: v0 = s2+112)
+22d1fc  jal 0x2676f8 SubVector(sp+192, v[1].proj, v[0].proj)   ; e1
+22d214  f1 = e2.x * e1.y
+22d21c  f0 = e2.y * e1.x
+22d220  f1 = f1 - f0
+22d224  c.lt.s  f4(0.0), f1         ; cc = (0 < cross)
+22d22c  bc1f    0x22d238            ; NOT LIKELY - the delay slot always runs
+22d230  li      v0,1                ;   (delay)
+22d234  move    v0,zero             ; reached only when cc is TRUE
+22d24c  sw      v0,336(v1)          ; face->+0x150
+```
+
+`bc1f` has no likely bit, so `li v0,1` executes unconditionally and the branch
+skips `move v0,zero`.  Therefore
+
+```
+cull = !(e2.x*e1.y - e2.y*e1.x > 0)
+```
+
+and HEAD had `f->cull = (e2x*e1y - e2y*e1x) > 0.0f` — the exact opposite.
+
+**Confirmed against the live face bank.**  `0x3529D0` holds cube 4's six faces
+at the moment of `ss-real1.png`.  Their stored `+0x150` and the cross product
+of their own stored `+0x20` projected positions:
+
+| face | normal (camera space) | cross | ROM's cull | port's old rule |
+|---|---|---|---|---|
+| 0 | (0.103, 0.990, −0.093) | **+260** | 0 | 1 |
+| 1 | (−0.103, −0.990, 0.093) | **−95** | 1 | 0 |
+| 2 | (−0.104, 0.103, 0.989) | **+1417** | 0 | 1 |
+| 3 | (−0.989, 0.093, −0.114) | **+295** | 0 | 1 |
+| 4 | (0.104, −0.103, −0.989) | **−104** | 1 | 0 |
+| 5 | (0.989, −0.093, 0.114) | **−125** | 1 | 0 |
+
+Six for six inverted.  And the geometry agrees with the ROM, not with HEAD:
+the cube's centre is at camera-space (−11.25, 11.5, 47.5), so the faces whose
+normal points *away* from the eye — 0, 2, 3 — are the back set, and those are
+exactly the ones the ROM marks `cull == 0`.  `cull == 0` **is** the far layer,
+which is what `menuconfig.c` always claimed.
+
+### What it was doing to the picture
+
+Every pass in both walks keys on that flag, so all of them were on the wrong
+set at once:
+
+* `0x22D2E8` passes 1–4 (the far glass into wb4, its emboss, the flat layer)
+  ran on the **near** faces;
+* passes 5, 7, 8 (the silhouette, the near glass on the screen-facing layer,
+  its emboss) ran on the **far** faces.
+
+So the port drew the *back* of every cube on top and refracted the *front* into
+the buffer nobody sees — "as if the faces were rendered in the wrong order",
+which is precisely what it was.  The rods were saved by a second error
+cancelling this one: `MeshDrawRod` drew `back = 1` first and `back = 0` last,
+so with the flag inverted the last (visible) pass still landed on the right set.
+That is why HEAD's rods looked plausible while its cubes did not, and it is why
+the rod path had to be rewritten in the same commit (§4).
+
+### And it is where the black seams came from
+
+`ss-ours.png` and a HEAD dump at 18:27:45 (`base145.png`) show the same thing:
+a dashed dark diagonal across every cube face and dark outlines on the edges.
+With the flag corrected they are gone — compare `cubecmp2.png` (left: the port
+right after this one line; right: retail).  Nothing else changed in that build.
+
+The mechanism: with the sets swapped, the alpha/silhouette pass and the visible
+glass pass no longer partition the same silhouette the same way, so the darker
+layer's own edges — including each quad's tristrip diagonal — ran across the
+middle of the visible faces instead of hiding underneath them.
+
+**The dark sphere in the middle of the ring goes away with the same line.**
+It was the orb cluster showing through a wrongly-ordered glass stack; retail's
+glowing orbs and the port's now agree (`cmpcull.png`).
+
+---
+
+## 3. Issue 3a — the clock ring's orientation is **not** a bug
+
+`ss-ours.png` shows a face-on twelve-spoke fan where `ss-real1.png` shows a
+tight near-vertical bundle.  That difference is entirely the **clock**:
+
+* `0x225628` drives the ring's spin from the *seconds* hand.  At 45 s the target
+  is `45 * 65536/60 = 49152`, i.e. **−90°**: the ring is edge-on.  The live
+  retail value is `*(short*)0x34E6C4 = **−15635** = −85.9°`, and the tilt
+  `*(short*)0x34E6C6 = **−32768** = 180°`, which is `(hour%12) << 16 / 12` for
+  hour 18 — both exactly what `CarouselClock()` computes.
+* `ss-ours.png` was taken at a different second, i.e. tens of degrees away from
+  edge-on, and near 90° the projected ring width changes very fast: the ring's
+  world x extent is `20·cos(spin)`, which is 1.4 units at retail's −85.9° and
+  4.6 at −76.6°.
+
+Re-run with the clock seeded so the dumped frame lands at the same second
+(`menu 18 27 43 ... 145`, which reaches 45.4 s and spin −16125) and the port's
+ring is the same tight vertical bundle — `cmpcull.png`, `final-vs-retail.png`.
+
+**And the matrix chain itself is confirmed exact.**  `0x225F80` was re-read
+(`unit; mdRotZ(tilt); mdRotY(spin); mdRotZ((i<<16)/12 − 32768);
+mdTranslatef(0,20,0); mdRotY(spin*4)`, `0x230180` being *get* mdTop, not push)
+and `0x226028` copies mdTop into the scene's `+0x20`.  The live sorted list at
+`0x34E980` holds all twelve rod records; their translations are
+
+```
+(0,±20,0)  (±0.700,±17.319,∓9.976)  (±1.213,±10.001,∓17.277)  (±1.400,0,∓19.951)
+```
+
+— all `|t| = 20.00`, and slot 5's `(0.700, 17.319, −9.976)` is reproduced by the
+port's chain as `(0.714, 17.320, −9.974)`.  Nothing structural is missing.
+
+The camera is right too: the port's `menuCamPos (10.436,0,−103)` /
+`menuCamRot (0.031, 0.145, 0)` maps the front rod's tip (world `(0, 46.39, 0)`)
+to camera `(−10.44, 46.36, 101.6)`, against retail's own transformed copy in the
+second face bank `0x3555D0`: `(−12.38…−8.10, 46.09…46.23, 99.2…103.9)`.
+
+---
+
+## 4. Issue 3b — the rods' real five-pass chain, ported
+
+HEAD drew a rod as two untargeted passes on the screen, both sampling work
+buffer 3.  That is one layer of the same picture twice: soft, featureless
+sticks.  `0x22D920`'s `f12 <= 0` arm (`0x22E0EC`, which all twelve rods take —
+`0x226028` passes `f12 = −1.0` for every object but the front one) is five
+loops, and the whole crystalline look is in the first four:
+
+| # | ROM | target / texture | faces | emit |
+|---|---|---|---|---|
+| 1 | `0x22BFD0(1,0,1)` + `0x22A0C0(1,1)` | FRAME wb4, TEX wb3, field; ALPHA 0x44, ZTST ALWAYS | far (`cull==0`) | `0x22C888`, extra 0 |
+| 2 | `0x22AB90(2,1,2)` + `0x22A0C0(**2**,2)` | TEXCBUMP; ALPHA **0x42 subtractive**, ZTST GEQUAL | far | `0x22C920`, ST offset `f21 + i*(gp-32032)` |
+| 3 | `0x22A0C0(**0**,2)` | ALPHA **0x48 additive** | far | `0x22C920`, offset `scene->+0xB0 + f21 + i*(gp-32028)` |
+| 4 | `0x22C020(1,0,1)` + `0x22A0C0(1,2)` | FRAME **the screen**, TEX wb4, field; ALPHA 0x44, ZTST **GEQUAL** | near (`cull!=0`) | `0x22C888`, extra 0 |
+| 5 | `0x22BFD0(0,1,1)` + `0x22A0C0(1,2)` | FRAME wb3, TEX wb4, field | near | `0x22C888`, extra **255** (22e3c4: `li a2,255`) |
+
+`f21` is `0x22D920`'s head: `(float)scene->+0x00 * *(gp-32056)` = **slot × 0.1**,
+and `i` in passes 2/3 is the face *index*, incremented for skipped faces too
+(22e1ec `mtc1 s1,f12`).  Both `(gp-32032)` and `(gp-32028)` are 0.1.
+
+Two constants HEAD had wrong, both read out of the image:
+
+* **the refraction centre.**  `22d9c0/22d9c4` multiply `0x22CFA8`'s outX/outY by
+  `*(gp-32052) = 0.9` before any pass, exactly as `0x22D2E8` multiplies them by
+  `*(gp-32064) = 0.35`.  The port passed them through unscaled — and
+  `docs/menu-config.md`'s glass write-up says in as many words that the rod path
+  "hands `0x22C888` outX/outY unchanged".  It does not.
+* **the rod scene's emboss offset is −0.008**, not the cube's +0.01
+  (`0x27EA00 = bc03126f bc03126f` in the live image), and passes 2/3 are the
+  **mirror** of the cubes' order (subtractive first).
+
+All five loops are now in `MeshDrawRod`, with `MeshBumpPass` gaining the
+per-face phase step the rods need and the cubes pass as 0.
+
+**Measured.**  Frame 145 at 18:27:43+2.4 s, `final145_480.png` against
+`ss-real1.png`, 12x12-px means:
+
+```
+                     HEAD            after the chain      retail
+rod, upper bundle    ( 21, 42, 62)   ( 3,142,215)         ( 20,118,156)
+rod, lower bundle    ( 44, 57, 83)   (25,141,184)         ( 35, 96,118)
+```
+
+HEAD's rods are grey-blue mush; the ported chain puts them in retail's
+saturated cyan band with the same internal shard structure (`cmprod.png`).
+They now overshoot slightly in G/B and undershoot in R — see §8.
+
+---
+
+## 5. The `FRAME = wb3` question, resolved
+
+`0x22D920` really does return with FRAME pointing at work buffer 3 (its pass 5)
+and `0x226700` really does walk orbs and rods alternately with no drawenv of its
+own.  **Nothing needs to restore it: every stage that draws afterwards pushes
+its own FRAME first.**
+
+```
+0x226360 (orb)  -> 0x22FEC0 trail, then 0x22EFF0
+                   0x22F0CC: 0x22A3B8(0x1F0A10, *(0x1F0C40), 0, *(0x27B448))
+0x2267E8 (the carousel bloom, 0x2268F0's tail)
+                   0x22681C: 0x22A4C8(1, 0x27EBF0, field)   clear wb4
+                   0x226864: 0x22C020(1,0,0)                FRAME the screen
+0x226D00 (cubes)   0x22D2E8's 0x22BF58(1,0,1)
+the 2D layers      0x227560's / 0x2283A0's own 0x22A3B8
+```
+
+A whole-image caller scan for `0x22A3B8`/`0x22A4C8`/`0x22BFD0`/`0x22BF58`/
+`0x22C020` finds `0x22F0CC` inside the orb draw, which is the piece that makes
+the interleaving safe.  The port had no such push (nothing moved FRAME before),
+so porting the rods' chain required adding it — one call at the head of
+`DrawOrb`, and the main menu is still bit-identical afterwards (§7).
+
+The one thing that *does* land in a work buffer is the orb **trail**:
+`0x226360` calls `0x22FEC0` before `0x22EFF0`, and only `0x22EFF0` re-aims.  A
+trail that sorts after a rod is drawn into wb3, and retail's wb3
+(`gs_wb3.png`) shows exactly that — a dark torus of trail around the ring
+centre that is on no screen buffer.  The port draws its trail from inside
+`DrawOrb`, after the push, so it does not reproduce that; it is invisible on
+the screen either way.  Noted, not ported.
+
+---
+
+## 6. New: the cubes were 3.5x too dark, and `0x22CD78` is why
+
+### 6.1 The measurement
+
+`ss-real1.png` at (85,300): retail's cube face is `(62,57,70)`; the port's, with
+everything above fixed, was `(17,13,26)`; the background beside both is
+`(25,19,35)` in *both* to within a level.  A flat offset of **+44/+44/+44**.
+
+Retail's GS memory says where it comes from:
+
+```
+              screen            wb3               wb4
+(160,140)  (26,19,36, 0)   (67,69,84,  0)    (  0, 0, 0,  0)   background
+( 85,140)  (61,56,69,128)  (61,56,69,128)    ( 44,44,44,128)   a cube face
+( 60, 90)  (33,29,44,128)  (30,26,41,128)    (  5, 5, 5,128)
+(120,150)  (135,113,167,128)(142,122,176,128)( 31,31,31,128)
+```
+
+`0x226D00`'s tail adds wb4 over wb3 (`0x22C088`, additive) and then composites
+wb3 onto the screen through the alpha mask, so `screen = wb3_before + wb4`.
+`61 − 44 = 17`, `56 − 44 = 12`, `69 − 44 = 25` — **the port's own wb3 value**.
+The chain `menuconfig.c` already had was arithmetically right; the whole
+deficit was wb4.
+
+And wb4 is not black.  It carries smooth per-face grey over every cube
+(`gs_wb4.png`) — which is `0x22CD78`, the TEXCREFA spherical environment map,
+the one loop the previous write-up declined to port.
+
+### 6.2 Why it survives the black pass — the GS's AA1 rule
+
+`docs/menu-config.md`'s last write-up says `0x22CD78` is "by the ROM's own
+ordering, invisible: `0x22CA68` redraws the SAME `cull != 0` faces immediately
+afterwards with `PRIM = 132`, whose ABE is clear, so the black overwrites it".
+**Retail's wb4 disproves that**, and the reason is the AA1 rule: with AA1 set
+the GS blends regardless of ABE, and `0x22CA68` runs under `0x22A0C0(0,3)` =
+ALPHA_1 `0x48` = `Cs*As + Cd` with `Cs = 0`.  It adds no colour at all.  It is
+an **alpha-only pass** — that is how it makes the mask, and it is why the
+reflection is still underneath it.
+
+The same correction applies to `0x22D2E8` pass 5: it does not "prime the cube's
+area of work buffer 3 to black", it stamps `A = 0x80` there and leaves the
+colour alone.
+
+### 6.3 As ported
+
+`0x22CD78(face, scene, aa)`, read to its `jr ra`, is per **vertex**:
+
+```
+n = sceVu0Normalize(v.cam)                          ; 0x2677E0
+d = 2 * sceVu0InnerProduct(n, face.normal)          ; 0x267818 then f0+f0
+if(d < 0) d = -d                                    ; 22ce80..22ceb4
+r = sceVu0AddVector(n, ScaleVector(normal, d))      ; 0x267710 is ADD, 0x267050 SCALE
+UV   = ((r.x + 1) * 512, (r.y + 1) * 256)           ; 0x25A368, 1/16 units
+PRIM = aa ? 404 : 276     (0x22D798 passes aa = 1)
+RGBAQ= scene->+0xC0 = {120,120,120,128}
+XYZ2 = v.fix, no z + 1
+```
+
+`r = n + N|2(n·N)|` is `reflect(n, N)` written for a normal that faces the eye.
+TEXC slot 5's descriptor `0x27F1C0 + 5*12` is `{0x01E3BCB0, 6, 6}` — a 64x64
+page — and the decoder table `0x2A4BA0[5]` is `0x22A720`, **the same grey
+expander slot 2 (TEXCBUMP) uses**, so one decode serves both.  The bind is
+`0x22AB90(5,0,1)` (ALPHA 0x48, ZTST ALWAYS).
+
+Result at the same probe: the port's cube face goes `(17,13,26)` →
+`(64.6, 59.9, 73.4)` against retail's `(61.8, 57.0, 70.1)` — a 4 % match, with
+the cubes at different spin phases so exact equality is not expected.
+`cubecmp3.png` is the before/after against retail.
+
+**Where the resource lives.**  `res.c` already has the
+`{ "TEXCREFA", nil, 0, RES_COMPSUBFILE }` row and `res.h` already has
+`RESID_TEXCREFA`; only the `.inc` include and the two
+`resources[RESID_TEXCREFA].data/.size` lines are missing, and `res.c` belongs to
+the parallel workstream.  So `menuconfig.c` includes `res/TEXCREFA_EXP.inc`
+itself and uses the array directly, with a comment saying so.  **Moving those
+three lines into `res.c` and calling `GetResourceData(RESID_TEXCREFA)` is the
+tidy version and is a five-minute merge.**
+
+---
+
+## 7. Verification
+
+Headless PCSX2 2.6.3, **software** renderer, Xvnc :99, `ee-gcc 2.9-ee-991111
+-O2`, clean build, no warnings.  Logs in `logs/`.
+
+* **Main menu bit-identical.**  `menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`,
+  whole-frame 8x8 map at frame 60, against a build of HEAD's own sources made
+  in this tree: **0 of 2296 blocks differ** (`logs/final-mm60.log` vs
+  `logs/head2-mm60.log`; `logs/new-mm60.log` is the same check one edit
+  earlier).  Also 0 against the real tree's current `main.elf`.
+  Everything new is behind the cube/carousel timers except `DrawOrb`'s FRAME
+  push, which is a no-op while nothing else moves FRAME.
+* **Leave path unchanged.**  `... 220 0 0 0 10 0 1 140 1` (enter 1, leave 140,
+  dump 220): **0 of 2296 blocks differ** from HEAD.
+* **Config screen.**  `menu 18 27 43 0 1 128 145 0 0 0 10 0 1 0 1`,
+  `logs/new-cfg145.log` — tunnel, edge-on rod bundle, five cubes and all three
+  text rows.  The colour side-by-side is `final-vs-retail.png`
+  (`final145_480.png` is the port alone, `final145.png` the raw 640x224).
+* **The RGB readback** used for every image here was a temporary extension of
+  `DumpFrameAscii` (`debugFrame + 10000/20000/30000` selecting the screen /
+  work buffer 4 / work buffer 3).  It is **removed from the diff**; `menu.c`'s
+  only change is the eleven-line `DrawOrb` block.  If you want it back: PCSX2
+  truncates each EE `printf` at ~256 bytes, so the dump has to emit ≤ 32 pixels
+  (192 hex chars) per line — at 80 px/line exactly half of every line was lost
+  silently.  `mkpng.py` rebuilds the PNG from the log (and has to re-join
+  PCSX2's wrapped log entries first).
+
+---
+
+## 8. Remaining deltas on this screen
+
+In rough order of visible effect.
+
+1. **A 1-px dashed dark line along each cube face's tristrip diagonal**, in the
+   software renderer.  Much smaller than HEAD's seams (which were the §2 bug)
+   but real: a 40–64 level dip on a ~62 face, one pixel wide, dashed.
+   Bisected, each with its own run (`logs/`):
+
+   | switched off | seam |
+   |---|---|
+   | AA1 in `MeshEmitFace` (passes 1/7) | unchanged |
+   | AA1 in `MeshEmitFlatFace` (pass 4) | unchanged |
+   | the black pass `0x22CA68` (pass 5) | unchanged |
+   | the TEXCBUMP emboss (passes 2/3/8) | unchanged |
+   | `0x22C100` (pass 6) | unchanged — **it is a no-op in the port**, wb3's alpha is still 0 when it runs |
+   | `0x22CCE8`/`0x22CB58` (pass 4, the flat far layer) | **mostly gone**, and the cubes turn much brighter |
+   | `meshTex = 0` (all texturing) | **gone completely** |
+
+   So it is not antialiasing, not the silhouette, not the emboss, and not a
+   rasterisation gap (untextured cubes are clean, `wb3notex.png`); it lives in
+   the textured far layer.  It is **not** pose-dependent either: re-rendered at
+   retail's own cube rotation (`cubeSpin = 38628`, frame 1288, solved from
+   `0x27EFB0`'s live world matrix) the cubes show retail's two-face pose and the
+   lines are still there (`pose_zoom.png`).  Retail's own work buffer 3
+   (`retail_wb3_zoom.png`) is clean at the same stage, so one detail of the
+   far-layer path is still wrong.  **Next measurement:** a mid-frame GS dump of
+   retail's wb4 (before `0x226D00` clears it) — the savestates were both taken
+   after the clear, so the far glass layer is the one thing the ground truth
+   here cannot show.
+2. **The rods are over-cyan.**  Ours `(3,142,215)` against retail's
+   `(20,118,156)`.  Two known contributors: `0x2267E8`'s two-pass additive
+   carousel bloom (`0x22E428` into a cleared wb4, then wb4 over the screen at
+   alpha 30, twice) is still not ported and would lift R the most; and the ring
+   colour cyclers `0x225528`/`0x2255A8` are not ported, so the port uses
+   `0x27EAC0`'s idle `{45,85,102}` where the live retail value at 18:27:45 is
+   `{45,**96**,102}`.
+3. **`0x22D920`'s `f12 > 0` arm** — the front rod splitting along Y.  Still not
+   ported, and it *is* active in retail: the live ring has
+   `split = 0.5373` on slot 6 (`splitMax = 1 − 27/60 = 0.55`, still growing).
+   One visible shard of retail's bundle is missing from the port.  The split
+   *rate* is now the ROM's `*(gp-32164) = 0.004` (it was 0.02).
+4. **`0x2267E8`**, as above — also the only consumer of the second face bank
+   and of `0x22E428`.
+5. **`MenuConfigSetCursor()` is still unwired** (`menutext.c`'s one line);
+   unchanged from HEAD.
+6. **The tunnel is smoother than retail's** (issue 4).  Not chased, as asked.
+   The one thing that stands out from the GS dump: retail's wb3 shows the
+   un-tinted tunnel with much more mottling than the port's at the same
+   `backPhase`, and the port's `DrawKabe` is the only place a scroll phase could
+   differ — worth one look at `0x229358`'s T advance before anything else.
+
+---
+
+## 9. Corrections to `docs/menu-config.md`
+
+Numbered against the three appended write-ups.
+
+1. **The glass write-up §2c/§5 and the refraction write-up §4.1 both describe
+   `cull == 0` as the far set and `cull != 0` as the near set.**  That is
+   correct — but the *port* computed the flag inverted, and neither write-up
+   states the rule as the ROM has it.  It is
+   `cull = !(cross > 0)`, i.e. **1 when the cross product is ≤ 0** (§2), and
+   the live face bank at `0x3529D0` is the check.
+2. **The refraction write-up §3.3 — "`0x22CA68` … in `0x22D2E8` pass 5 it
+   primes the cube's area of work buffer 3 to black".**  It does not.  AA1
+   forces blending regardless of ABE and the pass runs under ALPHA `0x48`
+   (`Cs*As + Cd`) with `Cs = 0`, so it adds nothing and only writes
+   `A = 0x80`.  It is an alpha-only pass in **both** walks.
+3. **The refraction write-up §3.6 / §8 — "`0x22CD78` … is also, by the ROM's own
+   ordering, invisible".**  It is not: retail's work buffer 4 carries its grey
+   over every cube face (§6.1), it is the cubes' only colour in that buffer, and
+   `0x22C088` adds it to the frame.  Not porting it made the cubes 3.5x too
+   dark.
+4. **The refraction write-up §7 — "`f21` is `0x22D920`'s
+   `(float)rec->slot * *(gp-32056)`"** is right, but the same section says the
+   rod path "hands `0x22C888` outX/outY unchanged".  `22d9c0`/`22d9c4` scale
+   both by `*(gp-32052)` = **0.9**.
+5. **The refraction write-up §7 — "`0x22D920` ends with FRAME = work buffer 3
+   and nothing restores it … that is a real ROM behaviour with visible
+   consequences and it wants its own investigation".**  Answered (§5): the orb
+   draw pushes its own FRAME at `0x22F0CC`, and so does every later stage.  The
+   only thing that really lands in a work buffer is the orb *trail*
+   (`0x22FEC0`, called before the push), and retail's wb3 shows it.
+6. **The rod table in the refraction write-up §7, rows 4 and 5** — both run
+   under `0x22A0C0(1,**2**)`, i.e. ZTST **GEQUAL**, not ALWAYS.
+7. **The original §10.2 — "`0x225628`'s tilt/spin easing rate … hard-coded 0.1
+   **[tnt]**".**  `*(gp-32168)` is indeed **0.1**; the tag can be dropped.  But
+   the ROM's steady-state lag behind the seconds hand is bigger than the port's
+   (retail spin −15635 where the target is −16384, i.e. 749 units; the port
+   settles ~170 behind), so something else in `0x225628` still differs.  It is
+   worth a look only because near 90° the ring's projected width is very
+   sensitive to it.
+8. **The original §10.2's split rate** — `*(gp-32164)` is 0.004 and the port now
+   uses it.
+9. **New, for `docs/menu-scene.md`**: the GS buffer map is
+   `0 / 2240 / 4480(Z) / 6720(wb3) / 8960(wb4)` in blocks for a 640x224 screen,
+   straight out of `0x22A198`/`0x22A290`, and the Z buffer is all zeros in a
+   settled config frame — nothing on this screen writes Z.
+
+---
+
+## 10. Deliverables and cleanup
+
+* `glass2.diff` — `osdbits/menu.c`, `osdbits/menuconfig.c`; `git apply -p1`
+  from the repo root, checked.
+* `notes.md` — this file.
+* `final-vs-retail.png` — the config screen at 18:27:45, port | retail.
+  `cmp145.png` (HEAD), `cmpcull.png` (after §2), `cmprod.png` (after §4),
+  `cmprefl.png` (after §6) are the four steps.
+* `gs_wb3.png` / `gs_wb4.png` / `gs_scr0.png` — retail's live GS buffers;
+  `wb3cmp.png` / `wb4cmp.png` the port beside them.
+* `ram.py`, `gsmem.py`, `mkpng.py`, `fn.sh` — the four throwaway tools
+  (savestate EE RAM, savestate GS memory, log-to-PNG, function printer).
+* `logs/` — every run above.  `ascii.sh` is the `config/` harness with `ELF=`
+  taken from the environment so a reference build runs through the same path.
+* Xvnc `:99` was started and killed by this job (it died once mid-job and was
+  restarted); no `pcsx2-qt` left running; `ulimit -c 0` throughout, no cores.
+  **No PCSX2 setting was changed** (no `-setting`, no ini edit) and the two
+  savestates were only ever read.
+* The real tree `/u/aap/src/ps2rev/osdsys` was not touched and nothing was
+  committed.

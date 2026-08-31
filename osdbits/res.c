@@ -8,6 +8,7 @@
 #include "res/TEXCBUMP_EXP.inc"
 #include "res/TEXCKABE_EXP.inc"
 #include "res/TEXCNAVI_EXP.inc"
+#include "res/TEXCREFA_EXP.inc"
 #include "res/TEXOBLPR_EXP.inc"
 #include "res/TEXOBLP_EXP.inc"
 #include "res/TEXOCRBL_EXP.inc"
@@ -195,6 +196,9 @@ LoadResources(void)
 	/* the four shape-button icons the hint bar draws (menutext.c) */
 	resources[RESID_TEXCMARU].data = TEXCMARU_EXP;
 	resources[RESID_TEXCMARU].size = TEXCMARU_EXP_len;
+	/* the cubes' spherical environment map (menuconfig.c) */
+	resources[RESID_TEXCREFA].data = TEXCREFA_EXP;
+	resources[RESID_TEXCREFA].size = TEXCREFA_EXP_len;
 }
 
 u8*
