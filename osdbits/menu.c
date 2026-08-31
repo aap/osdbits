@@ -22,7 +22,12 @@
  *
  * Run it as
  *     main.elf menu [hh [mm [ss [framelimit [fromOpening [fadeAlpha
- *                    [debugFrame]]]]]]]
+ *                    [debugFrame [cursor [notext [textDump [backPhase
+ *                    [back [cfgEnter [cfgLeave [meshTex
+ *                    [cfgCursor]]]]]]]]]]]]]]]]
+ * cfgEnter/cfgLeave are frame numbers at which to call
+ * MenuEnterConfig()/MenuLeaveConfig() - the headless stand-in for the
+ * pad (menuconfig.c); 0 means never.
  * All optional; with no arguments the clock is seeded from the cycle
  * counter and the scene runs forever.  fromOpening (default 1) decides
  * whether all seven orbs fly in or only orb 0; fadeAlpha starts the
@@ -54,9 +59,12 @@
 static float clockMs;
 static int clockSec, clockMin, clockHour;
 
-static float ClockSeconds(void) { return clockSec + clockMs*0.001f; }
-static float ClockMinutes(void) { return clockMin + ClockSeconds()/60.0f; }
-static float ClockHours(void)   { return clockHour + ClockMinutes()/60.0f; }
+float MenuClockSeconds(void) { return clockSec + clockMs*0.001f; }
+float MenuClockMinutes(void) { return clockMin + MenuClockSeconds()/60.0f; }
+float MenuClockHours(void)   { return clockHour + MenuClockMinutes()/60.0f; }
+#define ClockSeconds MenuClockSeconds
+#define ClockMinutes MenuClockMinutes
+#define ClockHours MenuClockHours
 
 /* real: 0x22BB30's ms integration, minus the RTC resync */
 static void
@@ -115,7 +123,7 @@ InitClock(void)
  * Layout, as for sceVu0FMATRIX: m[col][row], so m[3] is the translation
  * and (M v)[r] = sum_c m[c][r]*v[c]. */
 
-static void
+void
 matUnit(sceVu0FMATRIX m)
 {
 	int c, r;
@@ -125,14 +133,14 @@ matUnit(sceVu0FMATRIX m)
 			m[c][r] = c == r ? 1.0f : 0.0f;
 }
 
-static void
+void
 matCopy(sceVu0FMATRIX d, sceVu0FMATRIX s)
 {
 	memcpy(d, s, sizeof(sceVu0FMATRIX));
 }
 
 /* d = a x b, the sceVu0MulMatrix(d, a, b) argument order */
-static void
+void
 matMul(sceVu0FMATRIX d, sceVu0FMATRIX a, sceVu0FMATRIX b)
 {
 	sceVu0FMATRIX t;
@@ -146,7 +154,7 @@ matMul(sceVu0FMATRIX d, sceVu0FMATRIX a, sceVu0FMATRIX b)
 }
 
 /* o = m x v, the sceVu0ApplyMatrix(o, m, v) argument order */
-static void
+void
 matApply(sceVu0FVECTOR o, sceVu0FMATRIX m, sceVu0FVECTOR v)
 {
 	sceVu0FVECTOR t;
@@ -270,11 +278,11 @@ matViewScreen(sceVu0FMATRIX m, float scrz, float ax, float ay,
  * sceVu0MulMatrix(top, top, R), i.e. top = top x R.  (The camera builder
  * 0x22ED20 pre-multiplies instead - see MenuCameraMatrix.) */
 
-static sceVu0FMATRIX mdTop;
+sceVu0FMATRIX mdTop;
 
 #define MDANGLE(a) ((a) * (TAU/65536.0f))
 
-static void
+void
 mdRotX(int a)
 {
 	sceVu0FMATRIX r;
@@ -282,7 +290,7 @@ mdRotX(int a)
 	matMul(mdTop, mdTop, r);
 }
 
-static void
+void
 mdRotY(int a)
 {
 	sceVu0FMATRIX r;
@@ -290,7 +298,7 @@ mdRotY(int a)
 	matMul(mdTop, mdTop, r);
 }
 
-static void
+void
 mdRotZ(int a)
 {
 	sceVu0FMATRIX r;
@@ -301,7 +309,7 @@ mdRotZ(int a)
 /* real: mdTranslate 0x2303E8 / mdTranslatef 0x230440 - the top matrix's
  * translation column becomes ApplyMatrix(top, v), i.e. translate in the
  * matrix's own frame, accumulating onto the existing translation. */
-static void
+void
 mdTranslatef(float x, float y, float z)
 {
 	sceVu0FVECTOR v, o;
@@ -476,8 +484,8 @@ static int orbCoreColor[4] = { 0x80, 0x80, 0x80, 0x80 };
 /* the two matrices 0x21CF20 builds on its stack and hands to every
  * stage; the scene struct at 0x27E950 keeps pointers to them at +0x60
  * (viewscreen) and +0x64 (camera) */
-static sceVu0FMATRIX menuCamera;
-static sceVu0FMATRIX menuViewScreen;
+sceVu0FMATRIX menuCamera;
+sceVu0FMATRIX menuViewScreen;
 /* real 0x27E970 = the scene struct's world matrix (scene+0x20) */
 static sceVu0FMATRIX menuWorld;
 
@@ -538,23 +546,11 @@ PushTrail(int i, float *pos, int *col)
  *
  * real: the dummy head at 0x34E980 with 320-byte records after it,
  * singly linked through +0, insertion-sorted ascending by the view
- * depth at +4 (0x225D18).  Only type 1 (orb) records exist here; the
- * type != 1 branch is the fly-in mesh objects, which are out of scope
- * but kept as a hole in the walk so they can be dropped in later. */
+ * depth at +4 (0x225D18).  Type 1 is an orb (0x225ED0); type 0 is one
+ * of the twelve System Configuration fly-in rods (0x225DD8), drawn by
+ * menuconfig.c.  The record layout is in inc.h. */
 
-#define MAXRECS 16
-
-typedef struct SceneRec SceneRec;
-struct SceneRec
-{
-	SceneRec *next;		/* +0x000 */
-	float key;		/* +0x004 view depth */
-	sceVu0FMATRIX world;	/* real +0x030 (the scene-struct copy at
-				 * +0x010, whose world matrix is at +0x20) */
-	int type;		/* +0x0F0 */
-	float f12;		/* +0x0F4 */
-	int index;		/* +0x130 */
-};
+#define MAXRECS 32
 
 static SceneRec sceneRecs[MAXRECS];
 static SceneRec sceneHead;
@@ -610,6 +606,39 @@ SceneAddOrb(int i)
 	rec->type = 1;
 	rec->f12 = 0.0f;
 	rec->index = i;
+	SceneInsert(rec);
+}
+
+/* real: 0x225DD8 - append a fly-in mesh record.  The ROM copies the
+ * whole 224-byte scene struct into the record (so the world matrix lands
+ * at +0x30) and writes the two colour qwords at +0x100 and +0x120, the
+ * split at +0xF4 and the front-object flag at +0x110; this carries the
+ * same fields as named members. */
+void
+SceneAddMesh(sceVu0FMATRIX world, int slot, float progress, float size,
+	float split, const int *col0, const int *col1,
+	const int *colA, const int *colB, int aux)
+{
+	SceneRec *rec;
+	int k;
+
+	if(sceneNumRecs >= MAXRECS)
+		return;
+	rec = &sceneRecs[sceneNumRecs++];
+	rec->key = SceneDepth(world);
+	matCopy(rec->world, world);
+	rec->type = 0;
+	rec->f12 = split;
+	rec->index = slot;
+	rec->progress = progress;
+	rec->size = size;
+	rec->aux = aux;
+	for(k = 0; k < 4; k++) {
+		rec->col0[k] = col0[k];
+		rec->col1[k] = col1[k];
+		rec->colA[k] = colA[k];
+		rec->colB[k] = colB[k];
+	}
 	SceneInsert(rec);
 }
 
@@ -936,7 +965,8 @@ SceneWalk(void)
 	for(rec = sceneHead.next; rec; rec = rec->next)
 		if(rec->type == 1)
 			DrawOrbRecord(rec);
-		/* else: 0x2266E0 -> 0x22D920, the fly-in mesh objects */
+		else
+			MenuConfigDrawMesh(rec);	/* real: 0x2266E0 -> 0x22D920 */
 }
 
 /* ============================== init ============================== */
@@ -1021,6 +1051,7 @@ InitMenuScene(void)
 	/* real: 0x21CE58 also runs do_load_font (0x21DBA0) and the
 	 * per-screen init 0x228460 - menutext.c */
 	InitMenuText();
+	InitMenuConfig();
 
 	SceneReset();
 }
@@ -1053,13 +1084,14 @@ DrawFadeCurtain(void)
  *   0x22B020  the fade curtain (0x22AFB8)                [ported]
  *   0x2283F0  per-screen UI init hub                     [not scene]
  *   0x21D368  letterbox, 0x21D3A0/0x21DA68/0x21DB18 UI   [not scene]
- *   0x225BF8  the fly-in carousel timer                  [deferred]
+ *   0x225BF8  the fly-in carousel timer                  [ported]
  *   0x2285C0/0x2287D0/0x22B588/0x22BE30 UI               [not scene]
  *   0x22B058  the fade counter                           [ported]
  *   0x22BB30  clock tick                                 [ported]
  * The 0x2268F0 stage's carousel fly-in (0x226028) only fires while the
- * carousel's progress exceeds 0.05, which never happens without the
- * carousel, so it is correctly inert here rather than missing. */
+ * carousel's progress exceeds 0.05, and its timer (0x27EB00) is opened
+ * only by "enter System Configuration", so on the main menu the whole
+ * mesh half of the list is correctly inert. */
 static void
 MenuFrame(void)
 {
@@ -1081,16 +1113,21 @@ MenuFrame(void)
 	 * that tints the whole screen deep blue.  It has to run between the
 	 * camera and the object list because its last act overwrites the
 	 * frame buffer (menuback.c). */
-	/* aap ground truth (real console): the TEXCKABE tunnel is NOT
-	 * visible in the main menu, only in System Configuration - like the
-	 * 12-rod clock carousel it must be gated on that screen's entry
-	 * (suspect: the never-opened fade timer 0x27F190, the way the
-	 * carousel's 0x27EB00 is opened only by "enter System Config").
-	 * Default off here; argv[11] (back=1) shows it for tuning until a
-	 * System Config mode exists. */
-	if(OsdArgInt(11, 0))
+	/* aap ground truth (real console): the TEXCKABE tunnel is visible
+	 * ONLY in System Configuration.  The ROM's own per-screen signal for
+	 * that is the backdrop fade timer 0x27F190, whose sole opener
+	 * (0x2291E8) is called from one place in the whole image - 0x2272B8,
+	 * inside "enter System Configuration" - and whose sole closer
+	 * (0x229230) from that screen's leave path.  0x229358 does not itself
+	 * gate the mesh on it (menuback.c's MenuBackdropVisible documents the
+	 * divergence); argv[11] still forces it on. */
+	if(MenuBackdropVisible() || OsdArgInt(11, 0))
 		MenuBackdrop(menuCamera, menuViewScreen, menuFadeMode);
 	SceneReset();
+	/* real: 0x2268F0's head - the fly-in emitter runs before the orbit
+	 * so the rods sort into the same list as the orbs */
+	if(MenuConfigCarouselActive())
+		MenuConfigEmit();	/* real: 0x226028 */
 	UpdateOrbs();
 	SceneWalk();
 	/* real: 0x2283D0, the FIRST thing stage 5 (0x2283F0) does, before any
@@ -1105,11 +1142,20 @@ MenuFrame(void)
 	 * linear, so blur(lerp(scene, black, a)) == lerp(blur(scene), black,
 	 * a) either way. */
 	MenuZoomBlur();
+	/* real: 0x226FA8, 0x2283F0's second slot - the five config cubes,
+	 * drawn over the blurred scene and before any 2D layer */
+	MenuConfigCubes();
+	/* real: 0x227DE8, 0x2283F0's sixth slot - the System Configuration
+	 * screen's own Anim and state machine */
+	MenuConfigStep();
 	/* real: 0x2283F0's main-menu slot (0x2283A0), which runs between
 	 * the 3D list and the letterbox.  The fade words are 0x22AD30/
 	 * 0x22AD28's job in the ROM; pass them instead of exporting them. */
 	MenuTextFrame(menuFadeMode, menuFadeAlpha);
 	DrawFadeCurtain();
+	/* real: 0x225BF8, stage 10 - after the 2D layer, so the progress the
+	 * emitter reads at stage 3 is always the previous frame's */
+	MenuConfigCarousel();
 	FadeStep();
 	ClockTick();
 }
@@ -1160,13 +1206,24 @@ DumpFrameAscii(int par)
 }
 
 /* real: 0x21CA38's inner frame loop (the screen-id dispatch that ends
- * it has no counterpart here - osdbits has no screens to leave to) */
+ * it has no counterpart here - osdbits has no screens to leave to).
+ *
+ * NOT original: argv[12]/argv[13] are a headless stand-in for the pad,
+ * for runs where no controller is attached.  The real path in is
+ * MenuSelectItem(1) below. */
 void
 DoMenuScene(void)
 {
-	int par;
+	int par, enterFrame, leaveFrame;
+
+	enterFrame = OsdArgInt(12, 0);
+	leaveFrame = OsdArgInt(13, 0);
 
 	for(;;) {
+		if(enterFrame > 0 && frameCount == enterFrame)
+			MenuEnterConfig();
+		if(leaveFrame > 0 && frameCount == leaveFrame)
+			MenuLeaveConfig();
 		if(menuDebug && frameCount % 10 == 0)
 			printf("menu frame %d (fade %d/%d)\n",
 				frameCount, menuFadeMode, menuFadeAlpha);
@@ -1208,17 +1265,13 @@ DoMenuScene(void)
 	}
 }
 
-/* NOT original (a hook, not a reconstruction): where the main menu's
- * confirm button ends up.  n is the item index - 0 Browser, 1 System
- * Configuration - i.e. what the ROM's 0x228278 turns into a screen
- * change (the System Configuration entry is also what opens the timers
- * the 12-rod carousel and the TEXCKABE tunnel are gated on, 0x27EB00 and
- * the never-opened 0x27F190).
- *
- * Deliberately empty: the System Configuration screen is being built in
- * parallel and the two get wired together at merge. */
+/* real: the two arms of 0x228278's CIRCLE branch.  n is the item index
+ * - 0 Browser (0x227F50(0), no counterpart here), 1 System
+ * Configuration (0x227268).  The pad layer calls this; menuconfig.c
+ * owns everything the entry switches on. */
 void
 MenuSelectItem(int n)
 {
-	(void)n;
+	if(n == 1)
+		MenuEnterConfig();	/* real: 0x227268 */
 }

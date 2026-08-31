@@ -19,6 +19,7 @@ OBJS        = crt0.o \
               menu.o \
               menuback.o \
               menutext.o \
+              menuconfig.o \
               pad.o \
               towerchain.o \
               $(TARGET).o

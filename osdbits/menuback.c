@@ -136,6 +136,47 @@ BackTimerInterp(BackTimer *t, int n)
 	return t->duration ? t->count*n/t->duration : 0;
 }
 
+/* real: 0x2291E8 and 0x229230, the timer's ONLY opener and closer.  A
+ * whole-image scan of the call graph finds exactly one call site each:
+ * 0x2272B8 inside "enter System Configuration" (0x227268) and 0x227478
+ * inside that screen's state machine (0x227390).  Nothing else in the
+ * image touches 0x27F190's state, so the timer being open is precisely
+ * "the System Configuration screen is up". */
+void
+MenuBackFadeOpen(void)
+{
+	if(bgTimer.state == 0) {
+		bgTimer.count = 0;
+		bgTimer.edge = 1;
+		bgTimer.state = 1;
+	}
+}
+
+void
+MenuBackFadeClose(void)
+{
+	if(bgTimer.state == 2) {
+		bgTimer.edge = 1;
+		bgTimer.count = bgTimer.duration;
+		bgTimer.state = 3;
+	}
+}
+
+/* NOT original as a gate.  0x229358 draws the tunnel whenever the
+ * module-wide fade is idle, on every screen - and a retail GS dump of
+ * the main menu really does contain all sixteen ribbons, bright.  Yet
+ * the retail main menu measures (0,0,0) everywhere outside the orb glow
+ * and aap confirms from the console that the tunnel is a System
+ * Configuration-only sight (docs/menu-backdrop.md 11 and its
+ * resolution).  Whatever makes the retail main menu black happens below
+ * the GIF stream and has not been found; the ROM's own per-screen signal
+ * for this screen is 0x27F190, so the port keys the mesh on it. */
+int
+MenuBackdropVisible(void)
+{
+	return bgTimer.state != 0;
+}
+
 /* ======================== small math helpers ========================
  *
  * The ROM does its trig with a 16384-entry quarter-wave table at
@@ -467,6 +508,24 @@ BlurBlit(u32 tbp, u32 psm, int x1, int y1, int u1, int v1)
 	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox, oy, 0));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(u1, v1));
 	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox + x1, oy + y1, 0));
+	vif1End();
+}
+
+/* real: 0x22A290(0) - point TEX0 at work buffer 3, the copy of the frame
+ * MenuBackdrop() takes before the object list runs.  0x22D920's glass
+ * passes sample it by screen position, so the rods and cubes refract
+ * whatever the backdrop drew behind them.  TW/TH are the ROM's literal
+ * 10 and 8, and CLAMP/CLAMP is what sceGsSetDefTexEnv writes. */
+void
+MenuBackBindScreenCopy(void)
+{
+	vif1Begin();
+	pktSetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(1, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(extraBuf1, screenW/64, SCE_GS_PSMCT32,
+		10, 8, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+	/* TW 10 / TH 8 are the ROM's literals, and the glass primitives push
+	 * their own CLAMP_1 = REPEAT/REPEAT, so 1024 wraps U and 256 wraps V */
+	pktSetAD(SCE_GS_CLAMP_1, SCE_GS_SET_CLAMP(0, 0, 0, 0, 0, 0));
 	vif1End();
 }
 

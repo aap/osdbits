@@ -33,10 +33,12 @@
  *
  * Extra argv (menu mode), continuing menu.c's list:
  *     main.elf menu hh mm ss framelimit fromOpening fadeAlpha
- *                   debugFrame [cursor [notext]]
+ *                   debugFrame [cursor [notext [textDump [backPhase
+ *                   [back [cfgEnter [cfgLeave [meshTex [cfgCursor]]]]]]]]]
  * cursor (default 0) picks the item the highlight STARTS on; the pad
  * (pad.c, MainMenuInput below) moves it from there.  notext = 1
  * suppresses the whole 2D layer (for the orbs-only regression run);
+ * cfgCursor picks which System Configuration item starts highlighted;
  * textDump is a frame number at which to read the item band back out of
  * GS memory and print it at 2x2 px per character, fine enough to read
  * the glyph shapes (menu.c's DumpFrameAscii is 8x8, too coarse for
@@ -492,9 +494,62 @@ MainMenuAlpha(int fadeAlpha)
 	return a * fadeAlpha / 128;
 }
 
+/* ================= the System Configuration item list =================
+ *
+ * Its page header is static data at 0x27BE28 - {title 91 "System
+ * Configuration", items 0x27BD10, count 5, rows 0, cursor 0} - and the
+ * five 56-byte item records give the string ids below plus each item's
+ * own widget callbacks (0x21DF28 and friends, none of them ported).
+ * The five cubes menuconfig.c draws are these five items. */
+
+/* real: 0x27BD10 + n*56 + 0x00 */
+static const int configItemStr[5] = { 106, 107, 111, 114, 117 };
+static int configCursor;
+
+/* Where the labels go is NOT the ROM's: 0x227D08 hands the drawing to
+ * each item's own widget, and those are unported.  The port hangs each
+ * label off its cube's projected position instead, which at least keeps
+ * the two halves of the screen consistent with each other. */
+static void
+DrawConfigMenu(int fadeAlpha)
+{
+	const int *col;
+	float x, y;
+	int i, alpha;
+
+	alpha = MenuConfigAlpha(fadeAlpha);
+	if(alpha < 16)
+		return;
+	osdTextSetScale(1.0f);
+	for(i = 0; i < 5; i++) {
+		if(!MenuConfigItemPos(i, &x, &y))
+			return;
+		col = i == configCursor ? colSelected : colUnselected;
+		drawTextL(screenW/2 + (int)x + 24, screenH/2 + (int)y - 10,
+			col, alpha, osdGetString(configItemStr[i]));
+	}
+}
+
+/* real: the System Configuration screen's own share of 0x2279B8's
+ * UP/DOWN arms.  Confirm is not wired: each item's widget callback
+ * (0x27BD10 + n*56 + 0x14) is a whole sub-screen and none are ported. */
+static void
+ConfigMenuInput(void)
+{
+	if(!MenuConfigOpen())
+		return;
+	if((pad.dirPress & PAD_UP) && configCursor > 0)
+		configCursor--;
+	if((pad.dirPress & PAD_DOWN) && configCursor < 4)
+		configCursor++;
+	/* real: 0x2279B8's TRIANGLE arm leaves the screen (0x2210C8) */
+	if(pad.press & PAD_TRIANGLE)
+		MenuLeaveConfig();
+}
+
 /* real: 0x228050 - open the menu once the module's fade-up has come far
  * enough, close it again when the fade-out is complete.  The real guard
- * 0x227FC0 ("no other screen is open") is constant-true here. */
+ * 0x227FC0 ("no other screen is open") is MenuConfigOpen() here. */
 static void
 MainMenuStep(int fadeMode, int fadeAlpha)
 {
@@ -517,6 +572,10 @@ DrawMainMenu(int fadeAlpha)
 	int i, y, alpha;
 
 	alpha = MainMenuAlpha(fadeAlpha);
+	/* real: 0x228110's own guard 0x227FC0 - the main menu's labels are
+	 * suppressed the moment another screen's Anim leaves state 0 */
+	if(MenuConfigOpen())
+		return;
 	/* real: 0x228110 returns unless the Anim is state 2 (fully open) -
 	 * the labels do NOT fade in with it.  What makes them appear
 	 * gradually is 0x227E18's getFadeAlpha() factor: the Anim opens at
@@ -570,6 +629,8 @@ InitMenuText(void)
 	mainMenuAnim.duration = mainMenuDur;
 
 	mainMenu.cursor = clamp(OsdArgInt(7, 0), 0, mainMenu.count-1);
+	/* real: 0x27BE28's cursor, moved by 0x2279B8's UP/DOWN arms */
+	configCursor = clamp(OsdArgInt(15, 0), 0, 4);
 
 	printf("osdsys: menu text, cursor %d (\"%s\")\n",
 		mainMenu.cursor, osdGetString(mainMenuItems[mainMenu.cursor].strid));
@@ -590,6 +651,10 @@ MainMenuInput(void)
 	int moved = 0;
 
 	if(!mtIsState(&mainMenuAnim, 2))
+		return;
+	/* real: 0x228278's own 0x227FC0 guard - once System Configuration is
+	 * up, its own handler (0x2279B8) owns the pad */
+	if(MenuConfigOpen())
 		return;
 
 	if((pad.dirPress & PAD_UP) && mainMenu.cursor > 0) {
@@ -622,6 +687,9 @@ MenuTextFrame(int fadeMode, int fadeAlpha)
 	mtStep(&mainMenuAnim);
 	MainMenuStep(fadeMode, fadeAlpha);
 	MainMenuInput();
+	ConfigMenuInput();
 	DrawMainMenu(fadeAlpha);
+	/* real: 0x227DE8's tail 0x227D08, one slot earlier in 0x2283F0 */
+	DrawConfigMenu(fadeAlpha);
 	/* the readback itself moved to DoMenuScene's post-swap window */
 }

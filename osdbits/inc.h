@@ -143,6 +143,66 @@ int OsdArgInt(int n, int def);
 void InitMenuScene(void);
 void DoMenuScene(void);
 
+/* the deferred, depth-sorted draw list (real: the dummy head at
+ * 0x34E980 with 320-byte records after it).  Type 1 is an orb
+ * (0x225ED0), type 0 one of the twelve System Configuration fly-in rods
+ * (0x225DD8); the mesh half of the record is the subset of the ROM's
+ * 224-byte scene-struct copy that menuconfig.c actually reads. */
+typedef struct SceneRec SceneRec;
+struct SceneRec
+{
+	SceneRec *next;		/* real +0x000 */
+	float key;		/* real +0x004 view depth */
+	sceVu0FMATRIX world;	/* real +0x030 */
+	int type;		/* real +0x0F0 */
+	float f12;		/* real +0x0F4 the front rod's split */
+	int index;		/* real +0x130 orb index / ring slot */
+	float progress;		/* real: the scene struct's +0x6C */
+	float size;		/* real: the scene struct's +0x90 */
+	int col0[4];		/* real: the scene struct's +0x80 */
+	int col1[4];		/* real: the scene struct's +0xC0 */
+	int colA[4];		/* real +0x100 */
+	int colB[4];		/* real +0x120 */
+	int aux;		/* real +0x110 */
+};
+
+void SceneAddMesh(sceVu0FMATRIX world, int slot, float progress, float size,
+	float split, const int *col0, const int *col1,
+	const int *colA, const int *colB, int aux);
+
+/* menu.c's software clock (real: the 0x352980 block's accessors
+ * 0x22B5E8 / 0x22B6B0 / 0x22B720) */
+float MenuClockSeconds(void);
+float MenuClockMinutes(void);
+float MenuClockHours(void);
+
+/* menu.c's matrix layer, in plain C because freesce's libvu0 is broken
+ * (see the header comment there); the camera and view-screen matrices
+ * 0x21CFD8 rebuilds every frame; and the 0x230000 MatrixDrive stack. */
+extern sceVu0FMATRIX menuCamera, menuViewScreen, mdTop;
+void matUnit(sceVu0FMATRIX m);
+void matCopy(sceVu0FMATRIX d, sceVu0FMATRIX s);
+void matMul(sceVu0FMATRIX d, sceVu0FMATRIX a, sceVu0FMATRIX b);
+void matApply(sceVu0FVECTOR o, sceVu0FMATRIX m, sceVu0FVECTOR v);
+void mdRotX(int a);
+void mdRotY(int a);
+void mdRotZ(int a);
+void mdTranslatef(float x, float y, float z);
+
+/* ---- menuconfig.c: the System Configuration screen ---- */
+void InitMenuConfig(void);
+void MenuEnterConfig(void);	/* real: 0x227268 */
+void MenuLeaveConfig(void);	/* real: the closing arm of 0x227390 */
+void MenuConfigStep(void);	/* real: 0x227DE8 */
+void MenuConfigCarousel(void);	/* real: 0x225BF8 */
+void MenuConfigEmit(void);	/* real: 0x226028 */
+int MenuConfigCarouselActive(void);
+void MenuConfigDrawMesh(SceneRec *rec);
+void MenuConfigCubes(void);	/* real: 0x226FA8 */
+int MenuConfigOpen(void);
+int MenuConfigAlpha(int fadeAlpha);
+int MenuConfigItemPos(int i, float *x, float *y);
+
 /* ---- menutext.c: the readback diagnostic, run from DoMenuScene's
  * post-swap window ---- */
 int MenuTextDumpFrame(void);
@@ -153,6 +213,10 @@ void InitMenuBackdrop(void);
 void MenuBackFrameStart(void);
 void MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode);
 void MenuZoomBlur(void);
+void MenuBackFadeOpen(void);	/* real: 0x2291E8 */
+void MenuBackFadeClose(void);	/* real: 0x229230 */
+int MenuBackdropVisible(void);
+void MenuBackBindScreenCopy(void);
 
 /* ---- menutext.c: the menu's 2D text/item layer ---- */
 void InitMenuText(void);
