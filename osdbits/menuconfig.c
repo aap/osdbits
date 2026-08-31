@@ -460,31 +460,134 @@ MeshEmitBumpFace(MeshFace *f, const int *col, float ofsx, float ofsy)
 	vif1End();
 }
 
-/* real: 0x22C888 - the Fresnel term.  normalize(vertex 0 in camera
- * space) dotted with the camera-space face normal, so 0 head-on and 1
- * edge-on: the glass is bright only at its silhouette. */
+/* real: 0x22CB58, the emit behind 0x22CCE8.  A THIRD primitive, and the
+ * simplest of the three: PRIM = 196 = TRIANGLE_STRIP | ABE | AA1 with
+ * **TME clear**, so the texture the caller's 0x22BFD0 just bound is not
+ * sampled at all.  The colour is the scene's own +0x80 scaled by the
+ * SQUARE of the Fresnel term (0x22CB58's `f20 = f12*f12' before the three
+ * `mul.s' + `trunc.w.s' + clamp-at-255 blocks), alpha a flat 0x80, and
+ * the four XYZF2 come straight out of the face record's +0x30 triple.
+ *
+ * GIFtag 0x27F880 (REGLIST, NREG 6, {PRIM, RGBAQ, XYZF2 x4}), a byte-for-
+ * byte twin of 0x22CA68's 0x27F870. */
+static void
+MeshEmitFlatFace(MeshFace *f, float fres, const int *col)
+{
+	float s = fres*fres;
+	int r, g, b, k;
+
+	r = (int)(s * (float)col[0]); if(r >= 256) r = 255;
+	g = (int)(s * (float)col[1]); if(g >= 256) g = 255;
+	b = (int)(s * (float)col[2]); if(b >= 256) b = 255;
+
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 0, 0, 0,
+		1, 1, 0, 0, 0));	/* real: 196 */
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(r, g, b, 0x80, 0));
+	for(k = 0; k < 4; k++)
+		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
+			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
+	vif1End();
+}
+
+/* real: 0x22CA68 - the fourth and last emit, and it takes only the face:
+ * PRIM = 132 = TRIANGLE_STRIP | AA1, no TME, no ABE, no IIP, RGBAQ a flat
+ * BLACK with A = 0x80, and Z bumped by one (`addiu a1,a1,1' on the +0x38
+ * word) under 0x22A0C0(x, 3)'s ZTST GREATER.  Same GIFtag family
+ * (0x27F870).
+ *
+ * It has two jobs, one per walk.  In 0x22D2E8 pass 5 it primes the cube's
+ * area of work buffer 3 to black, so pass 7's refraction is all the glass
+ * shows and none of the pre-object copy leaks through.  In 0x22D798 it is
+ * the whole point of the second walk: drawn into a work buffer 4 that was
+ * just cleared to alpha 0, its A = 0x80 IS the composite's mask.
+ *
+ * (RGBAQ's Q is `lui a2,0x3f8' = 0x03F80000, a ROM slip for 1.0f's
+ * 0x3F800000.  Dead - PRIM has TME clear - and reproduced as 0.) */
+static void
+MeshEmitBlackFace(MeshFace *f)
+{
+	int k;
+
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 0, 0, 0,
+		0, 1, 0, 0, 0));	/* real: 132 */
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0, 0, 0, 0x80, 0));
+	for(k = 0; k < 4; k++)
+		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
+			(int)(f->v[k].proj[1]*16.0f),
+			(int)(f->v[k].proj[2]*16.0f) + 1));
+	vif1End();
+}
+
+/* real: 0x22C888 and 0x22CCE8's shared head - normalize(vertex 0 in
+ * camera space) dotted with the camera-space face normal, so 0 head-on
+ * and 1 edge-on: the glass is bright only at its silhouette. */
+static float
+MeshFresnel(MeshFace *f)
+{
+	float d, l;
+
+	l = sqrtf(f->v[0].cam[0]*f->v[0].cam[0] +
+	          f->v[0].cam[1]*f->v[0].cam[1] +
+	          f->v[0].cam[2]*f->v[0].cam[2]);
+	if(l == 0.0f)
+		return -1.0f;
+	d = (f->v[0].cam[0]*f->normal[0] +
+	     f->v[0].cam[1]*f->normal[1] +
+	     f->v[0].cam[2]*f->normal[2]) / l;
+	return 1.0f - (d < 0.0f ? -d : d);
+}
+
+/* `back' selects the winding 0x22CFA8 wrote into the face record's
+ * +0x150: 0 is the cull == 0 set (the ROM's first, FAR layer) and 1 the
+ * cull != 0 set (its last, NEAR layer). */
 static void
 MeshDrawPass(MeshModel *mdl, const int *col, float size, int back, int extra)
 {
 	MeshFace *f;
-	float d, l, fres;
+	float fres;
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++) {
 		f = &meshFaces[i];
 		if((f->cull != 0) != back)
 			continue;
-		l = sqrtf(f->v[0].cam[0]*f->v[0].cam[0] +
-		          f->v[0].cam[1]*f->v[0].cam[1] +
-		          f->v[0].cam[2]*f->v[0].cam[2]);
-		if(l == 0.0f)
+		fres = MeshFresnel(f);
+		if(fres < 0.0f)
 			continue;
-		d = (f->v[0].cam[0]*f->normal[0] +
-		     f->v[0].cam[1]*f->normal[1] +
-		     f->v[0].cam[2]*f->normal[2]) / l;
-		fres = 1.0f - (d < 0.0f ? -d : d);
 		MeshEmitFace(f, fres, col, size, extra);
 	}
+}
+
+/* real: the 0x22CCE8 loop (0x22D2E8 pass 4) */
+static void
+MeshFlatPass(MeshModel *mdl, const int *col, int back)
+{
+	MeshFace *f;
+	float fres;
+	int i;
+
+	for(i = 0; i < mdl->nfaces; i++) {
+		f = &meshFaces[i];
+		if((f->cull != 0) != back)
+			continue;
+		fres = MeshFresnel(f);
+		if(fres < 0.0f)
+			continue;
+		MeshEmitFlatFace(f, fres, col);
+	}
+}
+
+/* real: the 0x22CA68 loops (0x22D2E8 pass 5, 0x22D798's second) */
+static void
+MeshBlackPass(MeshModel *mdl, int back)
+{
+	int i;
+
+	for(i = 0; i < mdl->nfaces; i++)
+		if((meshFaces[i].cull != 0) == back)
+			MeshEmitBlackFace(&meshFaces[i]);
 }
 
 /* real: the 0x22C920 halves of the same per-face loops - same cull test,
@@ -499,108 +602,237 @@ MeshBumpPass(MeshModel *mdl, const int *col, int back, float ofsx, float ofsy)
 			MeshEmitBumpFace(&meshFaces[i], col, ofsx, ofsy);
 }
 
-/* THE PASS STRUCTURE.
+/* THE PASS STRUCTURE, as the ROM has it.
  *
- * 0x22D2E8 (the cubes) runs EIGHT loops over the face bank, five for the
- * front faces and three for the back, spread over the two work buffers:
+ * 0x22D2E8 (one cube) runs EIGHT loops over the face bank, and NOT ONE of
+ * them draws on the screen.  `far' below is the cull == 0 set 0x22CFA8's
+ * winding test picks out, `near' the cull != 0 set; the ROM always draws
+ * far first and near last, which is what makes the pair a two-layer piece
+ * of glass rather than two coats of the same one:
  *
- *   1  0x22BF58(1,0,0)  FRAME wb4, TEX **the screen** (0x22A198)
- *                       front, 0x22C888 -> 0x22C4E0, extra 0
- *   2  0x22AB90(2,1,2)  TEXCBUMP; 0x22A0C0(0,2) additive
- *                       front, 0x22C920, offset (+0xB0, +0xB4) = 0.01
- *   3  0x22A0C0(2,2)    subtractive
- *                       front, 0x22C920, offset (0, 0)
- *   4  0x22BFD0(0,1,1)  FRAME wb3, TEX wb4 - front, 0x22CCE8
- *   5  0x22A0C0(0,3)    back, 0x22CA68
- *   6  0x22BFD0(1,0,0) + 0x22C100()   wb3 -> wb4, half-width blit
- *   7  0x22BFD0(0,1,1)  back, 0x22C888  (again against wb4)
- *   8  0x22AB90/0x22A0C0 as 2 and 3    back, 0x22C920 x2
+ *   1  0x22BF58(1,0,1)  FRAME wb4, TEX **the live screen** (0x22A198,
+ *                       PSMCT24) - far faces, 0x22C888 -> 0x22C4E0, extra 0
+ *   2  0x22AB90(2,1,2)  TEXCBUMP; 0x22A0C0(0,2) = ALPHA 0x48 additive
+ *                       far, 0x22C920, ST offset (+0xB0,+0xB4) = 0.01
+ *   3  0x22A0C0(2,2)    = ALPHA 0x42 subtractive
+ *                       far, 0x22C920, offset (0, 0)
+ *   4  0x22BFD0(0,1,1)  FRAME wb3, TEX wb4 - far, 0x22CCE8 -> 0x22CB58
+ *                       (untextured, colour x fres^2)
+ *   5  0x22A0C0(0,3)    ZTST GREATER - near, 0x22CA68 (untextured BLACK)
+ *   6  0x22BFD0(1,0,0) + 0x22C100()  wb3 -> wb4, additive, LEFT HALF only
+ *   7  0x22BFD0(0,1,1)  FRAME wb3, TEX wb4 - near, 0x22C888, extra 0
+ *   8  0x22AB90 / 0x22A0C0(0,2) then (2,2)  - near, 0x22C920 x2
  *
- * and 0x226D00's tail then copies wb4 into wb3, runs 0x22C2A0's
- * work-buffer-3 twin of the zoom blur over it and blits wb3 back over the
- * screen opaquely (0x22C190(0)).
+ * so work buffer 4 collects the FAR glass refracting the finished screen,
+ * and work buffer 3 collects a black cube silhouette with the NEAR glass
+ * refracting work buffer 4 painted over it.  0x226D00 then runs all five
+ * cubes through that, and only afterwards:
  *
- * The port keeps the six loops that carry the picture - refraction plus
- * the two-offset emboss, back faces then front faces - and draws them all
- * straight onto the screen.  The wb3/wb4 ping-pong, 0x22CCE8/0x22CA68 and
- * the wb3 blur composite are still NOT ported.
+ *   0x22A4C8(1, 0x27F180, field)   clear wb4 to {0,0,0,**0**}
+ *   five x 0x22D798                near faces only, into the cleared wb4:
+ *                                  0x22CD78 (TEXCREFA reflection) then
+ *                                  0x22CA68 again - black, A = 0x80
+ *   0x22BFD0(0,1,0) + 0x22C088()   wb4 -> wb3, ADDITIVE
+ *   0x22C2A0(phase < 5 ? 5-phase : 0)   the work-buffer zoom blur
+ *   0x22C020(0,0,0) + 0x22C190(1)  wb3 -> the screen, **ABE = 1**
  *
- * That last gap decides the refraction SOURCE.  Loop 1's texture really is
- * the live screen (0x22A198), i.e. the tinted composite after the five
- * zoom-blur round trips - but its FRAME is work buffer 4, and 0x226D00's
- * tail ends by blitting work buffer 3 back over the screen opaquely
- * (0x22C190(0)), so what the player sees is the work buffers' content, and
- * both of them still hold 0x21D0A0's copy of the BRIGHT, un-tinted tunnel.
- * Binding the screen in a port that also draws onto the screen gets the
- * texture right and the destination wrong, and measurably so: with the
- * screen as the source the cubes read `----' against the backdrop, with
- * work buffer 3 (extraBuf1, what the ROM's destination holds) they read
- * `%%%%%##%%#'.  So the port keeps extraBuf1 for both meshes.
+ * The second walk is a MASK GENERATOR.  wb4 is cleared to alpha 0, the
+ * only thing painted into it is 0x22CA68's black at A = 0x80, and
+ * 0x22C088 - whose colour add therefore contributes nothing - copies that
+ * alpha into wb3 (the GS writes As to the destination alpha whatever the
+ * blend equation does to RGB).  0x22C190(1) then blends wb3 over the
+ * screen by that alpha, so the stage replaces the frame exactly inside
+ * the cubes and leaves the tunnel, the orbs and the rods untouched
+ * everywhere else.
  *
- * The RODS (0x22D920's 0x22E0EC arm) have the same five front-face loops
- * with their own per-face bump phase (`f21 + i * *(gp-32032)'); only the
- * refraction pass is ported for them, and their texture stays the
- * pre-object copy work buffer 3 really holds (0x22BFD0(1,0,1)). */
+ * WHY THIS IS THE FIX.  eba5595 collapsed the eight loops to two, drawn
+ * straight on the screen, and had to bind extraBuf1 (wb3) as the
+ * refraction source because binding the screen "measurably killed" the
+ * cubes.  Both halves of that were the same bug: wb3 is 0x21D0A0's copy
+ * of the frame taken BEFORE the composite multiplies it by
+ * {0x37,0x28,0x3C}/128, so the collapsed chain painted a ~3x brighter,
+ * un-tinted image of the backdrop onto the tinted backdrop - glass that
+ * glows is glass that reads as a solid milky block.  Measured on HEAD at
+ * frame 145, cube 0's face against the background 30 px to its left:
+ *
+ *     face  (5,117,185) (152,166,202) (0,80,131)
+ *     bkgd  (33,26,49)  (31,24,47)    (27,21,40)
+ *
+ * i.e. 3-6x, exactly the reciprocal of the tint.  The ROM has no such
+ * problem because pass 1's texture IS the tinted screen and the result
+ * only ever reaches the frame through 0x22C190(1)'s masked composite.
+ *
+ * NOT PORTED, and why: 0x22CD78, the second walk's first loop.  It is a
+ * spherical environment map - reflect(normalize(v.cam), normal) turned
+ * into UV = ((r.x+1)*512, (r.y+1)*256) over TEXC slot 5 = TEXCREFA, at
+ * the cube scene's +0xC0 = {120,120,120,128} - and the port ships no
+ * TEXCREFA (res.c has no entry and res/ no .inc).  It is also, by the
+ * ROM's own ordering, invisible: 0x22CA68 redraws the SAME cull != 0
+ * faces immediately after it with PRIM 132, whose ABE is clear, so the
+ * black overwrites it everywhere the depth test lets the black through -
+ * and the cubes' z is ~22000 against the tunnel's 43..526, so GREATER
+ * passes everywhere.  Only its AA1 edge pixels can survive.
+ *
+ * THE RODS (0x22D920's 0x22E0EC arm) are a different shape and need no
+ * fix.  Their five loops are
+ *
+ *   1  0x22BFD0(1,0,1)  FRAME wb4, TEX wb3   far,  0x22C888
+ *   2  0x22A0C0(2,2)    subtractive          far,  0x22C920, phase
+ *                                            f21 + i * *(gp-32032)
+ *   3  0x22A0C0(0,2)    additive             far,  0x22C920, phase
+ *                                            +0xB0 + f21 + i*(gp-32028)
+ *   4  0x22C020(1,0,1)  FRAME **the screen**, TEX wb4  near, 0x22C888
+ *   5  0x22BFD0(0,1,1)  FRAME wb3, TEX wb4   near, 0x22C888, extra 255
+ *
+ * - pass 4 puts their visible content on the screen DIRECTLY, with no
+ * work-buffer composite anywhere in the path, so the brightness mismatch
+ * above simply does not arise for them: in the ROM as in the port the
+ * rods sample an un-tinted copy and draw it onto the tinted frame, which
+ * is why retail's rods glow and its cubes do not.  What the port still
+ * skips for them is the first glass layer (passes 1-3 into wb4, which
+ * pass 4 then samples) and pass 5's white-ish silhouette into wb3; both
+ * are left alone here because 0x22D920 ends with FRAME = wb3 and the ROM
+ * never restores it - the orb that sorts after a rod in 0x226700's walk
+ * draws into a work buffer - and untangling that is a separate job. */
 static int cfgDebug;		/* NOT original: menu.c's debugFrame */
 
 static void
-MeshDraw(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
-	float sx, float sy, float sz, const int *col, float size,
-	float refScale, const int *bumpCol, float bumpOfs)
+MeshDebug(MeshModel *mdl, float sy)
+{
+	int i, front = 0;
+
+	if(!cfgDebug || frameCount != cfgDebug)
+		return;
+	for(i = 0; i < mdl->nfaces; i++)
+		front += meshFaces[i].cull == 0;
+	printf("mesh %d faces at %.1f %.1f, scale %.2f, %d front, v0 %.0f %.0f\n",
+		mdl->nfaces, meshObjX, meshObjY, sy, front,
+		meshFaces[0].v[0].proj[0] - 2048.0f,
+		meshFaces[0].v[0].proj[1] - 2048.0f);
+}
+
+/* real: 0x22D920's 0x22E0EC arm, collapsed onto the screen - see the
+ * final paragraph above.  Everything the player sees of a rod is pass 4,
+ * near faces sampling work buffer 4; the port draws both face sets and
+ * the emboss on the screen instead. */
+static void
+MeshDrawRod(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
+	float sx, float sy, float sz, const int *col, float size)
 {
 	MeshTransform(mdl, cam, world, sx, sy, sz);
-	meshRefX = meshObjX * refScale;
-	meshRefY = meshObjY * refScale;
-
-	if(cfgDebug && frameCount == cfgDebug) {
-		int i, front = 0;
-		for(i = 0; i < mdl->nfaces; i++)
-			front += meshFaces[i].cull == 0;
-		printf("mesh %d faces at %.1f %.1f, scale %.2f, %d front, v0 %.0f %.0f\n",
-			mdl->nfaces, meshObjX, meshObjY, sy, front,
-			meshFaces[0].v[0].proj[0] - 2048.0f,
-			meshFaces[0].v[0].proj[1] - 2048.0f);
-	}
+	meshRefX = meshObjX;
+	meshRefY = meshObjY;
+	MeshDebug(mdl, sy);
 
 	vif1SetZWrite(0);
 	vif1SetZTest(0);
 	/* real: 0x22A0C0(1, 1) -> the alpha jump table at 0x2A4B80 entry 1
-	 * (0x22A124), ALPHA_1 = 68 = 0x44 = (Cs - Cd)*As + Cd.  The port had
-	 * BlendModes[5] = 0x48 = Cs*As + Cd, the ADDITIVE one entry 0 gives.
-	 * That was dead state while PRIM's ABE was clear and the AA1 bit was
-	 * (wrongly) almost never set; with AA1 back where the ROM puts it the
-	 * GS blends, and 0x48 turned every glass face into an additive wash
-	 * over the tunnel.  With 0x44 and the RGBAQ's A = 0x80 the blend is
-	 * the identity, which is what an opaque glass face has to be. */
-	vif1SetAlphaBlend(1, 4, 128);	/* real: 0x22A0C0(1,1) = ALPHA_1 0x44 */
+	 * (0x22A124), ALPHA_1 = 68 = 0x44 = (Cs - Cd)*As + Cd.  With the
+	 * RGBAQ's A = 0x80 that blend is the identity, which is what an
+	 * opaque glass face has to be; entry 0's 0x48 (Cs*As + Cd) turned
+	 * every face into an additive wash once AA1 went back where the ROM
+	 * puts it. */
+	vif1SetAlphaBlend(1, 4, 128);
 	if(cfgMeshTex)
-		MenuBackBindScreenCopy();
+		MenuBackBindWork(0);
 
 	MeshDrawPass(mdl, col, size, 1, 0);
-	if(bumpCol && cfgMeshTex) {
-		MenuConfigBindBump();
-		/* real: 0x22A0C0(0,2) then (2,2) - additive at the scene's
-		 * (+0xB0, +0xB4) offset, subtractive at (0, 0).  The ROM's
-		 * ZTST for both is GEQUAL; every mesh pass here keeps the
-		 * refraction pass's ALWAYS, which is the same result while
-		 * the meshes leave ZWrite off and the only depths in the
-		 * buffer are the tunnel's (two orders of magnitude nearer). */
-		vif1SetAlphaBlend(1, 5, 128);		/* 0x48, Cs*As + Cd */
-		MeshBumpPass(mdl, bumpCol, 1, bumpOfs, bumpOfs);
-		vif1SetAlphaBlend(1, 6, 128);		/* 0x42, Cd - Cs*As */
-		MeshBumpPass(mdl, bumpCol, 1, 0.0f, 0.0f);
-		vif1SetAlphaBlend(1, 4, 128);
-		MenuBackBindScreenCopy();
-	}
 	MeshDrawPass(mdl, col, size, 0, 0);
+}
+
+/* real: 0x22D2E8, all eight loops, in the ROM's own order and against the
+ * ROM's own targets.  The `field' arguments are the ones the disassembly
+ * has (see MenuBackWorkTarget's comment): the mesh passes carry the
+ * interlace half pixel, the one blit between them does not. */
+static void
+MeshDrawCube(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
+	float sx, float sy, float sz, const int *col, float size,
+	const int *bumpCol, float bumpOfs, int field)
+{
+	MeshTransform(mdl, cam, world, sx, sy, sz);
+	/* real: *(gp-32064) = 0.35, applied to 0x22CFA8's outX/outY right
+	 * after the transform and before any pass */
+	meshRefX = meshObjX * 0.35f;
+	meshRefY = meshObjY * 0.35f;
+	MeshDebug(mdl, sy);
+
+	vif1SetZWrite(0);
+
+	/* 1 - the far glass, refracting the finished screen, into wb4 */
+	MenuBackBindScreen();			/* real: 0x22A198 */
+	MenuBackWorkTarget(1, 0, field);	/* real: 0x22BF58(1,0,1) */
+	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) ZTST 1 */
+	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 0x44 */
+	MeshDrawPass(mdl, col, size, 0, 0);
+
 	if(bumpCol && cfgMeshTex) {
-		MenuConfigBindBump();
-		vif1SetAlphaBlend(1, 5, 128);
+		/* 2, 3 - the TEXCBUMP emboss on the same faces */
+		MenuConfigBindBump();		/* real: 0x22AB90(2,1,2) */
+		vif1SetZTest(1);		/* real: 0x22A0C0(x,2) GEQUAL */
+		vif1SetAlphaBlend(1, 5, 128);	/* real: 0x22A0C0(0,2) 0x48 */
 		MeshBumpPass(mdl, bumpCol, 0, bumpOfs, bumpOfs);
-		vif1SetAlphaBlend(1, 6, 128);
+		vif1SetAlphaBlend(1, 6, 128);	/* real: 0x22A0C0(2,2) 0x42 */
 		MeshBumpPass(mdl, bumpCol, 0, 0.0f, 0.0f);
-		vif1SetAlphaBlend(1, 4, 128);
 	}
+
+	/* 4 - the far faces again, flat, into wb3 */
+	MenuBackBindWork(1);			/* real: 0x22BFD0(0,1,1) */
+	MenuBackWorkTarget(0, 0, field);
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 4, 128);		/* real: 0x22A0C0(1,1) */
+	MeshFlatPass(mdl, col, 0);
+
+	/* 5 - and the near faces black over them, which is what leaves the
+	 * cube's area of wb3 holding no backdrop at all */
+	vif1SetTEST_1(0, 0, 0, 0, 0, 0, 1, SCE_GS_DEPTH_GREATER);
+	vif1SetAlphaBlend(1, 5, 128);		/* real: 0x22A0C0(0,3) 0x48 */
+	MeshBlackPass(mdl, 1);
+
+	/* 6 - wb3's left half additively into wb4, so pass 7 can sample it.
+	 * NO half pixel: this one is a buffer-to-buffer resample. */
+	MenuBackWorkTarget(1, 0, 0);		/* real: 0x22BFD0(1,0,0) */
+	MenuBackWorkHalfAdd();			/* real: 0x22C100() */
+
+	/* 7 - the near glass, refracting wb4, into wb3 */
+	MenuBackBindWork(1);			/* real: 0x22BFD0(0,1,1) */
+	MenuBackWorkTarget(0, 0, field);
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 4, 128);
+	MeshDrawPass(mdl, col, size, 1, 0);
+
+	if(bumpCol && cfgMeshTex) {
+		/* 8 - the emboss on the near faces */
+		MenuConfigBindBump();
+		vif1SetZTest(1);
+		vif1SetAlphaBlend(1, 5, 128);
+		MeshBumpPass(mdl, bumpCol, 1, bumpOfs, bumpOfs);
+		vif1SetAlphaBlend(1, 6, 128);
+		MeshBumpPass(mdl, bumpCol, 1, 0.0f, 0.0f);
+	}
+}
+
+/* real: 0x22D798 - 0x226D00's SECOND walk, into the work buffer 4 that
+ * was just cleared to alpha 0.  Only the black pass is ported (0x22CD78's
+ * TEXCREFA reflection is the documented gap above); its A = 0x80 is the
+ * mask the tail composites by.  0x22D798 scales the refraction centre by
+ * *(gp-32060) = 0.2 rather than 0.35, which only 0x22CD78 would use. */
+static void
+MeshDrawCubeMask(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
+	float sx, float sy, float sz, int field)
+{
+	MeshTransform(mdl, cam, world, sx, sy, sz);
+	meshRefX = meshObjX * 0.2f;
+	meshRefY = meshObjY * 0.2f;
+
+	vif1SetZWrite(0);
+	MenuBackBindWork(0);			/* real: 0x22BFD0(1,0,1) */
+	MenuBackWorkTarget(1, 0, field);
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 4, 128);		/* real: 0x22A0C0(1,1) */
+	/* real: 0x22AB90(5,0,1) + the 0x22CD78 loop go here */
+	vif1SetTEST_1(0, 0, 0, 0, 0, 0, 1, SCE_GS_DEPTH_GREATER);
+	vif1SetAlphaBlend(1, 5, 128);		/* real: 0x22A0C0(0,3) */
+	MeshBlackPass(mdl, 1);
 }
 
 /* ==================== the models ==================== */
@@ -624,8 +856,8 @@ MenuConfigDrawMesh(SceneRec *rec)
 	/* real: the rod scene's camera pointer is the frame's own, written
 	 * into 0x27E950+0x64 by 0x2268F0; its outX/outY go into 0x22C888
 	 * unscaled (the 0.35 is 0x22D2E8's, i.e. the cubes' alone). */
-	MeshDraw(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f,
-		rec->col0, rec->size, 1.0f, nil, 0.0f);
+	MeshDrawRod(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f,
+		rec->col0, rec->size);
 }
 
 /* ================= the carousel (0x225BF8 / 0x226028) ================= */
@@ -868,7 +1100,7 @@ void
 MenuConfigCubes(void)
 {
 	float s;
-	int i, ang;
+	int i, ang, field;
 
 	cfgStep(&cfgCubeTimer);
 	cubeSpin = (cubeSpin + 30) & 0xFFFF;	/* real: 0x2285C0 */
@@ -884,15 +1116,17 @@ MenuConfigCubes(void)
 	s = cfgCubeTimer.duration ?
 		(float)cfgCubeTimer.count / (float)cfgCubeTimer.duration : 0.0f;
 
-	/* real: 0x22D2E8's only FRAME push is 0x22BF58(1, 0, 0), whose third
-	 * argument is the `field' 0x22A4C8 hands sceGsSetHalfOffset - and it
-	 * is 0, where the rods' three pushes all pass the real field.  So the
-	 * cubes are drawn with NO interlace half pixel, and so is the blit
-	 * that puts the stage's result back on the screen.  The port had them
-	 * inheriting the frame's, which moved them half a scanline on every
-	 * other field. */
-	MenuBackMeshHalfOffset(0);
+	/* real: 0x22D2E8's FRAME push is 0x22BF58(1, 0, **1**) - 22d36c is
+	 * `li a2,1', not `move a2,zero' - so the cube meshes carry the
+	 * interlace half pixel exactly as the rods' three pushes do.  Only
+	 * the buffer-to-buffer sprites in the chain (0x22C100, 0x22C088,
+	 * 0x22C190) are pushed with field = 0, which is 37efd18's rule.
+	 * (eba5595's commit message and docs/menu-config.md's glass write-up
+	 * both say the whole cube stage runs with no half pixel; that reading
+	 * of 0x22BF58's third argument was wrong.) */
+	field = 1;
 
+	/* ---- 0x226D00's first walk: the eight-pass glass, per cube ---- */
 	for(i = 0; i < 5; i++) {
 		ang = (short)(cubeSpin + i*7000);
 		matUnit(mdTop);
@@ -903,16 +1137,49 @@ MenuConfigCubes(void)
 		/* real: the identity camera at 0x352840, *(gp-32064) = 0.35 on
 		 * the refraction centre, the bump colour at scene+0xA0 =
 		 * {8,8,8,128} and the emboss offset at scene+0xB0 = 0.01 */
-		MeshDraw(&cubeModel, cubeCamera, mdTop, s + cubeBias[i],
+		MeshDrawCube(&cubeModel, cubeCamera, mdTop, s + cubeBias[i],
 			s + cubeBias[i], s + cubeBias[i],
 			cubeColor[i], 200.0f,	/* real: scene 0x27EFB0 +0x90 */
-			0.35f, cubeBumpColor, 0.01f);
+			cubeBumpColor, 0.01f, field);
 		cubeScreenX[i] = meshObjX;
 		cubeScreenY[i] = meshObjY;
 	}
-	/* the 2D layer that follows draws with the frame's own offset again
-	 * (0x22EFF0 and every text stage re-push it with the real field) */
-	MenuBackMeshHalfOffset(1);
+
+	/* real: 0x22A4C8(1, 0x27F180, *(0x27B448)) - work buffer 4 becomes
+	 * the mask, so it starts at alpha 0 everywhere */
+	vif1SetZTest(0);
+	MenuBackWorkTarget(1, 1, field);
+
+	/* ---- the second walk: near faces only, black at A = 0x80 ---- */
+	for(i = 0; i < 5; i++) {
+		ang = (short)(cubeSpin + i*7000);
+		matUnit(mdTop);
+		mdTranslatef(menuCubePos[i][0], menuCubePos[i][1], menuCubePos[i][2]);
+		mdRotX(ang);
+		mdRotY(ang);
+		mdRotZ(ang);
+		MeshDrawCubeMask(&cubeModel, cubeCamera, mdTop, s + cubeBias[i],
+			s + cubeBias[i], s + cubeBias[i], field);
+	}
+
+	/* ---- 0x226D00's tail ---- */
+	/* real: 0x22BFD0(0,1,0) then 0x22C088() - wb4 over wb3, additive,
+	 * and it is this blit that stamps the mask into wb3's alpha */
+	MenuBackWorkTarget(0, 0, 0);
+	MenuBackWorkAdd();
+	/* real: 0x22C2A0(phase < 5 ? 5 - phase : 0); the ramp idles at 10, so
+	 * this is 0 passes on a settled screen */
+	MenuBackWorkBlur(MenuBackPhase() < 5 ? 5 - MenuBackPhase() : 0);
+	/* real: 0x22C020(0,0,0) then 0x22C190(**1**) - wb3 back over the
+	 * screen, ABE set, blended by the alpha the mask put there */
+	MenuBackScreenTarget(0);
+	MenuBackWorkOver(1);
+
+	/* real: the next stage's own 0x22A3B8 puts the field back; the port's
+	 * 2D layer does not push one, so restore it here */
+	MenuBackScreenTarget(1);
+	vif1SetZTest(0);
+	vif1SetAlphaBlend(1, 4, 128);
 	cubeScreenValid = 1;
 }
 

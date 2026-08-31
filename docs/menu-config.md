@@ -1430,3 +1430,532 @@ metric) are the two throwaway comparators.
 
 Cleanup: Xvnc `:98` killed, no pcsx2-qt left running, no cores, `PCSX2.ini`
 never touched (the hardware attempt used `-setting` only).
+
+---
+
+# The System Configuration cubes' refraction: the ROM's work-buffer chain, ported
+
+Scratch tree `/u/aap/.claude/jobs/58e316f8/tmp/refract/osdbits`, on top of
+**eba5595**.  Deliverable diff: `refract.diff` (`inc.h`, `menuback.c`,
+`menuconfig.c`; +566/-137), `git apply -p1` from the repo root — checked.  No
+new resource, no `res/` change, `menutext.c` and `menu.c` byte-identical to
+HEAD.
+
+Method as usual: `objdump -D -b binary -m mips:5900 -EL --adjust-vma=0x200000
+/u/aap/src/osdsys/expanded.bin`, every function read to its own `jr ra`, static
+data read straight out of the image, checked against headless PCSX2
+software-renderer readbacks.  `gp = 0x2AF070`; addresses are retail image
+addresses.  Everything below is **[ok]** unless marked.
+
+---
+
+## 1. The verdict, in one line
+
+The cubes were opaque because the collapsed chain drew them on the screen while
+sampling `extraBuf1` — the copy of the frame taken **before** the composite
+multiplies it by `{0x37,0x28,0x3C}/128` — so every cube displayed a ~3x
+brighter, un-tinted image of the backdrop *onto* the tinted backdrop.  The ROM
+has no such problem because its glass never touches the screen: it is built in
+the two work buffers, and the one blit that puts it back (`0x22C190(**1**)`) is
+an **alpha-masked** composite, not the opaque one the docs recorded.
+
+---
+
+## 2. The hypothesis, measured on HEAD
+
+`menu 12 34 56 0 1 128 145 0 1 0 10 0 1 0 1`, frame 145, `notext = 1`,
+temporary RGB readback (removed from the diff).  Cube 1's projected centre is
+(78, 84), half-extent 28 x 13 px.  Row y = 84, x stepping 9 px:
+
+```
+HEAD   x=      33     42     51     60     69     78     87     96    105
+       bkgd  2b2640 34264e | 130f1d ... the cube ... |
+       face                  495162 495061 3f4556 484f5f 474e5e 4c5363 3e4554
+       bkgd  271f3b 231c34
+```
+
+i.e. face `(73,81,98)`, background `(39,31,59)` / `(35,28,52)` right beside it:
+**mean luminance 84 against 43, a factor of 2.0**, and remarkably *flat* — the
+same three numbers across the whole face.  Cube 0 (the cursor's, tinted toward
+`{0,150,200}`) is worse: `(0,117,185)`, `(152,166,202)`, `(0,80,131)` against
+`(33,26,49)` / `(31,24,47)`, i.e. **3x to 6x**.
+
+That ratio is the reciprocal of the composite tint: `0x27B4B0` = `{0x37, 0x28,
+0x3C}` = x0.43 / x0.31 / x0.47, so un-tinting a pixel multiplies it by 2.3 /
+3.2 / 2.1.  **Hypothesis confirmed**, and confirmed as arithmetic rather than
+as an impression: glass that shows its background 2-6x brighter than the
+background reads as a solid milky block.
+
+---
+
+## 3. The functions the brief asked for
+
+### 3.1 `0x22C190(abe)` — the crux
+
+```
+0x22C190(a0):
+    rec = 0x27F760 | uncached
+    rec.x1 = w<<4 ; rec.y1 = h<<4
+    rec.u1 = (w<<4)+8 ; rec.v1 = (h<<4)+8
+    0x22A0C0(1, 1)            ; ALPHA_1 = 0x44 = (Cs - Cd)*As + Cd, ZTST ALWAYS
+    rec.+0x34 = a0            ; 22c1fc: sw s1,52(s0)
+    0x2299C0(rec)
+    tail 0x22A0C0(1, 3)
+```
+
+The record at `0x27F760` in `.data` is
+
+```
+R 128  G 128  B 128  A 128   x0 0 y0 0  u0 8 v0 8   z 0   +0x34 = 0   +0x38 = 1
+```
+
+and the record layout is settled by `0x2297E8` / `0x2298A8` (the two halves
+`0x2299C0` runs):
+
+| field | +0x00 | +0x04 | +0x08 | +0x0C | +0x10 | +0x14 | +0x18 | +0x1C | +0x20 | +0x24 | +0x28 | +0x2C | +0x30 | **+0x34** | **+0x38** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | R | G | B | A | x0 | y0 | u0 | v0 | x1 | y1 | u1 | v1 | z | **ABE** | **TME** |
+
+because `0x2297E8` builds `PRIM = 6 | 256 | (rec+0x38)<<4 | (rec+0x34)<<6`, i.e.
+`SPRITE | FST | TME | ABE`.  So `0x22C190`'s argument **is the ABE bit**.
+
+**Its callers.**  `0x21D0A0` calls it twice with `a0 = 0` (the two opaque
+screen -> work-buffer copies).  `0x226D00`'s tail calls it with `a0 = **1**`:
+
+```
+226f44  ld ra,128(sp)
+226f48  li a0,1          <-- the argument
+...
+226f70  j 0x22c190       (tail)
+226f74  addiu sp,sp,160
+```
+
+With `ABE = 1`, `ALPHA_1 = 0x44` and `TFX = MODULATE` over a PSMCT32 work
+buffer with `Af = 0x80`, `As` is the **texture's own stored alpha**, so the
+blit is `screen = lerp(screen, wb3, wb3.A/128)`.  That is the difference
+between "the cube stage replaces the frame" (which would erase the tunnel, the
+orbs and the rods, since work buffer 3 is still the pre-object copy almost
+everywhere) and "the cube stage replaces the frame exactly inside the cubes".
+
+**`docs/menu-config.md`'s glass write-up §2d calls this "an *opaque*
+full-screen blit of work buffer 3 back over the screen (`0x22C020(0,0,0)` +
+`0x22C190(0)`)".  Both the argument and the conclusion are wrong**, and that
+single error is what made the collapsed chain look like the only option.
+
+### 3.2 `0x22CCE8` -> `0x22CB58` — the flat pass (`0x22D2E8` pass 4)
+
+`0x22CCE8(face, scene)` is `0x22C888`'s twin: `sceVu0Normalize` of the face's
+vertex 0 in camera space, `sceVu0InnerProduct` with the face normal at
+`face+0x140`, `f12 = 1 - |d|` — the same Fresnel term — then `0x22CB58(&blk,
+f12)` where the block is `{+0x00 scene, +0x04 face}` (note the order is the
+mirror of `0x22C888`'s five-word block).
+
+`0x22CB58` emits GIFtag `0x27F880` (REGLIST, NREG 6, `{PRIM, RGBAQ, XYZF2 x4}`
+— byte-identical to `0x27F870`) and:
+
+```
+f20   = f12 * f12
+PRIM  = 196 = TRIANGLE_STRIP | ABE | AA1        ; **TME clear**, IIP clear
+RGBAQ = ( min(255, (int)(f20 * scene->+0x80)),
+          min(255, (int)(f20 * scene->+0x84)),
+          min(255, (int)(f20 * scene->+0x88)), 0x80 ), Q = 0
+4 x XYZF2 = face.v[k].fix (+0x30/+0x34/+0x38), F = 0
+```
+
+So: untextured, flat, the scene colour scaled by the **square** of the Fresnel
+term.  The `0x22BFD0(0,1,1)` that precedes it binds work buffer 4, which the
+primitive then does not sample — dead state, like several others on this path.
+
+### 3.3 `0x22CA68` — the black pass (`0x22D2E8` pass 5, `0x22D798`'s second loop)
+
+Takes only the face.  GIFtag `0x27F870`, same NREG 6 layout:
+
+```
+PRIM  = 132 = TRIANGLE_STRIP | AA1              ; TME clear, **ABE clear**
+RGBAQ = (0, 0, 0, 0x80), Q = 0x03F80000
+4 x XYZF2 = (x, y, **z + 1**), F = 0            ; 22cb00: addiu a1,a1,1
+```
+
+drawn under `0x22A0C0(x, 3)` = ZTST **GREATER**.  (The `Q` is `lui a2,0x3f8` =
+`0x03F80000`, a ROM slip for `1.0f`'s `0x3F800000`; dead, TME is clear.)
+
+Two jobs, one per walk:
+
+* in `0x22D2E8` pass 5 it primes the cube's area of work buffer 3 to **black**,
+  so pass 7's refraction is all the glass shows and none of the pre-object copy
+  leaks through;
+* in `0x22D798` it is the whole point of the second walk — drawn into a work
+  buffer 4 that `0x226D00` has just cleared to `{0,0,0,0}`, its `A = 0x80` **is
+  the composite's mask**.
+
+### 3.4 `0x22C100` — the half-width merge (`0x22D2E8` pass 6)
+
+Record `0x27F720` = `{0x80,0x80,0x80,0x80}`, `u0/v0 = 8`, **ABE 1**, TME 1;
+extents patched to `x1 = (w/2)<<4`, `y1 = h<<4`, `u1 = ((w/2)<<4)+8`,
+`v1 = (h<<4)+8` — a **1:1 copy of the left half**, not a stretch
+(`22c158: sll v0,v0,0x3` on `w`, i.e. `(w/2)<<4`, and the same value again in
+`u1`).  Blend `0x22A0C0(0, 1)` = ALPHA_1 **0x48** = `Cs*As + Cd`, i.e. additive
+and gated by the source's alpha.
+
+Half width because the five cubes live at projected x -242..-79 of centre, i.e.
+entirely in the left half of a 640-wide frame; the ROM simply does not pay for
+the right half.  Its call site is `0x22BFD0(1,0,0)` (FRAME work buffer 4, TEX
+work buffer 3), so it exists to show pass 7 — which samples work buffer 4 — the
+silhouette passes 4 and 5 have just written into work buffer 3.
+
+### 3.5 `0x22C2A0(n)` — the work-buffer zoom blur
+
+Record `0x27F7E0` = `{0x80,...}`, **ABE 0**, TME 1.  Instruction for
+instruction `0x22C3C0` with the same `x = 5108, y = 2388` start and the same
+`-32 / -16` per pass; only the two FRAME/TEX pushes differ:
+
+```
+for(k = 0; k < n; k++) {
+    0x22BFD0(1,0,0)   ; FRAME wb4, TEX wb3, NO half pixel
+    0x22A0C0(1,1)
+    rec.x1 = 5108-32k ; rec.y1 = 2388-16k ; rec.u1 = (w<<4)+8 ; rec.v1 = ((h-1)<<4)+8
+    0x2299C0(rec)
+    0x22BFD0(0,1,0)   ; FRAME wb3, TEX wb4
+    0x22A0C0(1,1)
+    rec.x1 = w<<4 ; rec.y1 = (h-1)<<4 ; rec.u1 = 5108-32k+8 ; rec.v1 = 2388-16k+8
+    0x2299C0(rec)
+}
+0x22A0C0(1, 3)
+```
+
+`0x226D00` calls it with `phase < 5 ? 5 - phase : 0` off `*(gp-28844)`, which
+idles at 10 — so **n is 0 on a settled screen** and the loop does not run.
+(`0x2283D0`'s always-on blur keys on the same ramp the other way, `phase - 5` =
+5.)  Ported anyway, for the transition case.
+
+This also closes `docs/menu-backdrop.md` §6's "`0x22C228` is the same loop
+against work buffer 3 ... not chased": the loop `0x226D00` uses is **`0x22C2A0`
+with record `0x27F7E0`**.  `0x22C228` is a different thing entirely — one flat
+sprite from record `0x27F7A0` (`{0,0,0,0}`, ABE 1, **TME 0**) under
+`0x22A0C0(4, 1)` = ALPHA_1 `0x68` — and is still without a caller here.
+
+### 3.6 `0x22CD78` — the one loop NOT ported
+
+`0x22D798`'s *first* loop, `0x22CD78(face, scene, aa)`, under
+`0x22AB90(**5**, 0, 1)`.  Per vertex:
+
+```
+n     = sceVu0Normalize(v.cam)
+d     = 2 * sceVu0InnerProduct(n, face.normal)      ; |2d|, sign-folded
+r     = 0x267710(n, 0x267050(face.normal, |2d|))    ; reflect
+u     = 0x25A368((r.x + 1.0) * 512.0)
+v     = 0x25A368((r.y + 1.0) * 256.0)
+PRIM  = aa ? 404 : 276 ; here 404 = TRISTRIP|TME|FST|AA1
+RGBAQ = scene->+0xC0 = {120,120,120,128} for the cube scene
+```
+
+— a **spherical environment map**, and TEXC slot 5 is **TEXCREFA** (the slot
+order is the resource table's TEXC run: 0 FLOW, 1 KABE, 2 BUMP, 3 BINV, 4 SMOK,
+**5 REFA**, 6 NAVI, 7 BLUR, 8 STSL, 9 MARU — which is what pins slot 1 = KABE
+and slot 2 = BUMP, both already known).  The port ships no TEXCREFA (`res.c`
+has no entry, `res/` no `.inc`), so it is not ported.
+
+It is also, by the ROM's own ordering, invisible: `0x22CA68` redraws **the same
+`cull != 0` faces** immediately afterwards with `PRIM = 132`, whose ABE is
+clear, so the black overwrites it wherever the depth test lets the black
+through — and the cubes' projected z is ~22000 against the tunnel's 43..526, so
+`GREATER` passes everywhere.  Only AA1 edge pixels can survive.  Its colour
+`{120,120,120,128}` is real and deliberate, so this may be a genuine ROM
+dead-pass rather than a reading error; it is flagged, not resolved.
+
+---
+
+## 4. The chain as ported
+
+`menuback.c` grew the plumbing (`MenuBackBindWork`, `MenuBackBindScreen`,
+`MenuBackWorkTarget`, `MenuBackScreenTarget`, `MenuBackWorkAdd`,
+`MenuBackWorkHalfAdd`, `MenuBackWorkOver`, `MenuBackWorkBlur`,
+`MenuBackPhase`), `menuconfig.c` the two new emitters (`MeshEmitFlatFace`,
+`MeshEmitBlackFace`), their two passes (`MeshFlatPass`, `MeshBlackPass`) and
+three draw functions (`MeshDrawRod`, `MeshDrawCube`, `MeshDrawCubeMask`)
+replacing the single collapsed `MeshDraw`.
+
+`extraBuf1` = the ROM's work buffer 3, `extraBuf2` = work buffer 4.
+
+### 4.1 `0x22D2E8`, per cube — `MeshDrawCube()`
+
+`far` = the `cull == 0` set, `near` = `cull != 0`; the ROM always draws far
+first and near last, which is what makes the pair one two-layer piece of glass
+instead of two coats of the same one.
+
+| # | ROM | target / texture | faces | emit |
+|---|---|---|---|---|
+| 1 | `0x22BF58(1,0,1)` + `0x22A0C0(1,1)` | FRAME wb4, TEX **the live screen** (`0x22A198`, PSMCT24) | far | `0x22C888` -> `0x22C4E0`, extra 0 |
+| 2 | `0x22AB90(2,1,2)` + `0x22A0C0(0,2)` | TEXCBUMP, ALPHA 0x48 | far | `0x22C920`, ST offset (+0xB0,+0xB4) = 0.01 |
+| 3 | `0x22A0C0(2,2)` | ALPHA 0x42 | far | `0x22C920`, offset (0,0) |
+| 4 | `0x22BFD0(0,1,1)` + `0x22A0C0(1,1)` | FRAME wb3, TEX wb4 | far | `0x22CCE8` -> `0x22CB58` |
+| 5 | `0x22A0C0(0,3)` | ZTST GREATER, ALPHA 0x48 | near | `0x22CA68` |
+| 6 | `0x22BFD0(1,0,0)` + `0x22C100()` | FRAME wb4, TEX wb3 | — | half-width additive blit |
+| 7 | `0x22BFD0(0,1,1)` + `0x22A0C0(1,1)` | FRAME wb3, TEX wb4 | near | `0x22C888` -> `0x22C4E0`, extra 0 |
+| 8 | `0x22AB90` + `0x22A0C0(0,2)` then `(2,2)` | TEXCBUMP | near | `0x22C920` x2 |
+
+### 4.2 `0x226D00`'s tail — `MenuConfigCubes()`
+
+```
+five x 0x22D2E8                     the table above
+0x22A4C8(1, 0x27F180, field)        clear wb4 to {0,0,0,**0**}
+five x 0x22D798                     near faces only, into the cleared wb4:
+                                    (0x22CD78 - not ported) then 0x22CA68
+0x22BFD0(0,1,0) + 0x22C088()        wb4 over wb3, ADDITIVE
+0x22C2A0(phase < 5 ? 5-phase : 0)   0 passes on a settled screen
+0x22C020(0,0,0) + 0x22C190(1)       wb3 back over the screen, ABE = 1
+```
+
+**The second walk is a mask generator, and `0x22C088` is how the mask travels.**
+Work buffer 4 is cleared to alpha 0; the only thing painted into it is
+`0x22CA68`'s black at `A = 0x80`; `0x22C088` (record `0x27F6E0`, ABE 1, under
+`0x22A0C0(0,1)` = ALPHA 0x48 = `Cs*As + Cd`) therefore adds **no colour** — and
+copies `As`, i.e. work buffer 4's own alpha, into work buffer 3's alpha channel,
+because GS alpha blending only touches RGB and the destination alpha is written
+from the source's regardless.  `0x22C190(1)` then blends by exactly that.
+
+Measured in the port at frame 145 (temporary work-buffer readback, removed):
+
+```
+                x=140     150      160      170      180      190      200
+WB4  y=50    000000/00 000000/00 000000/80 000000/3c 000000/80 000000/80 000000/80
+WB3  y=50    51596d/00 5b6377/00 006eda/80 0272dd/3c 0049ab/80 0042ae/80 003fab/80
+SCR  y=50    211a31/-- 211930/-- 006eda/-- 10417e/-- 0049ab/-- 0042ae/-- 003fab/--
+```
+
+- work buffer 4 black with alpha 0x80 exactly on the cube (0x3c and friends are
+AA1 edge coverage), work buffer 3 carrying that alpha with the pre-object copy
+`(81,89,109)` still intact outside it, and the screen equal to work buffer 3
+inside the mask and to the tinted backdrop `(33,26,49)` outside.  The mechanism
+is exactly as reversed.
+
+### 4.3 The half pixel
+
+The ROM's `field` arguments, read off the call sites:
+
+```
+0x22BF58(1,0,**1**)  pass 1      FRAME wb4     field     22d36c: 24060001 li a2,1
+0x22BFD0(0,1,**1**)  pass 4/7    FRAME wb3     field     22d51c / 22d5dc: li a2,1
+0x22BFD0(1,0,**0**)  pass 6      FRAME wb4     none      22d5b8: move a2,zero
+0x22A4C8(1,rec,*(0x27B448))  the wb4 clear     field
+0x22BFD0(1,0,**1**)  0x22D798    FRAME wb4     field     22d810: li a2,1
+0x22BFD0(0,1,**0**)  the tail    FRAME wb3     none      226ef8..226f04
+0x22C020(0,0,**0**)  the tail    FRAME screen  none      226f34..226f40
+```
+
+i.e. **every mesh pass carries the interlace half pixel and every
+buffer-to-buffer sprite does not** — exactly 37efd18's rule, stated by the ROM
+itself.  `MenuBackWorkTarget`/`MenuBackScreenTarget` take the flag per call,
+which is a closer model than the old `MenuBackMeshHalfOffset` bracket; that
+function is removed (see §6).
+
+---
+
+## 5. Evidence
+
+Headless PCSX2, **software** renderer, Xvnc :99, `ee-gcc 2.9-ee-991111 -O2`,
+clean build, no warnings.  Logs in `logs/`.  "HEAD" = eba5595 rebuilt from
+`pristine/` in this tree (`headbits/main.elf`).
+
+### 5.1 The cubes, before and after
+
+`menu 12 34 56 0 1 128 145 0 1 0 10 0 1 0 1`, frame 145, RGB every 9 px.
+
+**Cube 1** (`(78,84)`, an *unselected* cube, colour easing to `{100,100,100}`),
+row y = 84:
+
+```
+x=        33       42       51       60       69       78       87       96      105
+HEAD  2b2640  34264e  495162  495061  3f4556  484f5f  474e5e  4c5363  3e4554  8995b7
+NEW   2b2640  34264e  130f1d  14101e  191423  110d1a  100c18  120e1a  8394c1  76799a
+```
+
+Background beside it is `(39,31,59)` / `(35,28,52)`.  HEAD's face is a flat
+`(73,81,98)`, **2.0x the background**.  The new face is `(19,15,29)` ...
+`(16,12,24)`, **0.45x the background** — a piece of glass that darkens what is
+behind it, which is what `{100,100,100}/128 = 0.78` squared over two layers has
+to do.
+
+**Cube 3** (`(86,142)`), row y = 142, the same shape:
+
+```
+HEAD  ... 4a5062 454b5b 3f4554 3d4251 3f4352 404452 ...    flat (74,80,98)
+NEW   ... 15111f 110c1a 120e1b 0f0b18 100d18 ...           (21,17,31)..(16,13,24)
+```
+
+**Cube 4** (`(199,170)`), row y = 170, where the structure shows best:
+
+```
+HEAD  1f182e 3e414f 363845 333642 353744 3a3c48 363945 323541 9ca0c0 1c1528
+NEW   1f182e 657ba3 214569 303140 13202e 081624 172637 191e2f 557b9d 1c1528
+```
+
+HEAD: eight nearly identical numbers, spread 62..79 in R.  NEW: 8..101 in R,
+19..123 in G — the refraction displacement and the emboss are visible **as
+structure across the face**, and the face sits either side of the background's
+own `(31,24,46)` instead of two to six times above it.
+
+**Cube 0** is the *cursor's* cube, and `0x226BB8` eases its colour toward the
+tracker `0x27EC30` -> `0x27EC10` = `{0,150,200}`; at frame 145 it is there.  It
+therefore modulates by `(bright+0, bright+150, bright+200)/128` **twice**, and
+comes out a saturated cyan: predicted `(5,58,179)` for a mid face at
+`bright = 50` over a `(31,24,47)` background, measured `0041aa` = `(0,65,170)`.
+That is the ROM's "the selected cube tints blue" effect doing exactly what its
+arithmetic says, not a residue of the old bug.  (`MenuConfigSetCursor()` is
+still unwired, so item 0 is always the selected one — unchanged from HEAD, one
+line in `menutext.c` away.)
+
+### 5.2 The main menu is bit-identical
+
+`menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`, whole-frame 8x8 map at frame 60:
+`diff logs/head-mm60.map logs/final-mm60.map` is **empty**, 0 of 2240 blocks
+differ.  Everything new is either behind the cube timer or a no-op refactor
+(`BlurBlit` gained an `abe` argument passed 0 at both old call sites;
+`MenuBackBindScreenCopy` became a wrapper on `MenuBackBindWork(0)`).
+
+### 5.3 Enter and leave are clean
+
+`menu 12 34 56 0 1 128 220 0 0 0 10 0 1 140 1` (enter 1, leave 140, dump 220):
+`diff` against HEAD's map is **empty** — tunnel, rods, cubes all gone, black
+backdrop and the orb cluster back.  The full config screen with its 2D layer
+(`... 145 0 0 0 10 0 1 0 1`) still shows the three text rows intact, so the
+FRAME/XYOFFSET state the stage leaves behind is right.
+
+### 5.4 The one regression: field alternation
+
+8x8 max-luminance maps at frames 145/146/147 (`notext = 1`), mean absolute
+ramp-index difference; adjacent frames are opposite fields, frames two apart are
+the same field with twice the animation, so a ratio above 1 is field-alternating
+content:
+
+| build | d(145,146) | d(146,147) | d(145,147) | ratio |
+|---|---|---|---|---|
+| HEAD | 0.060 | 0.059 | 0.044 | 1.36 |
+| this | 0.082 | 0.087 | 0.049 | **1.72** |
+
+This is the direct consequence of §4.3: eba5595 read `0x22BF58`'s third argument
+as 0 and bracketed the whole cube stage with the half pixel **off**; the
+argument is 1, so the cubes shimmer at 60 Hz exactly as the rods and the tunnel
+already do — all three of which the ROM draws the same way.  The number is close
+to the 1.61 that write-up itself measured for "all fixes, cubes still on the
+frame's half pixel", and the port's blits are all still on the field-0 side of
+37efd18's rule.  Kept faithful; if aap prefers the quieter picture, the change
+is one argument (`field = 0` in `MenuConfigCubes`) and it is a deliberate
+divergence, not a bug fix.
+
+---
+
+## 6. Corrections to `docs/menu-config.md`
+
+The pass table in the appended glass write-up (§2c) and §5 of the original both
+need edits:
+
+1. **§2d — "`0x226D00`'s tail ends with `0x22C020(0,0,0)` + `0x22C190(0)` — an
+   **opaque** full-screen blit of work buffer 3 back over the screen".**  The
+   argument is **1** (`226f48: li a0,1`), it is the record's ABE bit, and the
+   blit is an **alpha-masked composite**.  This is the error the whole task
+   turned on: read as opaque, the chain looks like it would erase the frame, so
+   binding the un-tinted work buffer as the refraction source looks forced.
+2. **§5 — "the same loop again through `0x22D798` (into work buffer 3)".**
+   `0x22D798` targets **work buffer 4** (`0x22BFD0(1,0,1)`), after `0x226D00`
+   clears it to `{0,0,0,0}`.  It is the mask pass, not a second colour pass.
+3. **§3 "What it is" and eba5595's commit message — "the cubes: `0x22BF58(1,0,0)`
+   passes 0 ... the whole cube stage runs with no half pixel".**  `22d36c` is
+   `24060001 li a2,1`.  The cube *meshes* pass the real field like everything
+   else; only `0x22C100`, `0x22C088` and `0x22C190` pass 0 (§4.3).
+4. **§2c rows 4 and 5 label both `0x22CCE8` and `0x22CA68` loops loosely as
+   "front"/"back".**  Pass 4 (`0x22CCE8`) is the `cull == 0` set and pass 5
+   (`0x22CA68`) the `cull != 0` set, and the ROM's order over the whole function
+   is `cull == 0` **first** (passes 1-4) and `cull != 0` **last** (passes 5, 7,
+   8).  The collapsed chain in HEAD drew them the other way round.
+5. **§2c row 6 "wb3 -> wb4, half-width blit".**  Correct, and it is **additive**
+   (`0x22A0C0(0,1)` = ALPHA 0x48) and gated by work buffer 3's alpha, so on a
+   settled screen it moves only the silhouette, not the backdrop copy.
+6. **§7.4's rod table, row 4 — "FRAME screen, TEX wb3 (`0x22C020(1,0,1)`)".**
+   `0x22C020`'s first argument goes to `0x22A290`, so the texture is **work
+   buffer 4**, not 3.  Row 2/3's order is also the reverse of the cubes':
+   `0x22A0C0(**2**,2)` (subtractive) comes first and `0x22A0C0(**0**,2)`
+   (additive) second, at phases `f21 + i*(gp-32032)` and
+   `scene->+0xB0 + f21 + i*(gp-32028)`; both constants are 0.1.
+7. **`docs/menu-backdrop.md` §6 — "`0x22C228` is the same loop against work
+   buffer 3 and record `0x27F7A0` ... reached from elsewhere; not chased".**  The
+   loop `0x226D00` runs is **`0x22C2A0`**, record `0x27F7E0`; `0x22C228` is a
+   single flat `0x27F7A0` sprite under ALPHA `0x68` and still has no caller here
+   (§3.5).
+8. **§10.2's "the cubes' second pass + wb3 blur + `0x22C2A0` composite — not
+   ported"** and the "Remaining deltas" bullet that calls this "the biggest
+   single remaining piece" can both be struck.
+
+---
+
+## 7. The rods: checked, and no fix needed
+
+The brief asked whether the same class of bug applies to `0x22D920`'s
+`0x22E0EC` arm.  It does not, and the disassembly says why.  The five loops:
+
+| # | ROM | target / texture | faces | emit |
+|---|---|---|---|---|
+| 1 | `0x22BFD0(1,0,1)` | FRAME wb4, TEX wb3 | far | `0x22C888`, extra 0 |
+| 2 | `0x22A0C0(2,2)` | TEXCBUMP, ALPHA 0x42 | far | `0x22C920`, phase `f21 + i*0.1` |
+| 3 | `0x22A0C0(0,2)` | ALPHA 0x48 | far | `0x22C920`, phase `+0xB0 + f21 + i*0.1` |
+| 4 | `0x22C020(1,0,1)` | **FRAME the screen**, TEX wb4 | near | `0x22C888`, extra 0 |
+| 5 | `0x22BFD0(0,1,1)` | FRAME wb3, TEX wb4 | near | `0x22C888`, extra **255** |
+
+Pass 4 puts the rods' visible content **straight on the screen**.  There is no
+work-buffer composite anywhere in their path, so there is no destination to get
+wrong: in the ROM as in the port, a rod samples an un-tinted copy of the frame
+and draws it onto the tinted frame.  That is why the retail rods glow and the
+retail cubes do not, and it is why HEAD's rods already looked right while its
+cubes did not.  `f21` is `0x22D920`'s `(float)rec->slot * *(gp-32056)` =
+`slot * 0.1`.
+
+What the port still skips for them is pass 1-3 (the far layer, into work buffer
+4, which pass 4 then samples) and pass 5's `extra = 255` silhouette into work
+buffer 3.  Left alone deliberately, and worth recording why: **`0x22D920` ends
+with FRAME = work buffer 3 and nothing restores it.**  `0x226700`, the
+depth-sorted walk, alternates `0x226360` (orb) and `0x2266E0` -> `0x22D920`
+(mesh) with no drawenv of its own, and `0x226360` pushes none either (read to
+its `jr ra` at `0x2266D8`) — so in the ROM an orb that sorts *after* a rod is
+drawn into a work buffer rather than onto the screen.  That is a real ROM
+behaviour with visible consequences and it wants its own investigation; it is
+not something to port half of.
+
+---
+
+## 8. Left simplified, and why
+
+| what | why |
+|---|---|
+| `0x22CD78`, the TEXCREFA reflection in `0x22D798` | no TEXCREFA in `res.c` / `res/`, and `0x22CA68` overdraws the same faces opaquely one loop later (§3.6) |
+| the rods' five-pass chain | needs the FRAME-restore question of §7 answered first |
+| `0x22D920`'s `f12 > 0` arm (the front rod's split) | unchanged from HEAD |
+| `0x2267E8`'s two-pass carousel bloom | unchanged from HEAD |
+| `MenuConfigSetCursor()` still unwired | unchanged from HEAD; one line in `menutext.c`, which this job may not touch |
+
+Nothing in the cube chain itself is simplified: passes 1-8, the wb4 clear, the
+second walk's black pass, `0x22C088`, `0x22C2A0` and `0x22C190(1)` are all in.
+
+---
+
+## 9. Deliverables and cleanup
+
+* `refract.diff` — `inc.h`, `menuback.c`, `menuconfig.c`; `git apply -p1` from
+  the repo root, checked with `git apply --check`.
+* `notes.md` — this file.
+* `logs/` — every run above.  `headbits/` is the eba5595 reference build (from
+  `pristine/`), `pristine/` the untouched HEAD sources the diff is against.
+* `ascii.sh` — the harness, with one change from the `config/` copy: it kills
+  only the `pcsx2-qt` whose command line names an `osdbits/main.elf`, and takes
+  `ELF=` from the environment so `headbits/main.elf` runs through the same path.
+  The owner's own interactive pcsx2 (`-elf ./main.elf`, cwd the real tree) came
+  up mid-job and was correctly waited out, not killed.
+* All temporary readbacks (`RGBgrid`/`CUBEn`/`WB3`/`WB4` in
+  `menu.c:DumpFrameAscii`) are removed; `menu.c` is byte-identical to HEAD.
+* Xvnc :99 started by this job and killed by it; no pcsx2-qt left running that
+  this job started; `ulimit -c 0` throughout, no cores.  No PCSX2 setting was
+  changed (no `-setting`, no ini edit); the only deltas the ini shows against
+  this job tree's Aug-30 backup are window geometry, `HeaderState` and one pad
+  binding, which `-batch -nogui` writes back on exit and which predate this
+  job's runs.
+* The real tree `/u/aap/src/ps2rev/osdsys` is untouched and clean at eba5595;
+  nothing was committed.

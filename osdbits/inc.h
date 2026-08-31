@@ -219,7 +219,20 @@ void MenuBackFadeClose(void);	/* real: 0x229230 */
 int MenuBackdropVisible(void);
 void MenuBackBindScreenCopy(void);
 int MenuBackField(void);
-void MenuBackMeshHalfOffset(int on);
+/* the work-buffer stage the glass renders through (real: 0x22A198,
+ * 0x22A290, 0x22A4C8, 0x22A3B8 and the four sprite records 0x27F6E0 /
+ * 0x27F720 / 0x27F760 / 0x27F7E0 that 0x22C088, 0x22C100, 0x22C190 and
+ * 0x22C2A0 draw).  buf 0 = the ROM's work buffer 3 (extraBuf1), 1 = work
+ * buffer 4 (extraBuf2). */
+void MenuBackBindWork(int buf);		/* real: 0x22A290(n) */
+void MenuBackBindScreen(void);		/* real: 0x22A198(evenOddFrame) */
+void MenuBackWorkTarget(int buf, int clear, int field);	/* real: 0x22A4C8 */
+void MenuBackScreenTarget(int field);	/* real: 0x22A3B8 */
+void MenuBackWorkAdd(void);		/* real: 0x22C088 */
+void MenuBackWorkHalfAdd(void);		/* real: 0x22C100 */
+void MenuBackWorkOver(int abe);		/* real: 0x22C190(abe) */
+void MenuBackWorkBlur(int n);		/* real: 0x22C2A0 */
+int MenuBackPhase(void);		/* real: *(gp-28844) */
 
 /* ---- menutext.c: the menu's 2D text/item layer ---- */
 void InitMenuText(void);
