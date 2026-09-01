@@ -1331,12 +1331,12 @@ DumpFrameAscii(int par)
 	int x, y, i, j, l, best;
 	char line[81];
 
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 	sceGsSetDefStoreImage(&si, par == 0 ? 0 : (screenW*screenH)/64,
 		screenW/64, SCE_GS_PSMCT32, 0, 0, screenW, screenH);
 	FlushCache(0);
 	sceGsExecStoreImage(&si, FBDUMP);
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 	/* the store image reverses VIF1 for the download; whatever is left
 	 * in the FIFO afterwards gets parsed as vifcodes by the next packet
 	 * (PCSX2 logs "Unknown VifCmd" and libdma eventually hangs; real
@@ -1415,7 +1415,7 @@ DoMenuScene(void)
 		}
 		frameCount++;
 		if(hwFrameLimit > 0 && frameCount >= hwFrameLimit) {
-			sceGsSyncPath(0, 0);
+			gsSyncPath();
 			printf("hw frame limit %d reached, exiting\n", hwFrameLimit);
 			Exit(0);
 		}

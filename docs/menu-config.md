@@ -4164,3 +4164,228 @@ against `retail614.log` / `retail614v.log`:
 - **The cube mask walk's refraction ALPHA** (retail 0x44 vs our 0x48 for
   0x22CD78 there) - untouched, still open from the previous pass.
 - **Pixel proof**, section 6.
+
+
+---
+
+# "The config menu switches between two resolutions"
+
+Diagnosis, fix and evidence.  Deliverables in this directory:
+
+* `interlace.diff` — git-apply-able against `6425e1c` (checked with `git apply --check`)
+* `fix/osdbits/` — the patched tree it came from (builds clean, `main.elf` present)
+* `base/`, `fixm/` — throwaway instrumented trees used for the measurements
+* `pristine/osdbits/` — an unmodified copy of the tip, for the A/B runs
+
+---
+
+## Verdict: **hypothesis 1 (frame pacing).  Not a field/offset bug.**
+
+The config screen's frame no longer fits in one 16.7 ms field.  It straddles
+the vsync, so the port renders **one field for every two displayed**, and
+because a field-rendered scene picks its XYOFFSET half-pixel from the *current*
+CSR FIELD bit, rendering every second field means it always sees the **same
+parity**.  The even field is then never drawn fresh — the display shows the
+odd-field image on both fields, which is exactly a halving of vertical
+resolution.  When the frame happens to squeak in under budget it flips back to
+proper 60 Hz field alternation.  That flapping is what reads as "two
+resolutions", and it is worse on the heaviest item (cursor 0, Clock
+Adjustment).
+
+The display circuit is **not** involved: SMODE2 (`INT=1 FFMD=1`), DISPLAY2
+(`DX=636 DY=50 MAGH=4 MAGV=1 DW=2560 DH=448`) and DISPFB2's FBW/PSM are
+byte-identical in every privileged-register snapshot of both dumps, of the
+pre-bloom dump and of retail.
+
+---
+
+## Evidence from the two dumps
+
+`osdbits/tools/gsdump-decode.py` throws the 8 KB privreg blocks away
+(`('REGS',)`); `decode2.py` here is the same decoder with the blob kept, and
+`priv.py` prints PMODE / SMODE1 / SMODE2 / DISPFB1,2 / DISPLAY1,2 / CSR.
+
+### 1. DISPFB2 does not advance every field in the bad dump
+
+| dump | vsync 1 | vsync 2 | vsync 3 | vsync 4 | verdict |
+|---|---|---|---|---|---|
+| `...192536` ("bad")  | FBP 0 | FBP 0 | FBP 70 | FBP 70 | **30 Hz** |
+| `...192542` ("good") | FBP 70 | FBP 0 | FBP 70 | FBP 0 | 60 Hz |
+| `gscmp2/...155131` (pre-bloom) | 0 | 70 | 0 | 70 | 60 Hz |
+| `gscmp/...080614` (retail) | 0 | 70 | 0 | 70 | 60 Hz |
+
+CSR FIELD alternates 1/0/1/0 in all four — the GS keeps interlacing; it is the
+*app* that only produces a new buffer every other field.
+
+### 2. Both rendered frames of the bad dump use the SAME half-pixel
+
+Per-vsync XYOFFSET tally from `gsdump-drawlog.py`:
+
+```
+192536 (bad):   block0: 78x (1728.0,1936.5) + 11x (1728.0,1936.0)   <- ODD
+                block1: (nothing - only the 12-draw tail of block0 spilling past vsync)
+                block2: 78x (1728.0,1936.5) + 11x (1728.0,1936.0)   <- ODD AGAIN
+                block3: (nothing)
+
+192542 (good):  block0: 89x (1728.0,1936.0)                          <- EVEN
+                block1: 78x 1936.5 + 11x 1936.0                      <- ODD
+                block2: 89x (1728.0,1936.0)                          <- EVEN
+                block3: 78x 1936.5 + 11x 1936.0                      <- ODD
+```
+
+The 11 draws at 1936.0 inside an odd frame are the buffer-to-buffer blits, which
+correctly carry field 0 (commit 37efd18's rule).  So the *offsets themselves are
+right everywhere* — hypothesis 2 is disproved.  What is wrong is that the bad
+dump never renders an even field at all.
+
+Confirmed live, without a dump: with the field parity traced straight out of
+`SwapBuffers` for 40 consecutive frames starting at frame 120,
+
+```
+baseline: field parity: n=40 [1111111111111111111111111111111111111111]
+fixed:    field parity: n=40 [0101010101010101010101010101010101010101]
+```
+
+### 3. Where the vsync falls inside the frame
+
+In the bad dump the "empty" field is not empty: it holds ~12 draws of caption
+text (font sprites at x 2091..2346, y 2133..2148) — the *tail* of the previous
+frame spilling past the vsync marker.  The frame is only marginally over one
+field, which is why the two dumps differ at all (2057 vs 2002 packets/frame).
+
+### 4. We are not drawing more than retail — we are packaging it far worse
+
+Per frame, from the decoded streams:
+
+| | GIF packets | qwords | draws | verts |
+|---|---|---|---|---|
+| retail `080614`            | 1029 | 12997 | 1189 | 5942 |
+| ours, pre-bloom `155131`   | 1587 | 15763 |  826 | 4506 |
+| ours, with bloom `192542`  | 2002 | 20385 | 1136 | 5792 |
+| ours, with bloom `192536`  | 2057 | 20582 | 1150 | 5818 |
+
+The bloom brought our draw count to *retail parity* (the wb4 segment goes
+411 → 749 draws against retail's 771) — it is not drawing anything twice, and
+deleting it was never the answer.  The cost is entirely in packaging:
+
+* every one of our GIFtags is `(flg=PACKED, nreg=1, reg=A+D)` — **2002 of them**;
+  retail mixes `PACKED nreg=1/3/5` with `REGLIST nreg=2/3/6/10/12/14`, 1029 tags,
+  and REGLIST puts two registers in one qword where A+D puts one.
+* the per-FRAME-segment breakdown matches retail's pass structure exactly, but
+  every segment costs 2.5–4.7× the packets: e.g. the glass chain is
+  retail `2240:4 / 6720:4 / 8960:9` against ours `0:10 / 7040:11 / 9600:42`.
+
+---
+
+## Root cause in the source
+
+`opening.c`'s packet layer gave **every single GS register write its own DMA**:
+
+```c
+void vif1SetAD(u32 a, u64 d)
+{ vif1Begin(); pktSetAD(a, d); vif1End(); }
+```
+
+with `vif1Begin()` = grab a scratchpad chain buffer, `PkCnt` + `OpenDirectCode`
++ `OpenGifTag`, and `vif1End()` = `CloseGifTag` + `CloseDirectCode` + pad +
+`PkEnd` + `PkTerminate` + **`sceDmaSync`** (blocks on the previous kick) +
+`sceDmaSend`.  Measured in-emulator on the tip:
+
+```
+baseline, config screen: gif tags=1921  kicks=1921  DMA qwords=27273   (per frame)
+```
+
+1921 fully serialized DMA kicks per frame, ~9600 qwords of which are nothing but
+per-packet framing (CNT tag, GIFtag, END tag, `vif1Pad` padding).
+
+## The fix
+
+Every one of those packets has the *identical* shape — one PACKED A+D GIFtag —
+so consecutive ones concatenate exactly.  Keep **one** tag open in the chain
+buffer and only close/kick it when the buffer runs out or when something outside
+the layer needs the GS to have caught up:
+
+* `vif1Open()` — the old `vif1Begin` body (new buffer, CNT, DIRECT, GIFtag).
+* `vif1Begin()` — reuse the open tag if at least `VIF1_CHAIN_RESERVE` (224)
+  qwords are free, else flush and open a new one.  Guaranteeing the reserve up
+  front means **no begin/end block is ever split**, so no strip is ever cut in
+  half and no new PATH3 interleave hazard is created.
+* `vif1End()` — only tracks `vifChainHigh`, the largest block seen, which is
+  what justifies the 224: measured **182** across the whole config screen.
+* `vif1Flush()` — close the tag and kick.  `pktSetAD` carries a hard overrun
+  guard that splits as a last resort; `vifChainHigh` says it never fires.
+* `gsSyncPath()` = `vif1Flush()` + `sceGsSyncPath(0, 0)`; every `sceGsSyncPath(0, 0)`
+  in the port now goes through it, so a drain can never be declared while
+  register writes are still sitting in scratchpad.  Additional explicit flushes
+  before `sceGsExecLoadImage` (UploadImage), before `SwapBuffers`/`StartFrame`
+  touch the draw env, and before `sendDma`/`towerKick` reprogram D1 by hand.
+
+The GS sees the same register writes in the same order — only the packaging
+changes.  Both ASCII regression maps are byte-identical (below).
+
+### One trap worth recording
+
+`static const u64 vif1GifTag[2]` at file scope lands 8-byte aligned, and
+`sceVif1PkOpenGifTag` takes the tag *by value* — it is loaded with `lq`, which
+ignores the low four address bits.  The first build read the eight bytes
+*before* the array as the tag's low half; the GIF then sat mid-packet on PATH2
+forever and every later drain reported `sceGsSyncPath: DMA Ch.2 does not
+terminate`.  `ALIGN16` on the array is load-bearing (the old code got away with
+a stack local by luck).  The comment in the diff says so.
+
+---
+
+## Verification
+
+All runs: windowless PCSX2 on its own `:94` Xvnc, one instance at a time.
+
+### Pacing (config screen, cursor 0 = the worst item)
+
+`-gameargs "menu 18 27 45 <N> 1 128 0 0 0 0 10 0 1 0 1"`
+
+| | frames | fields consumed | 1-field frames | 2-field frames |
+|---|---|---|---|---|
+| baseline, N=300 | 300 | **507** | 93 | 205 |
+| fixed,    N=300 | 300 | **302** | 298 | 0 |
+| baseline, N=200 | 200 | **312** | 88 | 110 |
+| fixed,    N=200 | 200 | **202** | 198 | 0 |
+
+68 % of baseline frames were taking two fields.  None do now.
+
+### GIF traffic (per frame, config screen)
+
+| | GIFtags | DMA kicks | DMA qwords |
+|---|---|---|---|
+| baseline | 1921 | 1921 | 27273 |
+| fixed    | **75** | **75** | **17692** |
+
+25.6× fewer packets and kicks, 35 % less DMA volume.  Main menu, same run
+shape: 273 → **7** kicks/frame, 3025 → **1576** qwords/frame (it already had
+headroom — 202 fields for 200 frames before and after — which is why aap only
+saw this on the config screen).
+
+### Field parity, frames 120–159
+
+```
+baseline [1111111111111111111111111111111111111111]   locked odd, even field never drawn
+fixed    [0101010101010101010101010101010101010101]   proper interlace
+```
+
+### Output regressions — all byte-identical to the pristine tip
+
+* main menu, `menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1` → 28-line ASCII map identical
+* config,    `menu 18 27 45 0 1 128 145 0 0 0 10 0 1 0 1` → 28-line ASCII map identical
+* opening,   `boot 12 34 56 0` → identical printf stream, `osd: dispatch(20500, 1, 0, 0)`,
+  zero `does not terminate` errors (this exercises `sendDma` / `towerKick` /
+  `vu1Wait`, the raw-D1 paths the flush had to be threaded through)
+
+---
+
+## Left on the table (not needed for this bug)
+
+We are still at 2002 GIFtags/frame against retail's 1029 and 20385 GIF-payload
+qwords against 12997, because every register still goes as A+D.  Moving the
+vertex streams to REGLIST (retail's `nreg=14/12/10/6`) would roughly halve the
+payload and is the obvious next step if the frame ever gets tight again — but
+after this change the config screen has ~1/3 of a field of slack, so it is not
+urgent.

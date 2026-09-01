@@ -73,6 +73,7 @@ InitDraw(void)
 void
 SwapBuffers(void)
 {
+	vif1Flush();	/* nothing may still be queued when the env flips */
 	evenOddField = !((DGET_GS_CSR() >> GS_CSR_FIELD_O) & 1);
 	evenOddFrame ^= 1;
 	sceGsSetHalfOffset(evenOddFrame==0 ? UNCACHED(&db.draw0) : UNCACHED(&db.draw1),
@@ -85,7 +86,7 @@ SwapBuffers(void)
 	 * first chains (PATH1/2) overtake it, so the clear lands late and
 	 * erases early draws.  (Emulators that complete DMA synchronously
 	 * never show this.) */
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 }
 
 void
@@ -137,10 +138,12 @@ StartFrame(void)
 	SignalSema(waitFrameSema);
 	WaitSema(drawStartSema);
 
+	vif1Flush();	/* ditto - the draw env goes down PATH3 */
+
 	evenOddField = !((DGET_GS_CSR() >> GS_CSR_FIELD_O) & 1);
 	sceGsSetHalfOffset(evenOddFrame==0 ? &db.draw0 : &db.draw1, 2048, 2048, evenOddField);
 	sceGsPutDrawEnv(evenOddFrame==0 ? &db.giftag0 : &db.giftag1);
-	sceGsSyncPath(0, 0);	/* same PATH3 drain as SwapBuffers */
+	gsSyncPath();		/* same PATH3 drain as SwapBuffers */
 }
 
 void
@@ -151,7 +154,7 @@ WaitNextFrame(void)
 	 * via PATH3, and on real hardware the frame's rendering is
 	 * otherwise still in flight at that point - late primitives land
 	 * in the swapped buffer and the clear races the render. */
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 	SignalSema(drawEndSema);
 	WaitSema(drawStartSema);
 }

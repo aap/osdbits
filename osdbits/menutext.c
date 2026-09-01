@@ -453,7 +453,7 @@ osdTextDraw(const char *s)
 			(int)(textScale * (float)textGap)) << 4;
 		s++;
 	}
-	sceGsSyncPath(0, 0);		/* real: 0x262418, the same tail */
+	gsSyncPath();			/* real: 0x262418, the same tail */
 }
 
 /* =============== Module U's three alignment wrappers ===============
@@ -658,12 +658,12 @@ MenuTextDump(int par)
 		x0 = TCX0; x1 = TCX1; y0 = TCY0; y1 = TCY1;
 	}
 
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 	sceGsSetDefStoreImage(&si, par == 0 ? 0 : (screenW*screenH)/64,
 		screenW/64, SCE_GS_PSMCT32, 0, 0, screenW, screenH);
 	FlushCache(0);
 	sceGsExecStoreImage(&si, TEXTFBDUMP);
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 	sceDevVif1Reset();	/* clear the reversed FIFO - see DumpFrameAscii */
 
 	px = UNCACHED(TEXTFBDUMP);

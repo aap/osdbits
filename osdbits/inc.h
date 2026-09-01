@@ -119,6 +119,9 @@ void InitRender(void);
 void InitTexture(Texture *tex);
 void vif1Begin(void);
 void vif1End(void);
+void vif1Flush(void);	/* kick whatever the chain buffer still holds */
+void gsSyncPath(void);	/* vif1Flush() + sceGsSyncPath(0, 0) */
+extern int vifChainQW, vifChainHigh;
 void pktSetAD(u32 a, u64 d);
 void pktSetAlphaBlend(u32 type, u32 mode, u32 fix);
 void vif1SetAD(u32 a, u64 d);

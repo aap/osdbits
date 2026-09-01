@@ -200,6 +200,7 @@ sprAllocChains(void)
 	sprChains[1] = sprAlloc(sz);
 	sprCurrentChain = sprChains[0];
 	sprChainBit = 0;
+	vifChainQW = sz/16;	/* what one chain holds - see vif1Begin */
 	// TODO: unknown variable
 }
 
@@ -381,7 +382,24 @@ static struct BlendMode {
 	{ 2, 0, 1, 1 },
 	{ 0, 1, 1, 1 }
 };
-void pktSetAD(u32 a, u64 d) { sceVif1PkAddGsAD(vifCurrentPacket, a, d); }
+static void vif1Open(void);	/* see "the VIF1 chain buffer" below */
+
+/* the guard is the last line of defence against a begin/end block
+ * larger than VIF1_CHAIN_RESERVE overrunning the scratchpad chain
+ * buffer.  Splitting a block mid-way is safe for the GS (the A+D
+ * stream is just register writes and the tag carries no PRIM), it only
+ * exposes the block to the same PATH3 interleave that already sits
+ * between packets - so it is the right fallback, but vifChainHigh says
+ * it never fires. */
+void
+pktSetAD(u32 a, u64 d)
+{
+	if(sceVif1PkSize(vifCurrentPacket) >= vifChainQW - 2) {
+		vif1Flush();
+		vif1Open();
+	}
+	sceVif1PkAddGsAD(vifCurrentPacket, a, d);
+}
 void pktSetTEST_1(u32 ate, u32 atst, u32 aref, u32 afail, u32 date, u32 datm, u32 zte, u32 ztst)
 {
 	pktSetAD(SCE_GS_TEST_1, SCE_GS_SET_TEST(ate, atst, aref, afail, date, datm, zte, ztst));
@@ -418,18 +436,49 @@ void pktSetTexRect(Rect *r, Rect *tr, Color *col, u32 abe, u32 z)
 }
 
 
-void
-vif1Begin(void)
-{
-	const u64 giftag[2] = { SCE_GIF_SET_TAG(0, 1, 0, 0, 0, 1), 0xe };
-	vifCurrentPacket = &vifPackets[vifPacketBit];
-	vifPacketBit ^= 1;
-	sceVif1PkInit(vifCurrentPacket, (void*)sprGetChainBuffer());
-	sceVif1PkReset(vifCurrentPacket);
-	sceVif1PkCnt(vifCurrentPacket, 0);
-	sceVif1PkOpenDirectCode(vifCurrentPacket, 0);
-	sceVif1PkOpenGifTag(vifCurrentPacket, *(u128*)&giftag);
-}
+/* ======================= the VIF1 chain buffer =======================
+ *
+ * Every vif1SetXxx() used to be a DMA of its very own: open a chain,
+ * write ONE A+D GIFtag, terminate, sceDmaSync (which blocks until the
+ * previous kick has landed), sceDmaSend.  A System Configuration frame
+ * is ~2000 of those - 2000 GIFtags and 2000 serialized DMA kicks where
+ * the ROM's own frame needs ~1030 GIFtags.  Measured against retail's
+ * GS dump we were sending 2002 packets / 20385 qwords per frame against
+ * its 1029 / 12997, and the frame no longer fit in one field: it
+ * straddled the vsync, the scene fell to one rendered field every two
+ * displayed ones, and because a field-rendered scene carries the field
+ * half-pixel in XYOFFSET, the SAME parity got rendered every time and
+ * the odd field was never drawn fresh.  That is what reads as "the
+ * config menu switches between two resolutions".
+ *
+ * Every one of these packets has the identical shape - one PACKED
+ * GIFtag with nreg=1, reg=A+D - so consecutive ones concatenate
+ * exactly: keep ONE tag open in the chain buffer and only close and
+ * kick it when the buffer runs out, or when something outside this
+ * layer needs the GS to have caught up (vif1Flush, called from
+ * gsSyncPath and from the raw-DMA paths below).  The register writes
+ * the GS sees, and their order, are bit-for-bit what they were.
+ *
+ * vif1Begin() guarantees VIF1_CHAIN_RESERVE qwords of room before it
+ * hands the block to the caller, so no begin/end block ever has to be
+ * split; pktSetAD's guard is the belt to that suspenders and should
+ * never fire (see vifChainHigh). */
+
+int vifChainQW;			/* qwords in one SPR chain buffer */
+static int vifChainOpen;	/* a GIFtag is open in the current buffer */
+int vifChainHigh;		/* high-water mark of one begin/end block */
+static int vifChainMark;
+
+/* room vif1Begin leaves for the block that is about to be built.  The
+ * biggest single block in the config screen measures 183 qwords. */
+#define VIF1_CHAIN_RESERVE 224
+
+/* ALIGN16 is load-bearing: sceVif1PkOpenGifTag takes the tag by value
+ * and it is read with lq, which ignores the low four address bits - an
+ * 8-aligned u64[2] reads the eight bytes BEFORE it as the tag half, the
+ * GIF then sits mid-packet on PATH2 forever and every later
+ * sceGsSyncPath reports "DMA Ch.2 does not terminate". */
+static const u64 vif1GifTag[2] ALIGN16 = { SCE_GIF_SET_TAG(0, 1, 0, 0, 0, 1), 0xe };
 
 void
 vif1Pad(sceVif1Packet *pk)
@@ -447,9 +496,16 @@ vif1Pad(sceVif1Packet *pk)
 	}
 }
 
+/* close the open tag and kick the chain.  Everything that is not this
+ * layer - a path drain, a texture upload, the tower chains' raw D1
+ * writes, the frame handshake - must call this first, or its GS traffic
+ * would overtake register writes that are still sitting in scratchpad. */
 void
-vif1End(void)
+vif1Flush(void)
 {
+	if(!vifChainOpen)
+		return;
+	vifChainOpen = 0;
 	sceVif1PkCloseGifTag(vifCurrentPacket);
 	sceVif1PkCloseDirectCode(vifCurrentPacket);
 	vif1Pad(vifCurrentPacket);
@@ -457,6 +513,49 @@ vif1End(void)
 	sceVif1PkTerminate(vifCurrentPacket);
 	sceDmaSync(chVIF1, 0, 0);
 	sceDmaSend(chVIF1, DMASPR(vifCurrentPacket->pBase));
+}
+
+/* every path drain in the port goes through here: the GS cannot be
+ * "caught up" while register writes are still queued in scratchpad. */
+void
+gsSyncPath(void)
+{
+	vif1Flush();
+	sceGsSyncPath(0, 0);
+}
+
+static void
+vif1Open(void)
+{
+	vifCurrentPacket = &vifPackets[vifPacketBit];
+	vifPacketBit ^= 1;
+	sceVif1PkInit(vifCurrentPacket, (void*)sprGetChainBuffer());
+	sceVif1PkReset(vifCurrentPacket);
+	sceVif1PkCnt(vifCurrentPacket, 0);
+	sceVif1PkOpenDirectCode(vifCurrentPacket, 0);
+	sceVif1PkOpenGifTag(vifCurrentPacket, *(u128*)&vif1GifTag);
+	vifChainOpen = 1;
+}
+
+void
+vif1Begin(void)
+{
+	if(vifChainOpen) {
+		vifChainMark = sceVif1PkSize(vifCurrentPacket);
+		if(vifChainMark <= vifChainQW - VIF1_CHAIN_RESERVE)
+			return;		/* keep filling the open tag */
+		vif1Flush();
+	}
+	vif1Open();
+	vifChainMark = sceVif1PkSize(vifCurrentPacket);
+}
+
+void
+vif1End(void)
+{
+	int n = sceVif1PkSize(vifCurrentPacket) - vifChainMark;
+	if(n > vifChainHigh)
+		vifChainHigh = n;
 }
 
 void vif1SetAD(u32 a, u64 d)
@@ -620,10 +719,11 @@ UploadImage(void *data, u32 gsAddr, u32 psm, Rect *r)
 		int left = r->h - i*maxH;
 		int h = min(maxH, left);
 		sceGsSetDefLoadImage(&limg, tbp, r->w/64, psm, 0, 0, r->w, h);
+		vif1Flush();	/* the upload must not overtake queued state */
 		FlushCache(0);
 		// BUG: original code uses h instead of maxH
 		sceGsExecLoadImage(&limg, (u128*)(texels + r->w*i*maxH*psmToBppEE(psm)/8));
-		sceGsSyncPath(0, 0);
+		gsSyncPath();
 		tbp += r->w*h*psmToBppGS(psm)/32/64;
 	}
 
@@ -2939,7 +3039,7 @@ DrawEnd(void)
 	WaitNextFrame();
 	frameCount++;
 	if(hwFrameLimit > 0 && frameCount >= hwFrameLimit) {
-		sceGsSyncPath(0, 0);
+		gsSyncPath();
 		printf("hw frame limit %d reached, exiting\n", hwFrameLimit);
 		Exit(0);
 	}
@@ -3022,6 +3122,7 @@ static u32 *const towerBlocks[6] = {
 static void
 sendDma(void *addr)
 {
+	vif1Flush();		/* channel 1 is about to be reprogrammed */
 	*D1_QWC = 0;
 	*D1_TADR = (u32)addr & 0x0fffffff;
 	*(volatile u32*)0x1000e010 = 2;
@@ -3062,6 +3163,7 @@ towerKick(void *addr)
 	 * drains the paths (sceGsSyncPath) before the patchers run, so the
 	 * channel is provably idle by the time we get here - do not call
 	 * this without that guarantee. */
+	vif1Flush();		/* channel 1 is about to be reprogrammed */
 	*D1_QWC = 0;
 	*D1_TADR = (u32)addr & 0x0fffffff;
 	*(volatile u32*)0x1000e010 = 2;
@@ -3072,7 +3174,7 @@ towerKick(void *addr)
 static void
 towerSyncEnd(void)
 {
-	sceGsSyncPath(0, 0);	/* real: 0x218ad8, once after the whole field */
+	gsSyncPath();		/* real: 0x218ad8, once after the whole field */
 }
 
 /* tower field state (the real OSDSYS BSS arrays) */
@@ -3748,7 +3850,7 @@ InitTowersFog(void)
 	 * the latter. */
 	sendDma(&TowerUpload);
 	vu1Wait();
-	sceGsSyncPath(0, 0);
+	gsSyncPath();
 
 	/* real steps 6 + 7 */
 	HeightGrid();
@@ -3931,7 +4033,7 @@ DrawTowers(void)
 			 * small chain); we make the margin explicit.  This
 			 * drain is also what makes towerKick's raw register
 			 * sequence safe. */
-			sceGsSyncPath(0, 0);
+			gsSyncPath();
 
 			/* real per-tower sequence: giftag (params window),
 			 * block NOPs, 218318 (vertex z + colours), 2184d0
