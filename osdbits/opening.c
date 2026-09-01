@@ -504,13 +504,19 @@ vif1SetZTest(int enb)
 		vif1SetTEST_1(0, 0, 0, 0, 0, 0, 1, SCE_GS_DEPTH_ALWAYS);
 }
 
+/* The psm is **PSMZ32**, not PSMZ24: main.c's sceGsSetDefDBuff allocates the
+ * Z buffer as PSMZ32 and every ZBUF write in a retail GS dump carries psm = 0
+ * throughout the menu.  It used to matter nowhere (every z in this port fitted
+ * in 24 bits, and PSMZ24/PSMZ32 share the addressing), but the cube stage now
+ * emits retail's 0xFFFFF010 - PSMZ24 would silently mask that to 0xFFF010 on
+ * both the write and the compare. */
 void
 vif1SetZWrite(int enb)
 {
 	if(enb)
-		vif1SetAD(SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF(((screenW*screenH)/64)*2/32, SCE_GS_PSMZ24, 0));
+		vif1SetAD(SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF(((screenW*screenH)/64)*2/32, SCE_GS_PSMZ32, 0));
 	else
-		vif1SetAD(SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF(((screenW*screenH)/64)*2/32, SCE_GS_PSMZ24, 1));
+		vif1SetAD(SCE_GS_ZBUF_1, SCE_GS_SET_ZBUF(((screenW*screenH)/64)*2/32, SCE_GS_PSMZ32, 1));
 }
 
 void

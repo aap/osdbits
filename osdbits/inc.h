@@ -187,7 +187,8 @@ void matApply(sceVu0FVECTOR o, sceVu0FMATRIX m, sceVu0FVECTOR v);
 void mdRotX(int a);
 void mdRotY(int a);
 void mdRotZ(int a);
-void mdTranslatef(float x, float y, float z);
+void mdTranslate(const float *v4);	/* real: 0x2303E8, w comes from the vector */
+void mdTranslatef(float x, float y, float z);	/* real: 0x230440, w = 1 */
 
 /* ---- menuconfig.c: the System Configuration screen ---- */
 void InitMenuConfig(void);

@@ -995,7 +995,20 @@ MeshDrawCube(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 	meshRefY = meshObjY * 0.35f;
 	MeshDebug(mdl, sy);
 
-	vif1SetZWrite(0);
+	/* ZMSK **0**.  The ROM never masks Z anywhere in the menu: all 416
+	 * ZBUF writes in a retail GS dump of this screen are
+	 * `zbp=4480 psm=0' with ZMSK clear, because 0x22BF58/0x22BFD0/
+	 * 0x22A4C8 push FRAME and ZBUF together and the ZBUF they push has
+	 * ZMSK = 0.  The port's `vif1SetZWrite(0)' here was an addition
+	 * (124 of our 136 ZBUF writes carried ZMSK), and it is the second
+	 * half of the AA1 crack repair: with Z writes on, a fully covered
+	 * pixel stores the stage's flat Z while an AA1 partial-coverage
+	 * pixel does not, so the next primitive over that pixel wins its
+	 * depth test against the stale value and re-blends the coverage up
+	 * to solid.  With ZMSK set nothing is ever stored and the repair
+	 * cannot happen - which is why raising the Z alone did not heal our
+	 * mask in the replay harness (see notes.md). */
+	vif1SetZWrite(1);
 
 	/* 1 - the far glass, refracting the finished screen, into wb4 */
 	MenuBackBindScreen();			/* real: 0x22A198 */
@@ -1063,7 +1076,7 @@ MeshDrawCubeMask(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 	meshRefX = meshObjX * 0.2f;
 	meshRefY = meshObjY * 0.2f;
 
-	vif1SetZWrite(0);
+	vif1SetZWrite(1);			/* ZMSK 0 - see MeshDrawCube */
 	MenuBackBindWork(0);			/* real: 0x22BFD0(1,0,1) */
 	MenuBackWorkTarget(1, 0, field);
 	vif1SetZTest(0);
@@ -1381,7 +1394,20 @@ MenuConfigCubes(void)
 	for(i = 0; i < 5; i++) {
 		ang = (short)(cubeSpin + i*7000);
 		matUnit(mdTop);
-		mdTranslatef(menuCubePos[i][0], menuCubePos[i][1], menuCubePos[i][2]);
+		/* real: 0x226DD4 is `jal 0x2303E8' with a0 = the table entry
+		 * ITSELF, not the three-float 0x230440 - so the table's w = 0
+		 * reaches the matrix and flattens the stage's Z.  See
+		 * mdTranslate() in menu.c for the full derivation; the port used
+		 * mdTranslatef here, which forced w = 1 and emitted real
+		 * projected Z (~5.2M-6.2M against retail's flat 0xFFFFF010).
+		 * That broke the AA1 crack repair - the refract pass is AA1 and
+		 * leaves Z unwritten on partial-coverage pixels (face outlines
+		 * AND every tristrip diagonal), the non-AA1 bump taps that
+		 * follow run ZTST GEQUAL and so lost the repair wherever the
+		 * stale Z happened to be higher, which is where the black seams
+		 * and the "1px dashed dark line along the diagonals" came from.
+		 * Retail's near-max flat Z makes the repair win unconditionally. */
+		mdTranslate(menuCubePos[i]);
 		mdRotX(ang);
 		mdRotY(ang);
 		mdRotZ(ang);
@@ -1405,7 +1431,7 @@ MenuConfigCubes(void)
 	for(i = 0; i < 5; i++) {
 		ang = (short)(cubeSpin + i*7000);
 		matUnit(mdTop);
-		mdTranslatef(menuCubePos[i][0], menuCubePos[i][1], menuCubePos[i][2]);
+		mdTranslate(menuCubePos[i]);	/* real: 0x226E98, same w = 0 */
 		mdRotX(ang);
 		mdRotY(ang);
 		mdRotZ(ang);

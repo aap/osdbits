@@ -306,20 +306,54 @@ mdRotZ(int a)
 	matMul(mdTop, mdTop, r);
 }
 
-/* real: mdTranslate 0x2303E8 / mdTranslatef 0x230440 - the top matrix's
- * translation column becomes ApplyMatrix(top, v), i.e. translate in the
- * matrix's own frame, accumulating onto the existing translation. */
+/* real: mdTranslate 0x2303E8 - the top matrix's translation ROW becomes
+ * ApplyMatrix(top, v), i.e. translate in the matrix's own frame,
+ * accumulating onto the existing translation.
+ *
+ * All FOUR components are written back (`sq' of the whole qword at
+ * 0x230428), and the caller's vector supplies the fourth: 0x230440
+ * (mdTranslatef) builds {x, y, z, **1.0**} on its stack, but 0x226D00
+ * calls 0x2303E8 DIRECTLY with a pointer into the cube table at 0x27F090,
+ * whose five position vectors all carry **w = 0** (res/MENUGEOM.inc has
+ * them, and the port used to throw the w away by going through the
+ * three-float form).
+ *
+ * That zero is the whole cube-stage depth story.  With m[3][3] = 0 the
+ * camera-space w of every cube vertex comes out 0, so 0x22CFA8's second
+ * transform gives proj.z = viewscreen[2][2]*z_cam + viewscreen[3][2]*0 and
+ * proj.w = z_cam, and the perspective divide leaves proj.z = the CONSTANT
+ * viewscreen[2][2] = (zmin*farz - zmax*nearz)/(farz - nearz) = -255.0039
+ * for every vertex of every cube.  sceVu0FTOI4 turns that into -4080 =
+ * 0xFFFFF010, which is what the retail GS packets carry (the GS's 24-bit
+ * view of it, 0xFFF010 = 16773136, is what a dump decoder prints).
+ *
+ * Verified against the live retail face bank at 0x3529D0 in savestate
+ * `20020207-164243 (00000000).04.p2s': every vertex has cam.w = 0,
+ * proj = (x, y, -255.0039, 1.0) and fixed z = -4080, while the camera-space
+ * z legitimately varies 44.3..50.7.  x and y are untouched by the w
+ * (viewscreen[3][0] = viewscreen[3][1] = 0), which is exactly why the
+ * cubes land in the right place in this port but at the wrong depth. */
 void
-mdTranslatef(float x, float y, float z)
+mdTranslate(const float *v4)
 {
 	sceVu0FVECTOR v, o;
 
-	v[0] = x; v[1] = y; v[2] = z; v[3] = 1.0f;
+	v[0] = v4[0]; v[1] = v4[1]; v[2] = v4[2]; v[3] = v4[3];
 	matApply(o, mdTop, v);
 	mdTop[3][0] = o[0];
 	mdTop[3][1] = o[1];
 	mdTop[3][2] = o[2];
 	mdTop[3][3] = o[3];
+}
+
+/* real: mdTranslatef 0x230440 - 0x2303E8 with w = 1 */
+void
+mdTranslatef(float x, float y, float z)
+{
+	sceVu0FVECTOR v;
+
+	v[0] = x; v[1] = y; v[2] = z; v[3] = 1.0f;
+	mdTranslate(v);
 }
 
 /* =================== the animation timer (0x22AC10) ===================
@@ -870,28 +904,16 @@ DrawOrbTrail(Orb *o, int baseAlpha)
 	vif1End();
 }
 
-/* real: 0x22EFF0 */
+/* real: 0x27F940 - the SECOND walk's core colour, where the first walk's
+ * is 0x27F930 = orbCoreColor above.  The two records differ only in the
+ * RGB: the copy that goes into work buffer 3 is pure white. */
+static int orbCoreColorWork[4] = { 0xFF, 0xFF, 0xFF, 0x80 };
+
+/* one walk of 0x22EFF0's three primitives.  `blurCol'/`coreCol' are the
+ * colour records the walk uses (see DrawOrb). */
 static void
-DrawOrb(Orb *o)
+DrawOrbPass(Orb *o, float zscale, int baseAlpha, int *blurCol, int *coreCol)
 {
-	float zscale;
-	int baseAlpha;
-
-	TimerStep(&orbTrailTimer);
-	zscale = o->trail[o->head].pos[2] * 6.5e-06f;	/* real *(gp-31992) */
-	baseAlpha = TimerInterp(&orbTrailTimer, 128);
-
-	/* real: 0x22F0CC, the FIRST thing 0x22EFF0 does -
-	 * 0x22A3B8(0x1F0A10, *(0x1F0C40), 0, *(0x27B448)), i.e. aim FRAME at
-	 * the visible buffer with the module's own field.  It looks
-	 * redundant on the main menu, where nothing else moves FRAME, and
-	 * that is exactly why it is here: 0x226700's sorted walk interleaves
-	 * orbs and carousel rods, and 0x22D920 leaves FRAME on work buffer 3
-	 * (its pass 5) without restoring it.  Every orb that sorts after a
-	 * rod would be drawn into a work buffer if it did not re-aim first.
-	 * The port needs it now that MeshDrawRod ports that chain. */
-	MenuBackScreenTarget(MenuBackField());
-
 	/* real: 0x22A0C0(0, 3) - additive, depth GREATER.  osdbits draws
 	 * the whole scene with the depth test off (as opening.c's DrawLights
 	 * does); with nothing but additive primitives in the scene the
@@ -904,11 +926,71 @@ DrawOrb(Orb *o)
 	/* real: 0x22AB90(7, 1, 1) then 0x22AB90(6, 1, 1) */
 	vif1SetTexture(&menuTextures[MTEX_BLUR]);
 	vif1SetAlphaBlend(1, 5, 128);
-	DrawOrbSprite(o, zscale*30.0f, o->trail[o->head].col);
+	DrawOrbSprite(o, zscale*30.0f, blurCol);
 
 	vif1SetTexture(&menuTextures[MTEX_NAVI]);
 	vif1SetAlphaBlend(1, 5, 128);
-	DrawOrbSprite(o, zscale*4.5f, orbCoreColor);
+	DrawOrbSprite(o, zscale*4.5f, coreCol);
+}
+
+/* real: 0x22EFF0.
+ *
+ * 0x22EFF0 draws EVERY orb TWICE - once on the visible buffer and once,
+ * identically placed, into work buffer 3 - and the port only had the first
+ * walk.  Confirmed in the GS dumps: retail's per-orb pattern is
+ * `LINESTRIP+AA1 x1 + SPRITE+TME+ABE+FST x2' to FB = 0/2240 immediately
+ * followed by the same three to FB = 6720, interleaved per orb with the
+ * rods (retail614.log L7850/L7882 and their 6 repeats).  Work buffer 3 is
+ * what the frame-start tint, the rods' pass 1/5 and the whole cube chain
+ * sample, so without the twin everything that refracts the scene refracted
+ * a version of it with no orbs in it - which is why an orb passing behind
+ * the clock or a cube showed nothing.
+ *
+ * The two walks are not quite identical, and the difference is in the two
+ * sprite colour records (measured in the dump, then read out of the ROM):
+ *
+ *   walk 1  halo = the orb's own trail colour {0x30,0x62,0x80,0x3C}
+ *           core = *0x27F930 = {0x80,0x80,0x80,0x80}
+ *   walk 2  halo = the same RGB with **alpha 0x80**
+ *           core = *0x27F940 = {0xFF,0xFF,0xFF,0x80}
+ *
+ * The halo's alpha is not a separate record: 0x22EFF0 keeps the colour on
+ * its own stack (sp+48) and the sprite code overwrites the qword's fourth
+ * word with `TimerInterp(orbTrailTimer, <that word>)' every time it draws
+ * (22f54c/22f558) - so walk 1 feeds it the orb's 0x3C and walk 2's head
+ * (22f788/22f794: `li v1,128; sw v1,60(sp)') resets it to 128 first.  With
+ * the trail timer open both come out unchanged, i.e. exactly `baseAlpha'. */
+static void
+DrawOrb(Orb *o)
+{
+	float zscale;
+	int baseAlpha, k;
+	int blurCol[4];
+
+	TimerStep(&orbTrailTimer);
+	zscale = o->trail[o->head].pos[2] * 6.5e-06f;	/* real *(gp-31992) */
+	baseAlpha = TimerInterp(&orbTrailTimer, 128);
+
+	/* real: 0x22F0CC, the FIRST thing 0x22EFF0 does -
+	 * 0x22A3B8(0x1F0A10, *(0x1F0C40), 0, *(0x27B448)), i.e. aim FRAME at
+	 * the visible buffer with the module's own field.  It looks
+	 * redundant on the main menu, where nothing else moves FRAME, and
+	 * that is exactly why it is here: 0x226700's sorted walk interleaves
+	 * orbs and carousel rods, and 0x22D920 leaves FRAME on work buffer 3
+	 * (its pass 5) without restoring it - and so, now, does this
+	 * function's own second walk.  Every orb that sorts after either
+	 * would be drawn into a work buffer if it did not re-aim first. */
+	MenuBackScreenTarget(MenuBackField());
+	DrawOrbPass(o, zscale, baseAlpha, o->trail[o->head].col, orbCoreColor);
+
+	/* real: 0x22F798 - 0x22A4C8(0, NULL, *(0x27B448)): FRAME = work
+	 * buffer 3, no clear, the module's own field (the same half pixel the
+	 * screen walk carries - this is a mesh-style draw, not a blit). */
+	for(k = 0; k < 3; k++)
+		blurCol[k] = o->trail[o->head].col[k];
+	blurCol[3] = baseAlpha;
+	MenuBackWorkTarget(0, 0, MenuBackField());
+	DrawOrbPass(o, zscale, baseAlpha, blurCol, orbCoreColorWork);
 }
 
 /* real: 0x226360 - project the record, apply the entry animation's
@@ -1141,6 +1223,14 @@ MenuFrame(void)
 		MenuConfigEmit();	/* real: 0x226028 */
 	UpdateOrbs();
 	SceneWalk();
+	/* real: 0x2267E8, the stage's own tail, pushes FRAME before its two
+	 * composite quads - which is what puts the target back on the screen
+	 * after 0x22D920's pass 5 and 0x22EFF0's second walk both leave it on
+	 * work buffer 3.  That flush is still deferred here (see SceneWalk),
+	 * so re-aim explicitly: ZoomBlur() would normally do it as a side
+	 * effect, but not when argv[10] drops the phase to 5 and it runs zero
+	 * passes, and menutext.c never pushes a FRAME of its own. */
+	MenuBackScreenTarget(MenuBackField());
 	/* real: 0x2283D0, the FIRST thing stage 5 (0x2283F0) does, before any
 	 * of the 2D layer: 0x22C3C0(phase - 5), which is 0x22C3C0(5) in the
 	 * idle menu.  Five bilinear shrink/stretch round trips over the whole

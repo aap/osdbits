@@ -3155,3 +3155,405 @@ Numbered against the three appended write-ups.
   savestates were only ever read.
 * The real tree `/u/aap/src/ps2rev/osdsys` was not touched and nothing was
   committed.
+
+
+---
+
+# System Configuration screen: cube depth, orbs in work buffer 3, and the
+# deferred rod-bloom stage (2026-09-01)
+
+Companion to `docs/gscmp-FINDINGS` (the nine-dump comparison).  Everything here
+was settled against three independent kinds of ground truth: the real ROM
+disassembly (`objdump -D -b binary -m mips:5900 -EL --adjust-vma=0x200000
+expanded.bin`), the live retail EE/GS state in savestate `20020207-164243
+(00000000).04.p2s`, and PCSX2 GS dumps replayed through Sony's own software GS
+model (the `libgpu2` harness).
+
+---
+
+## 1. The cube stage's flat Z - what it actually is
+
+The dumps show retail drawing the entire cube stage at a constant
+`z = 0xFFF010` (the black mask faces at `0xFFF011`) while this port emitted
+real projected Z around 5.2M-6.2M.  The previous write-up proposed hardcoding
+the constant.  **It is not a constant in the ROM, and it does not need to be
+hardcoded** - it falls out of one number in the cube placement table.
+
+### The chain
+
+`sceVu0ViewScreenMatrix` (0x267068) builds, after the perspective divide,
+
+    Z = m[2][2] + m[3][2]/z_cam
+      = (zmin*farz - zmax*nearz)/(farz - nearz)  +  farz*nearz*(zmax - zmin)/(farz - nearz) / z_cam
+
+Both the frame's own matrix (0x21CFD8) and the cube scene's (0x228460 ->
+0x352800) are built from *identical* arguments - `scrz 512, ax/ay 0x27B44C/
+0x27B450, cx/cy 2048, zmin 1, zmax 16777215, nearz 1, farz 65536`; the two
+`gp`-relative zmax constants (`gp-32228` and `gp-32132`) both hold
+`0x4B7FFFFF` = 16777215.0.  So `m[2][2] = -255.0039` and `m[3][2] = 16777470`
+in both, and `menuViewScreen` really does serve for both scenes.
+
+The difference is the **w** of the cube's world matrix.
+
+`0x226D00` places each cube by calling **`0x2303E8` (mdTranslate) directly with
+a pointer to the table entry at 0x27F090**, not the three-float wrapper
+`0x230440` (mdTranslatef).  0x2303E8 does `ApplyMatrix(tmp, top, v)` and then
+stores the **whole quadword** into the matrix's row 3 (`sq` at 0x230428) - w
+included.  Every one of the five table vectors carries `w = 0`:
+
+    cube 0  (-11.50, -11.50, 47.5, 0)
+    cube 1  (-22.50,  -5.50, 47.5, 0)
+    cube 2  (-10.75,  -0.25, 47.5, 0)
+    cube 3  (-21.75,   6.00, 47.5, 0)
+    cube 4  (-11.25,  11.50, 47.5, 0)
+
+(`res/MENUGEOM.inc` has already been carrying those zeros; the port threw them
+away by going through `mdTranslatef`, which forces `w = 1`.)
+
+With `world[3][3] = 0` the camera-space w of every cube vertex is 0, so
+0x22CFA8's second transform gives
+
+    proj.z = m[2][2]*z_cam + m[3][2]*0 = -255.0039 * z_cam
+    proj.w = z_cam
+
+and the divide leaves `proj.z = m[2][2] = -255.0039` for **every vertex of
+every cube**.  `sceVu0FTOI4` (0x267668, a bare `vftoi4`) turns that into
+`-4080 = 0xFFFFF010`; the black pass's `+1` gives `0xFFFFF011`.  A dump decoder
+that masks the GS Z field to 24 bits prints those as 16773136 / 16773137.
+
+x and y are untouched, because `m[3][0] = m[3][1] = 0` in the view-screen
+matrix - which is exactly why this port's cubes were in the right place and at
+the right size but at the wrong depth.
+
+### Verified
+
+Live retail face bank at 0x3529D0 (savestate `.04.p2s`, face record stride
+352, vertex stride 80: `+0x00` cam, `+0x10` uv, `+0x20` proj, `+0x30` the
+`vftoi4` triple, `+0x40` q):
+
+    f0 v0  cam (-8.6401, 14.1428, 50.1668, 0.0000)  proj (1959.82, 2115.84, -255.0039, 1.0)  fix z -4080
+    f0 v1  cam (-13.8629, 14.6318, 49.5670, 0.0000) proj (1904.80, 2119.03, -255.0039, 1.0)  fix z -4080
+    f1 v0  cam (-9.1858, 8.9140, 50.6559, 0.0000)   proj (1955.16, 2090.35, -255.0038, 1.0)  fix z -4080
+
+- `cam.w = 0` on every vertex; camera-space z legitimately varies 44.3..50.7.
+- The rod scene's world matrix (0x27E950+0x20) has `row3 = (..., 1)` and its
+  vertices keep real per-vertex Z.  **Rods must not be changed.**
+
+After the fix, a one-shot debug print of the first face's vertex 0 at the debug
+frame (removed again before the diff) gives:
+
+    rods   camw 1.0000  projz 113648.8 .. 274767.4   fix z 1818380 .. 4396278
+    cubes  camw 0.0000  projz -255.0039              fix z -4080  (= 0xFFFFF010)
+
+i.e. bit-identical to retail, with the rods untouched.
+
+**Fix:** add `mdTranslate(const float *v4)` (the real 0x2303E8) next to
+`mdTranslatef` (the real 0x230440, which is 0x2303E8 with w = 1), and call it
+with `menuCubePos[i]` in both cube walks.
+
+---
+
+## 2. ZBUF: PSMZ32 and, more importantly, ZMSK = 0
+
+Two ZBUF divergences, found by counting every ZBUF write in both dumps:
+
+    retail:  416 x  "zbp=4480 psm=0"                (PSMZ32, ZMSK clear)
+    ours:      8 x  "zbp=4480 psm=0"
+               4 x  "zbp=4480 psm=1"                (PSMZ24)
+             124 x  "zbp=4480 psm=1 ZMSK"           (PSMZ24 + Z writes masked)
+
+**The ROM never masks Z anywhere in the menu.**  0x22BF58 / 0x22BFD0 /
+0x22A4C8 / 0x22A3B8 push FRAME and ZBUF together and the ZBUF they push always
+has ZMSK = 0.  `vif1SetZWrite(0)` in the mesh paths was an addition of ours.
+
+The psm is also wrong: `main.c`'s `sceGsSetDefDBuff` allocates the Z buffer as
+**PSMZ32**, and every retail ZBUF write agrees, but `vif1SetZWrite` was writing
+PSMZ24.  That was harmless while every Z in this port fitted in 24 bits; with
+the cube stage now emitting `0xFFFFF010` it is not (PSMZ24 masks the value on
+both the write and the compare).
+
+### Why ZMSK matters: the AA1 crack repair needs BOTH halves
+
+Measured in the libgpu2 replay harness on the wb4 alpha mask (the mask the
+cube stage composites by), classifying non-{0, 0x80} alpha pixels into
+*interior* (all four neighbours non-zero - a crack inside a face) and
+*silhouette* (unavoidable AA on the outline):
+
+| stream | solid 0x80 | interior cracks | silhouette |
+|---|---|---|---|
+| retail, as dumped | 11377 | **0** | 960 |
+| ours, as dumped | 11434 | **1020** | 1017 |
+| retail, cube-stage Z forced down to ours (0x55AECD) | 10404 | **941** | 984 |
+| ours, cube-stage Z forced up to 0xFFF010 | 11434 | **1020** | 1017 |
+
+Rows 3 and 4 are the whole story:
+
+- Giving **retail** our Z reproduces our artifact exactly (0 -> 941 interior
+  cracks).  So the flat near-max Z genuinely is what keeps retail's mask solid
+  - Finding 1's mechanism is confirmed, not just correlated.
+- Giving **ours** retail's Z fixes nothing, because our ZBUF has ZMSK = 1.
+  With Z writes masked, nothing is ever stored, every primitive compares
+  against whatever the pre-cube scene left, and the repair cannot happen at
+  all.  Retail's AA1 partial-coverage pixels skip the Z write while fully
+  covered ones store the flat Z, so the *next* primitive over a crack pixel
+  wins its depth test against the stale value and re-blends the coverage up to
+  solid.
+
+So the flat Z is necessary but not sufficient: **both** the `w = 0` translate
+and `ZMSK = 0` are required.  A bisect with the harness's `-x` knob also showed
+the crack pixels are written by the black pass (0x22CA68), not the reflection
+pass - masking cube 1's whole reflection pass left the final mask
+byte-identical, i.e. the black pass overwrites everything the reflection pass
+put down.
+
+**Fix:** `vif1SetZWrite` now writes `SCE_GS_PSMZ32`, and `MeshDrawCube` /
+`MeshDrawCubeMask` call `vif1SetZWrite(1)` (ZMSK 0).
+
+**Left alone deliberately:** `MeshDrawRod` and every other menu call site still
+carry `vif1SetZWrite(0)`.  Retail has ZMSK = 0 there too, so those are also
+divergences, but the rod path draws straight to the visible buffer and changing
+its depth behaviour is a separate, separately-verifiable change.  Worth doing
+next; see "open" below.
+
+---
+
+## 3. The orbs were missing from work buffer 3
+
+0x22EFF0 draws every orb **twice** - once on the visible buffer and once,
+identically placed, into work buffer 3 - and the port only had the first walk.
+Retail's per-orb pattern in the dumps is `LINESTRIP+AA1 x1 + SPRITE+TME+ABE+FST
+x2` to FB = 0/2240 immediately followed by the same three to FB = 6720,
+interleaved per orb with the rods.
+
+Work buffer 3 feeds the frame-start tint, the rods' passes 1 and 5, and the
+whole cube chain, so without the twin everything that refracts the scene
+refracted a version of it with no orbs in it.
+
+The second walk begins with `0x22F798: 0x22A4C8(0, NULL, *(0x27B448))` - FRAME
+= work buffer 3, no clear, the module's own field snapshot (the same half pixel
+the screen walk carries; this is a mesh-style draw, not a buffer-to-buffer
+blit).
+
+The two walks are **not** identical.  Both sprite colour records differ:
+
+| | halo (TEXCBLUR, tbp 11840) | core (TEXCNAVI, tbp 11776) |
+|---|---|---|
+| walk 1 (screen) | the orb's own trail colour `{0x30,0x62,0x80,0x3C}` | `*0x27F930 = {0x80,0x80,0x80,0x80}` |
+| walk 2 (wb3) | the same RGB with **alpha 0x80** | `*0x27F940 = {0xFF,0xFF,0xFF,0x80}` |
+
+Confirmed both in the ROM and per-vertex in the dump (`rgba=3062803c` /
+`80808080` on the screen, `30628080` / `ffffff80` into wb3).
+
+The halo's alpha is not a separate record: 0x22EFF0 keeps the colour on its own
+stack at sp+48 and the sprite code overwrites the quadword's fourth word with
+`TimerInterp(orbTrailTimer, <that word>)` each time it draws (0x22F54C/
+0x22F558), so walk 1 feeds it the orb's 0x3C while walk 2's head
+(0x22F788/0x22F794: `li v1,128; sw v1,60(sp)`) resets it to 128 first.  With the
+trail timer open both come out unchanged, i.e. exactly the port's `baseAlpha`.
+
+**Fix:** `DrawOrb` split into `DrawOrbPass(o, zscale, baseAlpha, blurCol,
+coreCol)` called twice, with `MenuBackWorkTarget(0, 0, MenuBackField())` between
+them, plus `orbCoreColorWork = {0xFF,0xFF,0xFF,0x80}` (the real 0x27F940).
+
+`MenuFrame` also re-aims FRAME at the screen after `SceneWalk()`, because the
+last orb now leaves it on work buffer 3 (as the last rod already did).  The ROM
+gets this from 0x2267E8's own FRAME push, which this port still defers; without
+it, an `argv[10]` that drops the transition phase to 5 makes `ZoomBlur` run zero
+passes and the 2D text would land in a work buffer.
+
+---
+
+## 4. The "full-screen distortion stage" is 0x2267E8, the deferred rod bloom
+
+FINDINGS called this "2 x 86 quads, full-screen bbox, two unknown textures
+(tbp 11200 and 11584), very likely the TEXCKABE tunnel family".  It is none of
+those things.  It is **0x2267E8**, the two-pass flush that
+`menu.c`'s `SceneWalk` comment already says is deferred, and its 86 quads are
+small and scattered - the bbox is full-screen only because the rods are.
+
+`86` is exactly the sum of the twelve carousel rods' *near*-face counts in that
+frame (5+5+5+7+7+7+8+6+8+9+8+11), which is what identified it.
+
+### The two unknown textures
+
+Both were resolved by dumping the retail dump's VRAM and matching the decoded
+texels against the live TEXC slot table at **0x27F1C0** (stride 12, first word =
+the decoded texel buffer):
+
+- **tbp 11200 = TEXC slot 0 = `TEXCFLOW`** - 64x64, greyscale, alpha 0x7F
+  throughout (the same `b | b<<8 | b<<16 | 0x7F000000` decoder as TEXCBUMP).
+- **tbp 11584 = TEXC slot 3 = `TEXCBINV`** - 64x64, and it is the **exact
+  bitwise complement of TEXCBUMP**: comparing the two VRAM images gives 0 RGB
+  mismatches and 0 alpha mismatches over all 4096 pixels.
+
+Slot numbering is `slot = <index in the TEXC resource group> - 4`, which the
+known bindings confirm: slot 1 = TEXCKABE, 2 = TEXCBUMP, 5 = TEXCREFA,
+6 = TEXCNAVI, 7 = TEXCBLUR.
+
+The VRAM map in blocks is therefore
+`11200 TEXCFLOW, 11264 TEXCKABE (128x128), 11520 TEXCBUMP, 11584 TEXCBINV,
+11712 TEXCREFA, 11776 TEXCNAVI, 11840 TEXCBLUR`.
+
+`tools/extract-res.py` already extracts both (`TEXCFLOW 4556 -> 4096`,
+`TEXCBINV 4452 -> 4096`); only TEXCFLOW needs adding to `res/` and `res.c`,
+because TEXCBINV can be produced in `DecodeBump()` as `~TEXCBUMP`.
+
+### The stage, from the disassembly
+
+`0x2268F0` ends with `j 0x2267E8`, immediately after `0x226700` (the sorted
+walk).  0x2267E8 is:
+
+    0x22A4C8(1, 0x27EBF0, field)      ; FRAME = wb4, CLEAR to {0,0,0,0x80}
+    for each record with type != 1:   ; meshes only, orbs skipped
+        0x22E428(rec+0x10, f12 = rec->0xF4 (split), a1 = 0, a2 = rec+0x120)
+    0x22C020(1, 0, 0)                 ; TEX = wb4, FRAME = screen, NO half pixel
+    0x226768(30)                      ; full-screen additive composite, alpha 30
+    0x22A4C8(1, 0x27EBF0, field)      ; again
+    for each record with type != 1:
+        0x22E428(..., a1 = 1, ...)
+    0x22C020(1, 0, 0)
+    0x226768(30)
+
+`0x22E428`'s `a1` selects the walk; `0x22E428` branches on `split > 0` into a
+split-rod arm (not needed - the port only has the one-piece rod) and, at
+**0x22E9A8**, the simple arm.  Guarded by `0 <= a1 < 2`, the simple arm is:
+
+    0x22CFA8(...)                     ; the same MeshTransform, scene = rec+0x10
+    outX *= 0.9; outY *= 0.9          ; *(gp-32020); unused by both emits here
+    f21 = (float)rec->index * 0.1     ; *(gp-32024)
+
+    ; pass A, both walks
+    0x22AB90(0, 0, 2)                 ; TEXCFLOW
+    0x22A0C0(1, 1)                    ; ALPHA_1 0x44, ZTST ALWAYS
+    for each face with cull != 0:     ; NEAR faces
+        0x22CD78(face, scene, aa = 0) ; PRIM 276 (TRISTRIP|TME|FST, no AA1, no
+                                      ; ABE) - the same spherical env map the
+                                      ; cube mask walk uses, colour scene+0xC0
+    0x22ED10                          ; flush
+
+    ; pass B
+    if(a1 == 1)  0x22AB90(2, 1, 2)    ; TEXCBUMP,
+                 ST offset = (scene+0xB0 + i*0.1, scene+0xB4 + i*0.1)
+    else         0x22AB90(3, 1, 1)    ; TEXCBINV,
+                 ST offset = (f21 + i*0.1, f21 + i*0.1)
+    0x22A0C0(2, 1)                    ; ALPHA_1 0x42 SUBTRACTIVE, ZTST ALWAYS
+    for each face with cull != 0:
+        0x22C920(face, scene+0xD0)    ; PRIM 84, colour {0x28,0x28,0x28,0x80}
+    0x22ED10
+
+Cross-checked against the dump, which shows exactly this and settles which
+texture goes with which walk:
+
+    walk a1 = 0:  TEX0 tbp=11200 (ALPHA 0101) x N faces, then tbp=11584 (ALPHA 2001) x N
+    walk a1 = 1:  TEX0 tbp=11200 (ALPHA 0101) x N faces, then tbp=11520 (ALPHA 2001) x N
+
+So it is the classic emboss pair - TEXCBUMP and its exact complement TEXCBINV,
+one per walk, subtractively over an environment-mapped rod - and the reason the
+two walks look almost identical in a segment summary.
+
+Constants read out of the ROM:
+
+    0x27EBF0  the wb4 clear record       {0, 0, 0, 0x80}
+    scene+0xC0                            the record's colA (dump: {0x3c,0x3c,0x3c,0x80})
+    scene+0xD0                            {0x28, 0x28, 0x28, 0x80}  (static)
+    scene+0xB0/+0xB4                      -0.008 (the rod scene's own bump offset)
+    gp-32020 = 0.9, gp-32024 = 0.1, gp-32000 = 0.1, gp-31996 = 0.1
+
+`0x226768(a)` patches the sprite record at **0x27EBB0** - colour
+`{0x80,0x80,0x80, a}`, `x0/y0 = 0,0`, `u0/v0 = 8,8`, extents `(w<<4, h<<4)` and
+`((w<<4)+8, (h<<4)+8)`, `+0x34 = 1` (ABE) and `+0x38 = 1` (TME) - then does
+`0x22A0C0(0, 1)` (ALPHA_1 0x48, additive, ZTST ALWAYS) and draws it via
+0x2299C0.  In the dump: `SPRITE+TME+ABE+FST`, full screen, `uv (0,0)-(640,224)`,
+`rgba = 8080801e` (alpha 30 = the argument).
+
+### To port it
+
+1. `tools/extract-res.py <bios.bin> osdbits/res` already writes
+   `TEXCFLOW_EXP.inc`; add the `#include` and the `{ "TEXCFLOW", ... }` row to
+   `res.c` and `RESID_TEXCFLOW` is already in `res.h`.
+2. In `menuconfig.c`'s `DecodeBump`, decode TEXCFLOW like TEXCBUMP/TEXCREFA,
+   and build TEXCBINV as `~bumpTexels` (RGB complement, alpha kept at 0x7F) -
+   no new resource.  Add `MenuConfigBindFlow()` / `MenuConfigBindBinv()`
+   alongside the existing binders.
+3. Give `MeshEmitReflFace` an `aa` parameter (PRIM `aa ? 404 : 276`); the cube
+   mask walk passes 1, this stage passes 0.  `MeshReflPass` gains the same.
+4. Add `MenuConfigFlushMesh(SceneRec *rec, int walk)` implementing 0x22E428's
+   simple arm above, and a `SceneFlush()` in `menu.c` implementing 0x2267E8,
+   called from `MenuFrame` right after `SceneWalk()` (replacing the explicit
+   screen-target restore added in section 3, whose job 0x2267E8 does).
+5. `menuback.c`'s `BlurBlit` is the right shape for `0x226768` but hardcodes
+   RGBAQ 0x80808080 - it needs an alpha argument (or a small sibling).
+6. `MenuBackWorkTarget(1, 1, field)` already models `0x22A4C8(1, rec, field)`,
+   but `WorkClear` writes `{0,0,0,0}`; this stage's record 0x27EBF0 is
+   `{0,0,0,0x80}`, so the clear colour has to become a parameter.
+
+Not implemented in this pass - see "open".
+
+---
+
+## 5. What changed, and how it was verified
+
+`gsfix.diff` (applies cleanly to the tree at `d68fbdf`):
+
+    osdbits/inc.h          3 +      declare mdTranslate
+    osdbits/menu.c       144 +-     mdTranslate/mdTranslatef split; DrawOrbPass;
+                                    the wb3 orb twin; FRAME restore after SceneWalk
+    osdbits/menuconfig.c  34 +-     mdTranslate(menuCubePos[i]) in both cube walks;
+                                    vif1SetZWrite(1) in the two cube drawers
+    osdbits/opening.c     10 +      vif1SetZWrite -> PSMZ32
+
+Verification (windowless PCSX2 on Xvnc :97, `DumpFrameAscii` 8x8 luminance maps
+extracted with `grep -o '|.*|'`):
+
+- **Cube Z, direct:** a temporary debug print of the first face's vertex 0 at
+  the debug frame gave `camw 0.0000 projz -255.0039 fix z -4080` for all five
+  cubes and `camw 1.0000 projz 113648..274767` for all twelve rods - retail's
+  values exactly, rods untouched.  Print removed before the diff.
+- **Main-menu regression** (`menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`): the
+  ASCII map is **byte-identical** to an unmodified baseline build.  Expected:
+  on the main menu nothing samples work buffer 3 after the scene walk, so the
+  orb twin has no visible consumer there, and there are no cubes.
+- **Config screen** (`menu 18 27 45 0 1 128 145 0 0 0 10 0 1 0 1`): the map
+  changes only in the cube/clock region and only by getting brighter.  Four
+  builds were compared to split the credit:
+
+      baseline                     9c736bd4672afb2442e09bb37f0b1d61
+      orb wb3 twin only            06e637469a057639728d2650d0b9fd2d
+      + cube flat Z                0524efab56a7823ab6db207447a39fb7
+      + ZMSK 0 / PSMZ32 (final)    (differs again, in the cube columns)
+
+  Almost all of the visible change is the orbs reaching work buffer 3 - exactly
+  what Finding 2 predicted (`.:+*#######` -> `.-+#%%%####` across the clock).
+  The flat Z alone moves one 8x8 block, because a 1 px seam barely survives a
+  block-max luminance map.  Adding ZMSK = 0 changes the five cube columns again
+  (`-%%` -> `-@@`, `+%@@@*` -> `+%@@@%`), which is the masked composite finally
+  replacing the frame solidly inside the cubes instead of leaking the dark
+  background through the seams.  The changed block columns (9-10 and 24-25)
+  match the cubes' own projected centres from the mesh debug print
+  (screen x 78, 86, 196, 199, 204).
+- **The cracks themselves** were measured in the libgpu2 replay harness rather
+  than on screen, because 1 px seams do not survive the ASCII map.  See the
+  table in section 2: forcing our Z into the retail stream reproduces our
+  artifact (0 -> 941 interior crack pixels), which is the pixel-exact proof of
+  the mechanism.
+
+### Open
+
+- **Pixel proof of the fixed build.**  The harness needs a PCSX2 GS dump, and
+  PCSX2's dump trigger is a hotkey - not reachable from the headless recipe.
+  A fresh shift+F8 dump of the fixed build replayed through
+  `gsreplay <dir> -e draw:<mask-walk-end> -s ...` and scored with the
+  interior/silhouette classifier should read `interior = 0`; that is the one
+  outstanding check for sections 1 and 2.
+- **ZMSK on the rod path and elsewhere.**  Retail has ZMSK = 0 for all 416 of
+  its ZBUF writes; we still set it everywhere except the two cube drawers.  The
+  rod path is the next one worth changing, but it draws to the visible buffer,
+  so it wants its own before/after run.
+- **Section 4 (0x2267E8) is specified but not implemented.**  It is a real,
+  visible stage (two full-screen additive composites at alpha 30 over an
+  embossed environment map of the rods) and its absence is why the retail clock
+  has a glow this port does not.
+- **The refraction-pass ALPHA in the cube mask walk.**  Retail runs 0x22CD78
+  there under `ALPHA_1 0x44`; we use `0x48`.  It does not affect the mask (the
+  black pass overwrites it) but it does affect the colour the reflection
+  contributes, so it is worth aligning.
