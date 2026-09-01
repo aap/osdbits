@@ -185,6 +185,36 @@ static Texture refaTexture = {
 	0, 0, SCE_GS_PSMCT32, 0, { 0 }
 };
 
+/* ============ TEXCFLOW (slot 0) and TEXCBINV (slot 3) ============
+ *
+ * The two textures the deferred rod bloom (0x2267E8, MenuConfigFlushMesh)
+ * uses, and the last two TEXC pages this port was missing.  The slot
+ * descriptor table at 0x27F1C0 declares both as 64x64 (wexp = hexp = 6)
+ * and the per-slot decoder table 0x2A4BA0 sends BOTH to 0x22A720, the same
+ * grey expander slots 2 and 5 use - so all four share one decode.
+ *
+ * TEXCBINV needs no resource of its own: the TEXIMAGE blobs `TEXCBUMP'
+ * and `TEXCBINV' are the exact bitwise complement of each other (checked
+ * byte for byte over the whole 4096-byte expansion, 0 mismatches), which
+ * is what makes the two walks of the flush a classic emboss PAIR rather
+ * than two unrelated passes. */
+
+static u32 flowTexels[BUMPW*BUMPH];
+
+static Texture flowTexture = {
+	(u8*)flowTexels, RESID_TEXCFLOW, nil, 0, { 0, 0, BUMPW, BUMPH },
+	0, 0, SCE_GS_PSMCT32, 0, { 0 }
+};
+
+static u32 binvTexels[BUMPW*BUMPH];
+
+/* `data' is set, so InitTexture never looks the resource up - the id is
+ * here to record which TEXC slot these texels really are. */
+static Texture binvTexture = {
+	(u8*)binvTexels, RESID_TEXCBINV, nil, 0, { 0, 0, BUMPW, BUMPH },
+	0, 0, SCE_GS_PSMCT32, 0, { 0 }
+};
+
 /* real: 0x22A720 */
 static void
 DecodeBump(void)
@@ -193,12 +223,20 @@ DecodeBump(void)
 	int i;
 
 	src = GetResourceData(RESID_TEXCBUMP);
-	for(i = 0; i < BUMPW*BUMPH; i++)
+	for(i = 0; i < BUMPW*BUMPH; i++) {
 		bumpTexels[i] = src[i] | src[i]<<8 | src[i]<<16 | 0x7F000000;
+		/* TEXCBINV = ~TEXCBUMP, run through the same expander */
+		binvTexels[i] = (u8)~src[i] | (u8)~src[i]<<8 | (u8)~src[i]<<16 |
+			0x7F000000;
+	}
 	/* slot 5 shares the decoder (0x2A4BA0[5] == 0x2A4BA0[2] == 0x22A720) */
 	src = GetResourceData(RESID_TEXCREFA);
 	for(i = 0; i < BUMPW*BUMPH; i++)
 		refaTexels[i] = src[i] | src[i]<<8 | src[i]<<16 | 0x7F000000;
+	/* and so does slot 0 */
+	src = GetResourceData(RESID_TEXCFLOW);
+	for(i = 0; i < BUMPW*BUMPH; i++)
+		flowTexels[i] = src[i] | src[i]<<8 | src[i]<<16 | 0x7F000000;
 }
 
 /* real: 0x22AB90(2, 1, 2) -> 0x22AA88, the same binder menuback.c's
@@ -243,6 +281,43 @@ MenuConfigBindRefa(void)
 	pktSetAD(SCE_GS_TEXA, SCE_GS_SET_TEXA(0x7F, 1, 0x81));
 	vif1End();
 }
+
+/* real: 0x22AB90(0, 0, 2) - the flush's pass A texture.  Same binder, TEXC
+ * slot 0's page; the ALPHA_1 0x44 and TEST_1 GREATER 0x22AA88 pushes for
+ * (additive = 0, ztst = 2) are both overwritten by the 0x22A0C0(1, 1) that
+ * follows, so as with MenuConfigBindBump only the texture state is here. */
+static void
+MenuConfigBindFlow(void)
+{
+	vif1Begin();
+	pktSetAD(SCE_GS_TEXFLUSH, 0);
+	pktSetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(1, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(flowTexture.gstex.tbp[0], BUMPW/64,
+		SCE_GS_PSMCT32, 6, 6, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+	pktSetAD(SCE_GS_CLAMP_1, SCE_GS_SET_CLAMP(0, 0, 0, 0, 0, 0));
+	pktSetAD(SCE_GS_TEXA, SCE_GS_SET_TEXA(0x7F, 1, 0x81));
+	vif1End();
+}
+
+/* real: 0x22AB90(3, 1, 2) - the flush's walk-0 emboss texture, TEXCBUMP's
+ * complement. */
+static void
+MenuConfigBindBinv(void)
+{
+	vif1Begin();
+	pktSetAD(SCE_GS_TEXFLUSH, 0);
+	pktSetAD(SCE_GS_TEX1_1, SCE_GS_SET_TEX1(1, 0, SCE_GS_LINEAR, SCE_GS_LINEAR, 0, 0, 0));
+	pktSetAD(SCE_GS_TEX0_1, SCE_GS_SET_TEX0(binvTexture.gstex.tbp[0], BUMPW/64,
+		SCE_GS_PSMCT32, 6, 6, 1, SCE_GS_MODULATE, 0, SCE_GS_PSMCT32, 0, 0, 1));
+	pktSetAD(SCE_GS_CLAMP_1, SCE_GS_SET_CLAMP(0, 0, 0, 0, 0, 0));
+	pktSetAD(SCE_GS_TEXA, SCE_GS_SET_TEXA(0x7F, 1, 0x81));
+	vif1End();
+}
+
+/* real: 0x27F180 - 0x226D00's clear record between its two cube walks,
+ * {0,0,0,0}: work buffer 4 becomes the stage's ALPHA MASK.  0x2267E8's
+ * record is a different one, {0,0,0,0x80} - see menu.c's flushClearColor. */
+static const int cubeMaskClear[4] = { 0, 0, 0, 0 };
 
 /* real: 0x27EFB0 + 0xC0, {120,120,120,128} in the live retail image
  * (0x27F070: 78 78 78 80).  0x22CD78 hands it straight to RGBAQ. */
@@ -424,6 +499,33 @@ cfgCosf(int a)
 	return cosf((short)a * (TAU/65536.0f));
 }
 
+/* real: the vertex kick shared by all five emits below, and the one place
+ * this port had the wrong GS REGISTER.
+ *
+ * Every one of the ROM's REGLIST templates - 0x27F870 and 0x27F880 (the
+ * black and flat passes, {PRIM, RGBAQ, XYZF2 x4}), 0x27F890 (the
+ * refraction, {PRIM, CLAMP_1, CLAMP_1, RGBAQ, (UV, XYZF2) x4}), 0x27F8A0
+ * (the reflection, {PRIM, RGBAQ, (UV, XYZF2) x4}) and 0x27F8B0 (the
+ * emboss, {PRIM, CLAMP_1, (ST, RGBAQ, XYZF2) x4}) - names GIF register
+ * **4 = XYZF2**, not 5 = XYZ2.  XYZF2's Z field is 24 bits wide where
+ * XYZ2's is 32, so the GS silently truncates.
+ *
+ * That is where retail's flat cube depth comes from: sceVu0FTOI4 (a bare
+ * `vftoi4') leaves -4080 in the face record's +0x38 and 0x22C4E0 pushes
+ * the whole sign-extended word, but the register only keeps its low 24
+ * bits - 0x00FFF010 = 16773136, exactly what the GS dumps show, against
+ * this port's 0xFFFFF010.  Nothing in the ROM masks; the register does.
+ *
+ * F is 0 and dead: none of the five PRIMs (276, 404, 84, 132, 196) sets
+ * FGE, so the fog value is never used. */
+static void
+MeshEmitXYZ(MeshFace *f, int k, int zbias)
+{
+	pktSetAD(SCE_GS_XYZF2, SCE_GS_SET_XYZF((int)(f->v[k].proj[0]*16.0f),
+		(int)(f->v[k].proj[1]*16.0f),
+		((int)(f->v[k].proj[2]*16.0f) + zbias) & 0xFFFFFF, 0));
+}
+
 /* real: the emit half of 0x22C4E0.  Every vertex is drawn 5 % of the way
  * toward the object's own screen centre (*(gp-32068) = 0.95) and pushed
  * by the camera-space face normal scaled by 1/w - a cheap refraction
@@ -501,8 +603,7 @@ MeshEmitFace(MeshFace *f, float fres, const int *col, float size, int extra)
 		v += screenH/2 + 256.0f - MenuBackField()*0.5f;
 		pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(((int)(u*16.0f)) & 0x3FFF,
 			((int)(v*16.0f)) & 0x3FFF));
-		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
-			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
+		MeshEmitXYZ(f, k, 0);
 	}
 	vif1End();
 }
@@ -541,8 +642,7 @@ MeshEmitBumpFace(MeshFace *f, const int *col, float ofsx, float ofsy)
 		pktSetAD(SCE_GS_ST, SCE_GS_SET_ST(*(u32*)&s, *(u32*)&t));
 		pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2],
 			col[3], *(u32*)&f->v[k].q));
-		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
-			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
+		MeshEmitXYZ(f, k, 0);
 	}
 	vif1End();
 }
@@ -572,8 +672,7 @@ MeshEmitFlatFace(MeshFace *f, float fres, const int *col)
 		1, 1, 0, 0, 0));	/* real: 196 */
 	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(r, g, b, 0x80, 0));
 	for(k = 0; k < 4; k++)
-		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
-			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
+		MeshEmitXYZ(f, k, 0);
 	vif1End();
 }
 
@@ -601,9 +700,7 @@ MeshEmitBlackFace(MeshFace *f)
 		0, 1, 0, 0, 0));	/* real: 132 */
 	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0, 0, 0, 0x80, 0));
 	for(k = 0; k < 4; k++)
-		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
-			(int)(f->v[k].proj[1]*16.0f),
-			(int)(f->v[k].proj[2]*16.0f) + 1));
+		MeshEmitXYZ(f, k, 1);
 	vif1End();
 }
 
@@ -615,8 +712,12 @@ MeshEmitBlackFace(MeshFace *f)
  *     if(d < 0) d = -d                        ; 22ce80..22ceb4, sign-folded
  *     r = sceVu0AddVector(n, ScaleVector(normal, d))  ; 0x267710/0x267050
  *     UV = ((r.x + 1) * 512, (r.y + 1) * 256) ; 0x25A368, 1/16 units
- *     PRIM = aa ? 404 : 276 ; 0x22D798 passes aa = 1, so 404
- *     RGBAQ = scene->+0xC0 = {120,120,120,128}
+ *     PRIM = aa ? 404 : 276 ; 0x22D798 passes aa = 1, so 404, and
+ *                             0x22E9A8 (the rod bloom) passes 0, so 276 -
+ *                             no AA1 and, since 276 has ABE clear too,
+ *                             a flat opaque write there
+ *     RGBAQ = scene->+0xC0 = {120,120,120,128} for the cube scene, the
+ *             ring slot's own col1 for a rod
  *     XYZ2 = v.fix, unchanged (no z + 1 here)
  *
  * `r = n + N*|2(n.N)|' is `reflect(n, N)' written for a normal that faces
@@ -647,14 +748,14 @@ MeshEmitBlackFace(MeshFace *f)
  * (17,12,25) - and this port, without the pass, measured (17,13,26) at
  * the same place.  17 + 44 = 61, 13 + 44 = 57, 26 + 44 = 70. */
 static void
-MeshEmitReflFace(MeshFace *f, const int *col)
+MeshEmitReflFace(MeshFace *f, const int *col, int aa)
 {
 	float n[3], r[3], d, l;
 	int k, u, v;
 
 	vif1Begin();
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 0, 1, 0,
-		0, 1, 1, 0, 0));	/* real: 404 */
+		0, aa, 1, 0, 0));	/* real: aa ? 404 : 276 */
 	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], col[3], 0));
 	for(k = 0; k < 4; k++) {
 		l = sqrtf(f->v[k].cam[0]*f->v[k].cam[0] +
@@ -674,8 +775,7 @@ MeshEmitReflFace(MeshFace *f, const int *col)
 		u = (int)((r[0] + 1.0f) * 512.0f);
 		v = (int)((r[1] + 1.0f) * 256.0f);
 		pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(u & 0x3FFF, v & 0x3FFF));
-		pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ((int)(f->v[k].proj[0]*16.0f),
-			(int)(f->v[k].proj[1]*16.0f), (int)(f->v[k].proj[2]*16.0f)));
+		MeshEmitXYZ(f, k, 0);
 	}
 	vif1End();
 }
@@ -751,15 +851,16 @@ MeshBlackPass(MeshModel *mdl, int back)
 }
 
 /* real: the 0x22CD78 loop, 0x22D798's FIRST - the same cull != 0 set the
- * black pass then stamps alpha over (22d884: `beqz v0' skips cull == 0). */
+ * black pass then stamps alpha over (22d884: `beqz v0' skips cull == 0).
+ * 0x22E9A8's pass A is the same loop with aa = 0 (22ea24: `move a2,zero'). */
 static void
-MeshReflPass(MeshModel *mdl, const int *col, int back)
+MeshReflPass(MeshModel *mdl, const int *col, int back, int aa)
 {
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++)
 		if((meshFaces[i].cull != 0) == back)
-			MeshEmitReflFace(&meshFaces[i], col);
+			MeshEmitReflFace(&meshFaces[i], col, aa);
 }
 
 /* real: the 0x22C920 halves of the same per-face loops - same cull test,
@@ -955,7 +1056,15 @@ MeshDrawRod(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 	/* real: 0x22D920's head, f21 = (float)scene->+0x00 * *(gp-32056) */
 	phase = (float)slot * 0.1f;
 
-	vif1SetZWrite(0);
+	/* ZMSK **0**, as everywhere else in the menu: all 416 ZBUF writes in
+	 * a retail GS dump of this screen are `zbp=4480 psm=0' with ZMSK
+	 * clear, because 0x22BF58 / 0x22BFD0 / 0x22C020 / 0x22A4C8 / 0x22A3B8
+	 * push FRAME and ZBUF together and the ZBUF they push never masks.
+	 * The port's `vif1SetZWrite(0)' here was an addition; passes 2..5 of
+	 * this function run ZTST GEQUAL, so with Z writes off they were
+	 * comparing every rod against whatever the previous frame's cube
+	 * stage happened to leave behind. */
+	vif1SetZWrite(1);
 
 	if(!cfgMeshTex) {			/* NOT original: argv[14] = 0 */
 		MenuBackScreenTarget(field);
@@ -968,7 +1077,7 @@ MeshDrawRod(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 
 	/* 1 - the far glass refracting wb3, into wb4 */
 	MenuBackBindWork(0);			/* real: 0x22BFD0(1,0,1) */
-	MenuBackWorkTarget(1, 0, field);
+	MenuBackWorkTarget(1, nil, field);
 	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) */
 	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 0x44 */
 	MeshDrawPass(mdl, col, size, 0, 0);
@@ -991,7 +1100,7 @@ MeshDrawRod(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 
 	/* 5 - the same faces again into wb3, washed out by extra 255 */
 	MenuBackBindWork(1);			/* real: 0x22BFD0(0,1,1) */
-	MenuBackWorkTarget(0, 0, field);
+	MenuBackWorkTarget(0, nil, field);
 	vif1SetZTest(1);
 	vif1SetAlphaBlend(1, 4, 128);
 	MeshDrawPass(mdl, col, size, 1, 255);
@@ -1030,7 +1139,7 @@ MeshDrawCube(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 
 	/* 1 - the far glass, refracting the finished screen, into wb4 */
 	MenuBackBindScreen();			/* real: 0x22A198 */
-	MenuBackWorkTarget(1, 0, field);	/* real: 0x22BF58(1,0,1) */
+	MenuBackWorkTarget(1, nil, field);	/* real: 0x22BF58(1,0,1) */
 	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) ZTST 1 */
 	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 0x44 */
 	MeshDrawPass(mdl, col, size, 0, 0);
@@ -1047,7 +1156,7 @@ MeshDrawCube(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 
 	/* 4 - the far faces again, flat, into wb3 */
 	MenuBackBindWork(1);			/* real: 0x22BFD0(0,1,1) */
-	MenuBackWorkTarget(0, 0, field);
+	MenuBackWorkTarget(0, nil, field);
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);		/* real: 0x22A0C0(1,1) */
 	MeshFlatPass(mdl, col, 0);
@@ -1060,12 +1169,12 @@ MeshDrawCube(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 
 	/* 6 - wb3's left half additively into wb4, so pass 7 can sample it.
 	 * NO half pixel: this one is a buffer-to-buffer resample. */
-	MenuBackWorkTarget(1, 0, 0);		/* real: 0x22BFD0(1,0,0) */
+	MenuBackWorkTarget(1, nil, 0);		/* real: 0x22BFD0(1,0,0) */
 	MenuBackWorkHalfAdd();			/* real: 0x22C100() */
 
 	/* 7 - the near glass, refracting wb4, into wb3 */
 	MenuBackBindWork(1);			/* real: 0x22BFD0(0,1,1) */
-	MenuBackWorkTarget(0, 0, field);
+	MenuBackWorkTarget(0, nil, field);
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);
 	MeshDrawPass(mdl, col, size, 1, 0);
@@ -1096,7 +1205,7 @@ MeshDrawCubeMask(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 
 	vif1SetZWrite(1);			/* ZMSK 0 - see MeshDrawCube */
 	MenuBackBindWork(0);			/* real: 0x22BFD0(1,0,1) */
-	MenuBackWorkTarget(1, 0, field);
+	MenuBackWorkTarget(1, nil, field);
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);		/* real: 0x22A0C0(1,1) */
 
@@ -1116,7 +1225,7 @@ MeshDrawCubeMask(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 		MenuConfigBindRefa();
 		vif1SetZTest(0);
 		vif1SetAlphaBlend(1, 4, 128);	/* real: ALPHA_1 0x44 */
-		MeshReflPass(mdl, cubeReflColor, 1);
+		MeshReflPass(mdl, cubeReflColor, 1, 1);	/* real: aa = 1 */
 	}
 
 	vif1SetTEST_1(0, 0, 0, 0, 0, 0, 1, SCE_GS_DEPTH_GREATER);
@@ -1149,6 +1258,94 @@ MenuConfigDrawMesh(SceneRec *rec)
 	 * all three of 0x22D920's FRAME pushes pass. */
 	MeshDrawRod(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f,
 		rec->col0, rec->size, rec->index, MenuBackField());
+}
+
+/* ============ the deferred bloom's mesh half (0x22E428) ============
+ *
+ * real: 0x22E428, called twice per record by 0x2267E8 (menu.c's
+ * SceneFlush) after the sorted walk has finished.  0x22E428 branches on
+ * the record's split (+0xF4): `> 0' takes the split-rod arm at 0x22E4D0,
+ * everything else the simple arm at **0x22E9A8**, which is what this is.
+ * The port has no split rod (MeshDrawRod does not either), so all twelve
+ * come through here.
+ *
+ * 0x22E9A8, guarded by `0 <= walk < 2' (22e9a8 slti / 22e9b4 bltz - an
+ * out-of-range walk falls to 0x22EB98, a lone pass A that nothing calls):
+ *
+ *   0x22AB90(0, 0, 2)      TEXCFLOW
+ *   0x22A0C0(1, 1)         ALPHA_1 0x44, ZTST ALWAYS
+ *   for each cull != 0 face:  0x22CD78(face, scene, aa = **0**)
+ *   0x22ED10               flush the packet
+ *   walk 1: 0x22AB90(2, 1, 2)  TEXCBUMP, ST offset f21 + i*0.1 + scene->0xB0
+ *   walk 0: 0x22AB90(3, 1, 2)  TEXCBINV, ST offset f21 + i*0.1 + 0
+ *   0x22A0C0(2, 1)         ALPHA_1 0x42 SUBTRACTIVE, ZTST ALWAYS
+ *   for each cull != 0 face:  0x22C920(face, scene + 0xD0)
+ *   0x22ED10
+ *
+ * with `f21 = (float)scene->+0x00 * *(gp-32024)' - the same slot * 0.1
+ * phase MeshDrawRod's emboss uses - and the per-face step *(gp-32000) /
+ * *(gp-31996), both 0.1, counted over EVERY face index, culled ones
+ * included, exactly as 0x22E0EC does for the visible rod.
+ *
+ * So each walk is an environment-mapped rod (TEXCFLOW through the SAME
+ * spherical reflect() 0x22CD78 the cube mask uses, but with AA1 and ABE
+ * both clear) with a subtractive emboss over it, and the two walks differ
+ * ONLY in which half of the emboss pair they use: TEXCBUMP on walk 1,
+ * TEXCBINV - its exact bitwise complement - on walk 0.  Each is composited
+ * additively over the screen at alpha 30 by SceneFlush.  That pair of
+ * near-cancelling layers is the clock's sparkle, and it is the last render
+ * stage of the System Configuration screen the port was missing.
+ *
+ * PRIM 276 (no ABE) means pass A writes work buffer 4 flat, alpha included
+ * - the colour it stamps IS the record's own col1, so the composite's As
+ * comes out of that alpha and not out of the 0x27EBF0 clear's 0x80 wherever
+ * a rod covers a pixel. */
+
+/* real: 0x27E950 + 0xD0, {0x28,0x28,0x28,0x80} - static .data, where the
+ * rod's other emboss colour (+0xA0, rodBumpColor) is {8,8,8,128}.  This
+ * pass is five times as strong because it is subtracted once and never
+ * added back. */
+static const int rodFlowColor[4] = { 0x28, 0x28, 0x28, 0x80 };
+
+void
+MenuConfigFlushMesh(SceneRec *rec, int walk)
+{
+	float phase, ofs;
+
+	/* real: 22e484/22e48c - `scene->+0x6C < 0' returns immediately */
+	if(rec->progress < 0.0f)
+		return;
+
+	MeshTransform(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f);
+	/* real: 22e4c4/22e4c8, *(gp-32020) = 0.9 - the same 0.9 MeshDrawRod
+	 * applies.  Neither of this stage's emits reads meshRefX/Y (0x22CD78
+	 * takes its UV from the reflection vector, 0x22C920 from the model's),
+	 * but the ROM computes it here, so do it and leave nothing stale. */
+	meshRefX = meshObjX * 0.9f;
+	meshRefY = meshObjY * 0.9f;
+
+	/* real: 22e490, f21 = (float)scene->+0x00 * *(gp-32024) = slot * 0.1 */
+	phase = (float)rec->index * 0.1f;
+
+	/* pass A - the environment map, identical in both walks.  ALPHA_1
+	 * 0x44 is pushed but dead: PRIM 276 has ABE clear. */
+	MenuConfigBindFlow();			/* real: 0x22AB90(0, 0, 2) */
+	vif1SetZTest(0);			/* real: 0x22A0C0(1, 1) ALWAYS */
+	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 0x44 */
+	MeshReflPass(&rodModel, rec->col1, 1, 0);	/* real: 0x22CD78(f, scene, 0) */
+
+	/* pass B - the emboss, subtractive.  Walk 1 carries the rod scene's
+	 * own -0.008 ST offset (0x27E950 + 0xB0, rodBumpOfs); walk 0 gets 0. */
+	if(walk) {
+		MenuConfigBindBump();		/* real: 0x22AB90(2, 1, 2) */
+		ofs = rodBumpOfs + phase;
+	} else {
+		MenuConfigBindBinv();		/* real: 0x22AB90(3, 1, 2) */
+		ofs = phase;
+	}
+	vif1SetZTest(0);			/* real: 0x22A0C0(2, 1) ALWAYS */
+	vif1SetAlphaBlend(1, 6, 128);		/* real: ALPHA_1 0x42 */
+	MeshBumpPass(&rodModel, rodFlowColor, 1, ofs, ofs, 0.1f);
 }
 
 /* ================= the carousel (0x225BF8 / 0x226028) ================= */
@@ -1476,7 +1673,7 @@ MenuConfigCubes(void)
 	/* real: 0x22A4C8(1, 0x27F180, *(0x27B448)) - work buffer 4 becomes
 	 * the mask, so it starts at alpha 0 everywhere */
 	vif1SetZTest(0);
-	MenuBackWorkTarget(1, 1, field);
+	MenuBackWorkTarget(1, cubeMaskClear, field);
 
 	/* ---- the second walk: near faces only, black at A = 0x80 ---- */
 	for(i = 0; i < 5; i++) {
@@ -1493,7 +1690,7 @@ MenuConfigCubes(void)
 	/* ---- 0x226D00's tail ---- */
 	/* real: 0x22BFD0(0,1,0) then 0x22C088() - wb4 over wb3, additive,
 	 * and it is this blit that stamps the mask into wb3's alpha */
-	MenuBackWorkTarget(0, 0, 0);
+	MenuBackWorkTarget(0, nil, 0);
 	MenuBackWorkAdd();
 	/* real: 0x22C2A0(phase < 5 ? 5 - phase : 0); the ramp idles at 10, so
 	 * this is 0 passes on a settled screen */
@@ -1654,10 +1851,13 @@ InitMenuConfig(void)
 	 * the only thing in the image that ever writes it */
 	matUnit(cubeCamera);
 
-	/* real: 0x22A9B8(2), TEXC slot 2's decode + upload */
+	/* real: 0x22A9B8(n) for TEXC slots 2, 5, 0 and 3 - one decoder
+	 * (0x22A720) serves all four, so one DecodeBump() does */
 	DecodeBump();
 	InitTexture(&bumpTexture);
 	InitTexture(&refaTexture);
+	InitTexture(&flowTexture);
+	InitTexture(&binvTexture);
 
 	memset(ring, 0, sizeof(ring));
 	for(i = 0; i < NRING; i++)

@@ -199,6 +199,7 @@ void MenuConfigCarousel(void);	/* real: 0x225BF8 */
 void MenuConfigEmit(void);	/* real: 0x226028 */
 int MenuConfigCarouselActive(void);
 void MenuConfigDrawMesh(SceneRec *rec);
+void MenuConfigFlushMesh(SceneRec *rec, int walk);	/* real: 0x22E428 */
 void MenuConfigCubes(void);	/* real: 0x226FA8 */
 int MenuConfigOpen(void);
 int MenuConfigAlpha(int fadeAlpha);
@@ -227,7 +228,8 @@ int MenuBackField(void);
  * buffer 4 (extraBuf2). */
 void MenuBackBindWork(int buf);		/* real: 0x22A290(n) */
 void MenuBackBindScreen(void);		/* real: 0x22A198(evenOddFrame) */
-void MenuBackWorkTarget(int buf, int clear, int field);	/* real: 0x22A4C8 */
+void MenuBackWorkTarget(int buf, const int *clear, int field);	/* real: 0x22A4C8 */
+void MenuBackFlushOver(int alpha);	/* real: 0x22C020(1,0,0) + 0x226768(a) */
 void MenuBackScreenTarget(int field);	/* real: 0x22A3B8 */
 void MenuBackWorkAdd(void);		/* real: 0x22C088 */
 void MenuBackWorkHalfAdd(void);		/* real: 0x22C100 */

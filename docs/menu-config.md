@@ -3761,3 +3761,406 @@ immediately.
   Anim count 80 on the way out. It is the main-menu screen's own timer; nothing
   in the port reads it, so the corresponding arm of the state machine is an
   empty statement with the ROM address in a comment.
+
+
+---
+
+# The deferred rod bloom (0x2267E8) ported, plus XYZF2 and the ZMSK audit
+# (2026-09-01, second pass)
+
+Implements section 4 of the previous write-up ("the deferred rod-bloom
+stage") and closes the two register-fidelity items it left open.  Ground
+truth throughout: the ROM disassembly (`objdump -D -b binary -m mips:5900
+-EL --adjust-vma=0x200000 expanded.bin`), the retail live state in
+savestate `20020207-164243 (00000000).04.p2s`, and the decoded retail GS
+dump `retail614.log` / `retail614v.log`.
+
+---
+
+## 1. What 0x2267E8 actually is, confirmed instruction by instruction
+
+The previous pass identified the stage and left a six-step plan.  Every
+constant in it was re-read from the image before use; the plan was right
+except for one argument (noted in 1.3).
+
+`0x2268F0` ends with `j 0x2267E8` right after the sorted walk 0x226700, so
+this is the tail of the object-list stage and it runs on **every** screen.
+Written out longhand in the ROM (not looped), it is:
+
+    0x2267e8  0x22A4C8(1, 0x27EBF0, *(0x27B448))   FRAME wb4, CLEAR, field
+    0x226824  for rec = *(0x34E980); rec; rec = rec->next:
+    0x226838      if(rec->0xF0 == 1) continue          ; orbs skipped
+    0x226848      0x22E428(rec+0x10, 0, rec->0xF4, rec+0x120)
+    0x226864  0x22C020(1, 0, 0)                    TEX wb4, FRAME screen,
+                                                   NO half pixel
+    0x22686c  0x226768(30)
+    0x226880  0x22A4C8(1, 0x27EBF0, *(0x27B448))   ... and again, with
+    0x2268a8      0x22E428(..., **1**, ...)            walk = 1
+    0x2268c4  0x22C020(1, 0, 0)
+    0x2268e8  j 0x226768   (a0 = 30)
+
+`0x22E428` branches on the record's split (+0xF4): `> 0` takes the
+split-rod arm at 0x22E4D0, everything else the **simple arm at 0x22E9A8**.
+This port has no split rod (neither does `MeshDrawRod`), so all twelve rods
+come through the simple arm.
+
+### 1.1 The simple arm, 0x22E9A8
+
+Guarded by `0 <= walk < 2` (22e9a8 `slti v0,s8,2` / 22e9b4 `bltz s8`); an
+out-of-range walk falls through to 0x22EB98, a lone pass A that nothing in
+the image calls.  Before the arm, 0x22E428's head does
+
+    22e484  if(scene->+0x6C < 0) return             ; the fly-in progress
+    22e490  f21 = (float)scene->+0x00 * *(gp-32024) ; slot * 0.1
+    22e4ac  0x22CFA8(&outX, &outY, &outZ, 0x3529D0, scene)   the transform
+    22e4c4  outX *= *(gp-32020) = 0.9; outY *= 0.9
+
+and then
+
+    ; pass A, identical in both walks
+    0x22AB90(0, 0, 2)                   TEXCFLOW
+    0x22A0C0(1, 1)                      ALPHA_1 0x44, ZTST **ALWAYS**
+    for each face with cull != 0:
+        0x22CD78(face, scene, aa = 0)   PRIM **276** - TRISTRIP|TME|FST,
+                                        no AA1, no ABE; RGBAQ = scene+0xC0
+    0x22ED10                            flush
+
+    ; pass B
+    walk 1: 0x22AB90(2, 1, 2)   TEXCBUMP, ST offset f21 + i*0.1 + scene->0xB0
+    walk 0: 0x22AB90(3, 1, 2)   TEXCBINV, ST offset f21 + i*0.1 + 0
+    0x22A0C0(2, 1)                      ALPHA_1 0x42 SUBTRACTIVE, ZTST ALWAYS
+    for each face with cull != 0:
+        0x22C920(face, scene+0xD0)      PRIM 84; RGBAQ {0x28,0x28,0x28,0x80}
+    0x22ED10
+
+`i` in the ST offset counts **every** face index, culled ones included
+(22eaac `mtc1 s2,f0` where s2 is the outer counter), exactly as 0x22E0EC
+does for the visible rod.  The two per-face steps are `*(gp-32000)` and
+`*(gp-31996)`, both 0.1.
+
+### 1.2 Constants, all re-read from the image
+
+| where | value | how |
+|---|---|---|
+| `0x27EBF0` | `{0, 0, 0, **0x80**}` | the wb4 clear record (0x226800/0x226810 build the pointer; bytes at 0x27EBF0) |
+| `0x27EBB0` | `{0x80,0x80,0x80, A}`, x0/y0 = 0, u0/v0 = 8, +0x34 = 1 (ABE), +0x38 = 1 (TME) | 0x226768's sprite record; A patched from a0 at 0x2267B8 |
+| `scene+0xC0` | the ring slot's own `col1` | 0x226028 at 0x226114/0x22611C copies `ring[slot]+0x30` into `0x27EA10` |
+| `scene+0xD0` | `{0x28,0x28,0x28,0x80}` | static .data at 0x27EA20 |
+| `scene+0xB0/+0xB4` | `-0.008` (`0xBC03126F`) | static .data at 0x27EA00 |
+| `gp-32020` | 0.9 | 0x2A735C |
+| `gp-32024`, `gp-32000`, `gp-31996` | 0.1 | 0x2A7358 / 0x2A7370 / 0x2A7374 |
+| `0x226768`'s alpha | 30 | `li a0,30` at 0x226870 and 0x2268D0 |
+
+`0x22AB90(slot, additive, ztst)` -> `0x22AA88`: `additive` picks ALPHA_1
+0x48 vs 0x44 (22ab44..22ab58) and `ztst` becomes `(ztst<<17) | 0x30000`, so
+its `2` arrives as GREATER.  Both are then overwritten by the `0x22A0C0`
+that immediately follows in every case, which is why the port's binders
+push texture state only.
+
+`0x22A0C0(mode, ztst)`: mode 0/1/2 -> ALPHA_1 0x48 / 0x44 / 0x42,
+TEST_1 = `(ztst<<17) | 0x10000` (no off-by-one here), so `(x, 1)` is ZTST
+ALWAYS.
+
+### 1.3 One correction to the previous plan
+
+The plan wrote walk 0's bind as `0x22AB90(3, 1, **1**)`.  It is
+`0x22AB90(3, 1, **2**)`: `a2` is set in the branch **delay slot** at
+0x22EA48 (`li a2,2`), which runs for both arms.  Immaterial - 0x22A0C0(2,1)
+overrides TEST_1 either way - but the disassembly says 2.
+
+### 1.4 The two textures
+
+Both were confirmed from the ROM rather than inferred:
+
+- the TEXC slot descriptor table at `0x27F1C0` gives slot 0 and slot 3 as
+  `wexp = hexp = 6` (64x64), and the per-slot decoder table `0x2A4BA0`
+  sends **both** to `0x22A720` - the same grey expander slots 2 (TEXCBUMP)
+  and 5 (TEXCREFA) use.  So one decode serves all four.
+- extracted from `scph39001.bin`'s TEXIMAGE: `TEXCFLOW 4556 -> 4096`,
+  `TEXCBUMP 4452 -> 4096`, `TEXCBINV 4452 -> 4096`, and **`TEXCBINV` is the
+  exact bitwise complement of `TEXCBUMP`** - checked byte for byte over the
+  whole 4096-byte expansion, 0 mismatches.  `DecodeBump()` derives it as
+  `~src[i]` through the same expander, so no new resource file.
+
+`tools/extract-res.py` already extracts TEXCFLOW with everything else in
+TEXIMAGE; `res/` is gitignored, so regenerate with
+
+    python3 tools/extract-res.py <bios.bin> osdbits/res
+
+before building.  `res.c` gains the `#include` and the two assignments;
+`RESID_TEXCFLOW` and `RESID_TEXCBINV` were already in `res.h`.
+
+### 1.5 What it looks like
+
+Each walk re-renders every rod's NEAR faces into a freshly cleared work
+buffer 4 as a spherical environment map (the same `reflect()` 0x22CD78 the
+cube mask walk uses, but with AA1 **and** ABE clear - PRIM 276 - so it is a
+flat opaque write, alpha included) with a subtractive emboss over it, then
+adds the whole buffer over the finished frame at alpha 30.  The two walks
+differ only in which half of one emboss pair they use, so what survives the
+two additions is the *difference* between TEXCBUMP and its complement: a
+thin sparkle along the rods.  That is the glow retail's clock has.
+
+Because pass A has ABE clear, the alpha it writes into wb4 is the record's
+own `col1[3]`, and that alpha is exactly what the composite modulates by -
+which is why 0x2267E8's clear record carries **0x80** where the cube
+stage's 0x27F180 carries 0.  A 0 there would make the whole stage
+invisible.
+
+---
+
+## 2. Nit 1: the flat cube Z was a wrong GS REGISTER, not a missing mask
+
+The port emitted `0xFFFFF010` where retail carries `0x00FFF010`.  Nothing
+in the ROM masks: `sceVu0FTOI4` (0x267668) is a bare `vftoi4` and 0x22C4E0
+pushes the whole sign-extended word (22c82c `lw a0,56(s0)` / 22c838
+`dsll32`).  The difference is the register.
+
+Every one of the ROM's REGLIST templates names GIF register **4 = XYZF2**,
+not 5 = XYZ2:
+
+| template | NREG | regs |
+|---|---|---|
+| 0x27F870, 0x27F880 | 6 | PRIM, RGBAQ, XYZF2 x4 |
+| 0x27F890 | 12 | PRIM, CLAMP_1, CLAMP_1, RGBAQ, (UV, XYZF2) x4 |
+| 0x27F8A0 | 10 | PRIM, RGBAQ, (UV, XYZF2) x4 |
+| 0x27F8B0 | 14 | PRIM, CLAMP_1, (ST, RGBAQ, XYZF2) x4 |
+
+XYZF2's Z field is 24 bits wide where XYZ2's is 32, so the GS truncates
+`-4080` to `0x00FFF010 = 16773136` - exactly what the dump shows.  The
+dump's own event counts confirm the register: retail's mesh vertices are
+`RL XYZF2` (22984 of them in one frame), never `XYZ2`.
+
+Fixed by a shared `MeshEmitXYZ(f, k, zbias)` used by all five emits, which
+pushes `SCE_GS_XYZF2` with `z & 0xFFFFFF` and F = 0.  F is dead: none of
+the five PRIMs (276, 404, 84, 132, 196) sets FGE.  The rods are unaffected
+(their z is 1.8M..4.4M, well inside 24 bits); only the cube stage's flat
+`0xFFFFF010` / `0xFFFFF011` changes, to retail's `0x00FFF010` /
+`0x00FFF011`.  `vif1SetZWrite`'s PSMZ32 stays as it is - retail's 416 ZBUF
+writes are all `psm=0` - but its comment about PSMZ24 masking the port's
+0xFFFFF010 is now moot and has been rewritten.
+
+---
+
+## 3. Nit 2: the ZMSK audit
+
+Retail: **416 of 416** ZBUF writes in a config-screen dump are
+`zbp=4480 psm=0` with ZMSK clear.  Before this patch the port still masked
+Z in five places.  All five are now `vif1SetZWrite(1)`:
+
+| file | function | ZTST there | effect |
+|---|---|---|---|
+| `menuconfig.c` | `MeshDrawRod` | passes 2..5 run **GEQUAL** | the real one - the rods were testing against whatever the previous frame's cube stage left behind, and never storing |
+| `menu.c` | `DrawOrbPass` | ALWAYS | orbs now store z (trails real, sprites 0), which is what the interleaved rods then test against |
+| `menu.c` | `DrawFadeCurtain` | ALWAYS | none |
+| `menuback.c` | `ZoomBlur` | ALWAYS | none |
+| `menuback.c` | `MenuBackWorkBlur` | ALWAYS | none |
+| `menuback.c` | `MenuBackdrop`'s two screen copies | ALWAYS | none |
+
+Retail's own orb pattern in the dump is the same shape: `LINESTRIP+AA1`
+under `ztst=3` at real z, then the two `SPRITE+TME+ABE+FST` under `ztst=1`
+at **z = 0**, all with ZMSK clear (retail614.log D1461-D1463).  So retail
+really does stamp z = 0 through every orb halo, and its rods' GEQUAL passes
+run against that.
+
+`menutext.c` has no `vif1SetZWrite` call at all, so nothing to align there.
+
+---
+
+## 4. The diff
+
+`rodflush.diff`, `git apply` from the repo root.  Written against
+`9d1fd93`; checked to apply cleanly against `3ee8cae` (current tip) as
+well - `729d76a` touched `menuconfig.c` but not in any hunk this patch
+needs.
+
+    osdbits/inc.h           4 +-   MenuConfigFlushMesh, MenuBackFlushOver,
+                                   MenuBackWorkTarget's clear-record arg
+    osdbits/menu.c         ~70 +   SceneFlush (0x2267E8); the two ZMSK
+                                   alignments; MenuFrame calls SceneFlush
+                                   instead of the explicit screen restore
+    osdbits/menuback.c    ~130 +-  WorkClear takes a colour record AND
+                                   pushes its own ZTST (see 5.1); BlurBlit
+                                   takes an alpha; MenuBackFlushOver
+                                   (0x22C020(1,0,0) + 0x226768); three ZMSK
+    osdbits/menuconfig.c  ~190 +-  TEXCFLOW + TEXCBINV decode/bind;
+                                   MeshEmitXYZ (XYZF2); MeshEmitReflFace and
+                                   MeshReflPass gain `aa'; MenuConfigFlushMesh
+                                   (0x22E9A8); rod-path ZMSK; cubeMaskClear
+    osdbits/res.c           8 +    TEXCFLOW wired in
+
+`res/TEXCFLOW_EXP.inc` is NOT in the diff - `res/` is gitignored.  Run the
+extractor first (1.4).
+
+`MenuFrame`'s explicit `MenuBackScreenTarget(MenuBackField())` after
+`SceneWalk()` is gone: 0x2267E8's own `0x22C020(1,0,0)` does that job, as
+the previous write-up predicted.  One behavioural consequence, documented
+rather than papered over: 0x22C020's third argument is 0, so the stage
+leaves XYOFFSET without the interlace half pixel, and it is `ZoomBlur`'s
+tail (`BackHalfOffset(1)`) that puts it back.  With the default ramp
+(`argv[10]` = 10) that always runs.  If `argv[10]` is dropped below 5 the
+blur runs zero passes and the 2D layer draws without the half pixel - the
+ROM does not have that gap because its 2D layers push their own 0x22A3B8;
+`menutext.c` pushes no FRAME at all.
+
+---
+
+## 5. Verification
+
+Windowless PCSX2 on Xvnc `:96` (started and left running by this job, no
+`pcsx2-qt` left behind, `ulimit -c 0`, no cores, no PCSX2 setting touched).
+`DumpFrameAscii` 8x8 luminance maps extracted with `grep -o '|.*|'`.
+Baseline = an unmodified build of `9d1fd93` in `base/osdbits`.
+
+- **Main-menu regression** (`menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`):
+  the ASCII map is **byte-identical** to the baseline
+  (md5 `37786007ddc6534efaff9528f3ba8c11` both).  Expected, and it is a
+  real check of three separate things at once: the flush runs there too
+  (the record list is all orbs, which it skips, so what runs is the wb4
+  clear plus two additive composites of a black buffer - exactly as in the
+  ROM, and exactly as invisible); the ZMSK changes are colour-neutral where
+  every ZTST is ALWAYS; and XYZF2 is a no-op for z that already fits in 24
+  bits.
+
+- **Config screen** (`menu 18 27 45 0 1 128 145 0 0 0 10 0 1 0 1`, frame
+  145): see the map diff below.
+
+### The map results
+
+| build | config-screen map md5 | main-menu map md5 |
+|---|---|---|
+| baseline (`9d1fd93`) | `08a25058c842a3cfd14056d5977d6888` | `37786007ddc6534efaff9528f3ba8c11` |
+| flush + XYZF2 only (ZMSK reverted) | `ed3cc7d236adb9eb4688eb81b65f828e` | - |
+| full patch, before the WorkClear fix | `1df6bc1a659b1deb62daaae4d3908fa2` | `37786007ddc6534efaff9528f3ba8c11` |
+| **final** (full patch + WorkClear fix) | `1df6bc1a659b1deb62daaae4d3908fa2` | `37786007ddc6534efaff9528f3ba8c11` |
+
+Two things worth recording about the method:
+
+- **The config map is reproducible run to run.**  Two independent PCSX2
+  runs of the same build gave a byte-identical map, so `evenOddField`
+  (which `main.c` reads from the live GS CSR, and which therefore *could*
+  have varied with emulation speed) did not vary here, and every difference
+  below is a real consequence of the change rather than run noise.  Worth
+  re-checking if a future comparison ever looks noisy.
+- **The bisect earned its keep** and is what found the `WorkClear` bug
+  (section 5.1).  Without it the "flush + ZMSK" pair would have gone in as
+  one change that happened to work.
+
+### What changed on the config screen
+
+Everything above the clock ring is within a ramp step or two of the
+baseline; the clock region is unambiguously brighter, which is the bloom:
+
+    row 13  base `.-+#%%%####`   ->  `.-*#%%%%###`
+    row 21  base `.-----*+=:`    ->  `.----=##*:`
+    row 23  base `==--+*++=`     ->  `++=-*%##=`
+    row 24  base `-------@@=-+#+*+`  ->  `-------@@==*%%%*-`
+    row 25  base `:=-+#+**-`     ->  `:-=+%%%%=`
+
+The change is not confined to the rods' own pixels - the top and bottom
+chrome bars and the item rows move by a ramp step too.  That is expected
+rather than suspicious: `MenuZoomBlur` runs `ZoomBlur(5)` on **every**
+frame (the ramp idles at 10), five bilinear shrink/stretch round trips over
+the whole frame buffer, so any brightness the bloom adds is spread a long
+way before the 2D layer goes on top.  The bloom is added before the blur in
+the ROM too (0x2267E8 is the object list's tail, 0x2283D0's blur is the
+next stage).  Confirming that in detail is a job for the GS dump in
+section 6, where the stage is two unmistakable segments rather than an 8x8
+luminance map.
+
+## 5.1 A real bug the bisect found: WorkClear had no depth test
+
+The "flush + XYZF2 only" build above lifted **every** background block of
+the config screen by about two ramp steps - a second, ~23 % copy of the
+whole frame laid over the frame.  The cause was not the new stage's
+arithmetic but `menuback.c`'s `WorkClear`, which emitted its clear sprite
+under whatever TEST_1 was live.
+
+`sceGsSetDefDrawEnv2` does not: a retail dump shows it bracketing the clear
+sprite with its own pushes (retail614.log around D1759) -
+
+    TEST ZTE ztst=2      the drawenv's own
+    TEST ZTE ztst=1      the clear's - ALWAYS
+    PRIM SPRITE ... z=(0,0) rgba=00000080
+    TEST ZTE ztst=2      restored
+
+The clear sprite is at z = 0, so a caller arriving with ZTST GEQUAL and a
+non-zero Z buffer got **no clear at all**.  `0x226D00`'s call site happens
+to set ZTST ALWAYS just before, so the cube mask clear was always fine;
+`0x2267E8`'s follows `MeshDrawRod`'s pass 5, which leaves GEQUAL, so the
+rod bloom's clear was skipped and work buffer 4 still held
+`MenuBackdrop`'s copy of the whole screen.
+
+`WorkClear` now pushes ALWAYS before its sprite and GEQUAL after, as the
+library does.  With the ZMSK alignment also in place the map does not move
+(the two pre-scene screen copies now write z = 0 across the buffer, so the
+clear was passing anyway) - `1df6bc1a...` before and after the fix - but
+the stage no longer depends on that coincidence, and neither does anything
+else that ever clears a work buffer.
+
+
+---
+
+## 6. What aap should look for in the next shift+F8 snap
+
+Pixel-exact proof needs a fresh interactive GS dump, which the headless
+recipe cannot trigger.  In the next config-screen dump of this build,
+decoded with `tools/gsdump-decode.py` + `-drawlog.py`, the things to check
+against `retail614.log` / `retail614v.log`:
+
+1. **Two new 173-draw segments into FB = wb4**, between the last rod/orb
+   and the zoom blur, each `1 SPRITE + 86 TRISTRIP+TME+FST + 86
+   TRISTRIP+TME+ABE`.  Retail's are at retail614.log **L9632** and
+   **L10335**.  Our wb4 is at block 9600, not retail's 8960, so match on
+   the shape, not the fbp.
+   - the leading sprite must be full-screen `z=(0,0) rgba=00000080` (the
+     0x27EBF0 clear).  `rgba=00000000` would mean the wrong clear record.
+   - the 86 `+TME+FST` draws must carry `rgba=3c3c3c80` (the ring slots'
+     `col1`) under `TEST ZTE ztst=1` and `ALPHA 0101`, sampling our
+     TEXCFLOW page.  See the caveat in 7 about one rod.
+   - the 86 `+TME+ABE` draws must carry `rgba=28282880` under `ztst=1` and
+     `ALPHA 2001` (0x42, subtractive), sampling TEXCBINV in the first
+     segment and TEXCBUMP in the second - the segment-boundary caveat in
+     `gsdump-segsum.py`'s header applies, so read the verbose log for which
+     tbp actually feeds which draw.
+2. **The two composites**: right after each segment, one
+   `SPRITE+TME+ABE+FST` onto the screen buffer with
+   `uv=(0,0)-(640,224)` and **`rgba=8080801e`**, under `ALPHA 0201`
+   (0x48) and `ztst=1`, with `XYOFF (1728.0,1936.0)` - no half pixel.
+   Retail's are D1932 and D2106.  A different alpha there means
+   `MenuBackFlushOver`'s argument did not reach `BlurBlit`.
+3. **ZBUF**: every ZBUF write in the whole frame must now read
+   `zbp=4480 psm=0` with **no** `ZMSK` suffix, matching retail's 416/416.
+   `grep -o 'ZBUF.*' ours.log | sort | uniq -c` should show exactly one
+   line.
+4. **The cube stage's Z**: `z=(16773136,16773136)` on the cube draws and
+   `16773137` on the black mask pass, where the previous build reported
+   `4294963216` / `4294963217`.
+5. **The crack classifier** (the outstanding check from the previous
+   write-up) can be run on the same dump: replay through
+   `tools/gsreplay/` with `-s draw:<mask-walk-end>` and score wb4's alpha -
+   `interior` should read 0.
+
+---
+
+## 7. Left open
+
+- **The front rod's `col1`.**  Retail's live ring (savestate `.04.p2s`,
+  0x34E6C0 + slot*48 + 0x30) gives the front slot `{0x80,0x80,0x80,0x1E}`
+  and the other eleven `{0x3C,0x3C,0x3C,0x80}` - which is exactly what
+  `InitMenuConfig` sets up, and 0x225318's argument list (a3 = 0x27EAD0 for
+  the plain slots, t1 = 0x27EAF0 for the front) confirms the targets.  Yet
+  all **86** of retail's flush draws are `rgba=3c3c3c80`.  The reason is
+  that retail's front rod has a non-zero `split` and therefore goes through
+  0x22E428's *split* arm (0x22E4D0), which passes 0x22CD78 a stack-built
+  scene copy (22e6c8 `move a1,sp`) rather than the record's.  This port has
+  no split rod, so its front rod comes through the simple arm with its own
+  `col1` - it will bloom at RGB 0x80 and, because pass A writes alpha too,
+  composite at As ~ 7 instead of 30 over its own faces.  Porting the split
+  arm is the real fix; until then this is one rod out of twelve, and it is
+  the same divergence the visible rod path already has.
+- **The split rod (0x22E4D0) itself**, still not ported anywhere - see
+  `MeshDrawRod`'s notes.
+- **The cube mask walk's refraction ALPHA** (retail 0x44 vs our 0x48 for
+  0x22CD78 there) - untouched, still open from the previous pass.
+- **Pixel proof**, section 6.

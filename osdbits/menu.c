@@ -917,8 +917,14 @@ DrawOrbPass(Orb *o, float zscale, int baseAlpha, int *blurCol, int *coreCol)
 	/* real: 0x22A0C0(0, 3) - additive, depth GREATER.  osdbits draws
 	 * the whole scene with the depth test off (as opening.c's DrawLights
 	 * does); with nothing but additive primitives in the scene the
-	 * result is identical. */
-	vif1SetZWrite(0);
+	 * result is identical.
+	 *
+	 * ZMSK is 0 though: the ROM never masks Z anywhere in the menu (all
+	 * 416 ZBUF writes in a retail dump of this screen carry ZMSK clear),
+	 * and it matters here because 0x226700 interleaves the orbs with the
+	 * carousel rods, whose passes 2..5 run ZTST GEQUAL against whatever
+	 * the orbs left - their trails at real z, their two sprites at 0. */
+	vif1SetZWrite(1);
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 5, 128);
 	DrawOrbTrail(o, baseAlpha);
@@ -989,7 +995,7 @@ DrawOrb(Orb *o)
 	for(k = 0; k < 3; k++)
 		blurCol[k] = o->trail[o->head].col[k];
 	blurCol[3] = baseAlpha;
-	MenuBackWorkTarget(0, 0, MenuBackField());
+	MenuBackWorkTarget(0, nil, MenuBackField());
 	DrawOrbPass(o, zscale, baseAlpha, blurCol, orbCoreColorWork);
 }
 
@@ -1047,9 +1053,7 @@ DrawOrbRecord(SceneRec *rec)
 	DrawOrb(&orbs[i]);
 }
 
-/* real: 0x226700 - walk the sorted list.  0x2267E8's two-pass flush
- * (the mesh emitter plus the two full-screen composite quads) is
- * deferred with the backdrop mesh. */
+/* real: 0x226700 - walk the sorted list. */
 static void
 SceneWalk(void)
 {
@@ -1060,6 +1064,60 @@ SceneWalk(void)
 			DrawOrbRecord(rec);
 		else
 			MenuConfigDrawMesh(rec);	/* real: 0x2266E0 -> 0x22D920 */
+}
+
+/* real: 0x27EBF0, 0x2267E8's clear record - {0, 0, 0, **0x80**}, where the
+ * cube stage's 0x27F180 is {0,0,0,0}.  See MenuBackFlushOver for why the
+ * alpha has to be 0x80 here. */
+static const int flushClearColor[4] = { 0, 0, 0, 0x80 };
+
+/* real: 0x2267E8 - the deferred two-pass rod bloom, and the tail of the
+ * object-list stage: 0x2268F0 ends with `j 0x2267E8' immediately after the
+ * sorted walk 0x226700.
+ *
+ *     for walk in 0, 1:
+ *         0x22A4C8(1, 0x27EBF0, *(0x27B448))   FRAME wb4, CLEAR to
+ *                                              {0,0,0,0x80}, with field
+ *         for each record with type != 1:      meshes only, orbs skipped
+ *             0x22E428(rec+0x10, walk, f12 = rec->0xF4, rec+0x120)
+ *         0x22C020(1, 0, 0)                    TEX wb4, FRAME the screen,
+ *                                              NO half pixel
+ *         0x226768(30)                         full-screen additive
+ *                                              composite at alpha 30
+ *
+ * (The two halves are written out longhand in the ROM, not looped; the
+ * only difference between them is 0x22E428's second argument, 0 then 1.)
+ *
+ * Each walk re-renders every carousel rod's NEAR faces into a freshly
+ * cleared work buffer 4 as an environment map with a subtractive emboss
+ * over it, and adds the result over the finished frame at alpha 30.  The
+ * two walks use opposite halves of one emboss pair (TEXCBUMP and its exact
+ * bitwise complement TEXCBINV), so what survives the two additions is the
+ * DIFFERENCE - a thin sparkle along the rods, which is the glow retail's
+ * clock has and this port did not.  See MenuConfigFlushMesh.
+ *
+ * In a retail GS dump of the config screen the stage is two 173-draw
+ * segments into FB = 8960: 1 clear sprite + 86 TRISTRIP+TME+FST + 86
+ * TRISTRIP+TME+ABE each, 86 being the sum of the twelve rods' near-face
+ * counts, each followed by one full-screen SPRITE+TME+ABE+FST at
+ * rgba = 8080801e onto FB = 0.
+ *
+ * This is also what re-aims FRAME at the screen after 0x22D920's pass 5
+ * and 0x22EFF0's second walk have both left it on work buffer 3 - the job
+ * MenuFrame used to do with an explicit MenuBackScreenTarget(). */
+static void
+SceneFlush(void)
+{
+	SceneRec *rec;
+	int walk;
+
+	for(walk = 0; walk < 2; walk++) {
+		MenuBackWorkTarget(1, flushClearColor, MenuBackField());
+		for(rec = sceneHead.next; rec; rec = rec->next)
+			if(rec->type != 1)
+				MenuConfigFlushMesh(rec, walk);
+		MenuBackFlushOver(30);		/* real: 0x226768(30) */
+	}
 }
 
 /* ============================== init ============================== */
@@ -1158,7 +1216,7 @@ DrawFadeCurtain(void)
 
 	if(a <= 0)
 		return;
-	vif1SetZWrite(0);
+	vif1SetZWrite(1);		/* ZMSK 0 - see DrawOrbPass */
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);	/* (Cs-Cd)*As + Cd */
 	vif1Begin();
@@ -1223,14 +1281,12 @@ MenuFrame(void)
 		MenuConfigEmit();	/* real: 0x226028 */
 	UpdateOrbs();
 	SceneWalk();
-	/* real: 0x2267E8, the stage's own tail, pushes FRAME before its two
-	 * composite quads - which is what puts the target back on the screen
-	 * after 0x22D920's pass 5 and 0x22EFF0's second walk both leave it on
-	 * work buffer 3.  That flush is still deferred here (see SceneWalk),
-	 * so re-aim explicitly: ZoomBlur() would normally do it as a side
-	 * effect, but not when argv[10] drops the phase to 5 and it runs zero
-	 * passes, and menutext.c never pushes a FRAME of its own. */
-	MenuBackScreenTarget(MenuBackField());
+	/* real: 0x2267E8, the stage's own tail - the deferred rod bloom, whose
+	 * last act aims FRAME back at the screen.  On the main menu the record
+	 * list holds nothing but orbs, which it skips, so all that runs there
+	 * is the wb4 clear and two additive composites of a black buffer -
+	 * exactly as in the ROM, and exactly as invisible. */
+	SceneFlush();
 	/* real: 0x2283D0, the FIRST thing stage 5 (0x2283F0) does, before any
 	 * of the 2D layer: 0x22C3C0(phase - 5), which is 0x22C3C0(5) in the
 	 * idle menu.  Five bilinear shrink/stretch round trips over the whole

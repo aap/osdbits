@@ -6,6 +6,7 @@
 #include "res/TEXCMARU_EXP.inc"
 #include "res/TEXCBLUR_EXP.inc"
 #include "res/TEXCBUMP_EXP.inc"
+#include "res/TEXCFLOW_EXP.inc"
 #include "res/TEXCKABE_EXP.inc"
 #include "res/TEXCNAVI_EXP.inc"
 #include "res/TEXCREFA_EXP.inc"
@@ -186,6 +187,12 @@ LoadResources(void)
 	resources[RESID_TEXCKABE].size = TEXCKABE_EXP_len;
 	resources[RESID_TEXCBUMP].data = TEXCBUMP_EXP;
 	resources[RESID_TEXCBUMP].size = TEXCBUMP_EXP_len;
+	/* TEXC slot 0 - the deferred rod bloom's environment map
+	 * (menuconfig.c).  Its partner TEXCBINV (slot 3) is NOT a resource
+	 * here: the two blobs are exact bitwise complements of each other
+	 * (verified byte for byte over all 4096), so DecodeBump() derives it. */
+	resources[RESID_TEXCFLOW].data = TEXCFLOW_EXP;
+	resources[RESID_TEXCFLOW].size = TEXCFLOW_EXP_len;
 	/* the OSD text engine's Latin font page (menutext.c) */
 	resources[RESID_FNTASCII].data = FNTASCII_EXP;
 	resources[RESID_FNTASCII].size = FNTASCII_EXP_len;

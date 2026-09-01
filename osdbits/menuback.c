@@ -491,25 +491,60 @@ SetScreenTarget(void)
 }
 
 /* real: the clear half of 0x22A4C8, i.e. the six extra A+D pairs the
- * drawenv GIFtag's NLOOP 14 turns on.  0x226D00's one clearing call site
- * (0x22A4C8(1, 0x27F180, *(0x27B448)), between its two cube walks) passes
- * the record at 0x27F180, which is {0,0,0,0} - ALPHA ZERO, and that is
- * the point: work buffer 4 becomes the stage's ALPHA MASK, and the tail's
- * 0x22C088 then carries that alpha into work buffer 3 for the composite.
+ * drawenv GIFtag's NLOOP 14 turns on.  Its third argument is a RECORD -
+ * four ints that 0x22A64C..0x22A668 pack into the drawenv's RGBAQ (with Q
+ * forced to 1.0) - and the menu has two of them, which is why the colour
+ * is a parameter here:
+ *
+ *   0x27F180 = {0,0,0,**0**}     0x226D00's clear between the two cube
+ *                                walks - ALPHA ZERO, because work buffer 4
+ *                                becomes that stage's ALPHA MASK and the
+ *                                tail's 0x22C088 carries the alpha into
+ *                                work buffer 3 for the composite;
+ *   0x27EBF0 = {0,0,0,**0x80**}  0x2267E8's clear before each of the rod
+ *                                bloom's two walks - alpha 0x80, because
+ *                                there the alpha is what the additive
+ *                                composite MODULATES BY, and 0 would make
+ *                                the whole stage invisible.
+ *
  * osdbits' own vif1SetFramebuffer(clear = 1) cannot be used: it emits the
- * clear sprite in raw GS coordinates, ignoring XYOFFSET. */
+ * clear sprite in raw GS coordinates, ignoring XYOFFSET.
+ *
+ * THE DEPTH TEST IS PART OF THE CLEAR.  sceGsSetDefDrawEnv2 brackets the
+ * clear sprite with its own TEST_1 pushes, and a retail dump shows all
+ * three (retail614.log D1759 and its neighbours):
+ *
+ *     TEST ZTE ztst=2      the drawenv's own
+ *     TEST ZTE ztst=1      the clear's - ALWAYS
+ *     PRIM SPRITE ... z=(0,0) rgba=00000080
+ *     TEST ZTE ztst=2      restored
+ *
+ * The port left the live test in place, and the clear sprite is at z = 0,
+ * so any caller that reached here with ZTST GEQUAL and a non-zero Z buffer
+ * silently got NO CLEAR at all.  0x226D00's call site happens to set ZTST
+ * ALWAYS just before, so the cube mask clear was fine; 0x2267E8's is not
+ * so lucky - it follows MeshDrawRod's pass 5, which leaves GEQUAL - and
+ * with the rod bloom's clear skipped, work buffer 4 still held
+ * MenuBackdrop's copy of the whole screen and the stage's additive
+ * composite laid ~23 % of a second copy of the frame over the frame.  That
+ * was measured, not guessed: a build with this stage in but the ZMSK
+ * alignment out (so the pre-scene blits no longer reset Z to 0) lifted
+ * every background block of the config screen by two ramp steps. */
 static void
-WorkClear(void)
+WorkClear(const int *col)
 {
 	int ox = (2048-screenW/2)<<4;
 	int oy = (2048-screenH/2)<<4;
 
+	vif1SetZTest(0);		/* real: the clear's own ZTST ALWAYS */
 	vif1Begin();
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 0, 0, 0, 0, 0, 0, 0));
-	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0, 0, 0, 0, 0x3f800000));
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], col[3],
+		0x3f800000));
 	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox, oy, 0));
 	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox + (screenW<<4), oy + (screenH<<4), 0));
 	vif1End();
+	vif1SetZTest(1);		/* real: back to the drawenv's GEQUAL */
 }
 
 /* real: 0x2299C0 over the record at 0x27F820, {0x80,0x80,0x80,0x80},
@@ -518,9 +553,13 @@ WorkClear(void)
  * 319.25 x 149.25, not an integer rectangle, so the Rect/pktSetTexRect
  * path (whole pixels, and a 1/16 shrink on the far corner) cannot express
  * it.  0x2298A8 adds (2048 - w/2, 2048 - h/2) << 4 to both corners, the
- * same convention pktSetFlatRect uses. */
+ * same convention pktSetFlatRect uses.
+ *
+ * `alpha' is the record's fourth word.  Every sprite record in this chain
+ * carries 0x80 except 0x2267E8's (0x27EBB0), whose alpha 0x226768 PATCHES
+ * from its own argument (`sw a0,12(s0)') - see MenuBackFlushOver. */
 static void
-BlurBlit(u32 tbp, u32 psm, int abe, int x1, int y1, int u1, int v1)
+BlurBlit(u32 tbp, u32 psm, int abe, int alpha, int x1, int y1, int u1, int v1)
 {
 	int ox = (2048-screenW/2)<<4;
 	int oy = (2048-screenH/2)<<4;
@@ -541,7 +580,7 @@ BlurBlit(u32 tbp, u32 psm, int abe, int x1, int y1, int u1, int v1)
 	 * from the argument - 0 for 0x21D0A0's two screen copies, 1 for the
 	 * cube stage's composite back over the screen. */
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 1, 0, abe, 0, 1, 0, 0));
-	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0x80, 0x80, 0x80, 0x80, 0x3f800000));
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0x80, 0x80, 0x80, alpha, 0x3f800000));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(8, 8));
 	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(ox, oy, 0));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(u1, v1));
@@ -604,19 +643,24 @@ MenuBackBindScreen(void)
  *   0x22BFD0(1,0,1)  0x22D798 FRAME wb4   field      | 22d810: li a2,1
  *   0x22BFD0(0,1,0)  the tail FRAME wb3   NO field   | 226efc..226f04
  *   0x22C020(0,0,0)  the tail FRAME screen NO field  | 226f34..226f40
+ *   0x22A4C8(1,0x27EBF0,*(0x27B448))  0x2267E8's two wb4 clears, field
  *
  * i.e. exactly the rule 37efd18 established - a buffer-to-buffer resample
  * must not carry the display's per-field half pixel, and a mesh drawn for
  * the display must.  (This corrects the note eba5595 left here: 0x22D2E8's
  * FRAME push is 0x22BF58(1,0,**1**), not (1,0,0), so the cube MESHES do
- * carry the half pixel; only the three blits around them do not.) */
+ * carry the half pixel; only the three blits around them do not.)
+ *
+ * `clear' is 0x22A4C8's own third argument: nil for no clear (which in the
+ * ROM drops the drawenv GIFtag's NLOOP from 14 to 8), otherwise the RGBA
+ * record to clear to - see WorkClear. */
 void
-MenuBackWorkTarget(int buf, int clear, int field)
+MenuBackWorkTarget(int buf, const int *clear, int field)
 {
 	SetTarget(buf ? extraBuf2 : extraBuf1);
 	vif1SetXYOffset(backFrameField, field);
 	if(clear)
-		WorkClear();
+		WorkClear(clear);
 }
 
 void
@@ -648,7 +692,7 @@ MenuBackWorkAdd(void)
 {
 	vif1SetZTest(0);			/* real: 0x22A0C0(0,1)'s ZTST 1 */
 	vif1SetAlphaBlend(1, 5, 128);		/* real: ALPHA_1 0x48 */
-	BlurBlit(extraBuf2, SCE_GS_PSMCT32, 1,
+	BlurBlit(extraBuf2, SCE_GS_PSMCT32, 1, 0x80,
 		screenW<<4, screenH<<4, (screenW<<4)+8, (screenH<<4)+8);
 }
 
@@ -664,7 +708,7 @@ MenuBackWorkHalfAdd(void)
 {
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 5, 128);		/* real: 0x22A0C0(0,1), 0x48 */
-	BlurBlit(extraBuf1, SCE_GS_PSMCT32, 1,
+	BlurBlit(extraBuf1, SCE_GS_PSMCT32, 1, 0x80,
 		(screenW/2)<<4, screenH<<4, ((screenW/2)<<4)+8, (screenH<<4)+8);
 }
 
@@ -687,7 +731,37 @@ MenuBackWorkOver(int abe)
 {
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);		/* real: 0x22A0C0(1,1), 0x44 */
-	BlurBlit(extraBuf1, SCE_GS_PSMCT32, abe,
+	BlurBlit(extraBuf1, SCE_GS_PSMCT32, abe, 0x80,
+		screenW<<4, screenH<<4, (screenW<<4)+8, (screenH<<4)+8);
+}
+
+/* real: 0x22C020(1, 0, 0) then 0x226768(a) - the tail of each of the rod
+ * bloom's two walks (menu.c's SceneFlush).
+ *
+ * 0x226768 patches the static sprite record at 0x27EBB0 - whose fixed part
+ * is {0x80,0x80,0x80, A}, x0/y0 = 0, u0/v0 = 8, +0x34 = 1 (ABE) and +0x38 =
+ * 1 (TME) - with the screen extents ((w<<4, h<<4) and ((w<<4)+8,
+ * (h<<4)+8), the same half-texel pairing the rest of the chain uses) and,
+ * from its argument, the record's fourth word: the ALPHA.  Then it pushes
+ * 0x22A0C0(0, 1) = ALPHA_1 0x48 (Cs*As + Cd) with ZTST ALWAYS and draws it
+ * through 0x2299C0.
+ *
+ * So this is "add work buffer 4 over the screen at alpha `alpha'".  As is
+ * the texture's own alpha modulated by the sprite's, which is why the wb4
+ * clear that starts each walk must be {0,0,0,0x80} and not the cube
+ * stage's {0,0,0,0}: at 0x80 the whole buffer contributes, and the passes
+ * that write their own alpha into it (0x22CD78's PRIM 276 has ABE clear)
+ * scale their own contribution.
+ *
+ * In a retail dump: `SPRITE+TME+ABE+FST, FB = 0, uv (0.5,0.5)-(640.5,224.5),
+ * rgba = 8080801e' - 0x1E = the 30 that 0x2267E8 passes, twice a frame. */
+void
+MenuBackFlushOver(int alpha)
+{
+	MenuBackScreenTarget(0);		/* real: 0x22C020(1, 0, 0) */
+	vif1SetZTest(0);			/* real: 0x22A0C0(0, 1) ZTST 1 */
+	vif1SetAlphaBlend(1, 5, 128);		/* real: ALPHA_1 0x48 */
+	BlurBlit(extraBuf2, SCE_GS_PSMCT32, 1, alpha,
 		screenW<<4, screenH<<4, (screenW<<4)+8, (screenH<<4)+8);
 }
 
@@ -712,21 +786,25 @@ MenuBackWorkBlur(int n)
 	if(n <= 0)
 		return;
 
-	vif1SetZWrite(0);
+	/* ZMSK 0, as everywhere else in the menu (416/416 retail ZBUF writes
+	 * are `zbp=4480 psm=0' with ZMSK clear).  Harmless either way here -
+	 * ZTST is ALWAYS on both blits - but a retail dump has these passes
+	 * stamping the resampled sprite's z = 0 over the buffer, so match it. */
+	vif1SetZWrite(1);
 	vif1SetZTest(0);
 	x = 5108;
 	y = 2388;
 	for(; n > 0; n--) {
 		/* real: 0x22BFD0(1,0,0) - FRAME wb4, TEX wb3, no half pixel */
-		MenuBackWorkTarget(1, 0, 0);
+		MenuBackWorkTarget(1, nil, 0);
 		vif1SetAlphaBlend(1, 4, 128);	/* real: 0x22A0C0(1,1) */
-		BlurBlit(extraBuf1, SCE_GS_PSMCT32, 0,
+		BlurBlit(extraBuf1, SCE_GS_PSMCT32, 0, 0x80,
 			x, y, (screenW<<4)+8, ((screenH-1)<<4)+8);
 
 		/* real: 0x22BFD0(0,1,0) - FRAME wb3, TEX wb4 */
-		MenuBackWorkTarget(0, 0, 0);
+		MenuBackWorkTarget(0, nil, 0);
 		vif1SetAlphaBlend(1, 4, 128);
-		BlurBlit(extraBuf2, SCE_GS_PSMCT32, 0,
+		BlurBlit(extraBuf2, SCE_GS_PSMCT32, 0, 0x80,
 			screenW<<4, (screenH-1)<<4, x+8, y+8);
 
 		x -= 32;
@@ -753,7 +831,7 @@ ZoomBlur(int n)
 	if(n <= 0)
 		return;
 
-	vif1SetZWrite(0);
+	vif1SetZWrite(1);			/* ZMSK 0 - see MenuBackWorkBlur */
 	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) - ZTST ALWAYS */
 	BackHalfOffset(0);			/* real: 0x22BF58/0x22C020 pass field = 0 */
 	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 = 0x44, unused (ABE 0) */
@@ -763,13 +841,13 @@ ZoomBlur(int n)
 		/* real: 0x22BF58(1,0,0) - TEX = the screen (PSMCT24, the psm
 		 * 0x22A198 passes), FRAME = work buffer 4 */
 		SetTarget(extraBuf2);
-		BlurBlit(backScreenTbp, SCE_GS_PSMCT24, 0,
+		BlurBlit(backScreenTbp, SCE_GS_PSMCT24, 0, 0x80,
 			x, y, (screenW<<4)+8, ((screenH-1)<<4)+8);
 
 		/* real: 0x22C020(1,0,0) - TEX = work buffer 4 (PSMCT32, the psm
 		 * 0x22A290 passes), FRAME = the screen */
 		SetScreenTarget();
-		BlurBlit(extraBuf2, SCE_GS_PSMCT32, 0,
+		BlurBlit(extraBuf2, SCE_GS_PSMCT32, 0, 0x80,
 			screenW<<4, (screenH-1)<<4, x+8, y+8);
 
 		x -= 32;
@@ -906,7 +984,7 @@ MenuBackdrop(sceVu0FMATRIX cam, sceVu0FMATRIX vs, int fadeMode)
 
 	/* the two copies.  Both read the screen; the second buffer only
 	 * matters to the zoom blur and to 0x2267E8's carousel bloom. */
-	vif1SetZWrite(0);
+	vif1SetZWrite(1);	/* ZMSK 0 - see MenuBackWorkBlur */
 	vif1SetZTest(0);
 	BackHalfOffset(0);	/* real: 0x22A4C8(...,field=0), as the blur */
 	SetTarget(extraBuf1);
