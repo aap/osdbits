@@ -3557,3 +3557,207 @@ extracted with `grep -o '|.*|'`):
   there under `ALPHA_1 0x44`; we use `0x48`.  It does not affect the mask (the
   black pass overwrites it) but it does affect the colour the reflection
   contributes, so it is worth aligning.
+
+
+---
+
+# The System Configuration clock's entry/exit animation
+
+Symptom (aap): in the port the twelve-rod clock carousel visibly **grows in**
+on entry and **shrinks out** on exit; on retail it just fades in.
+
+Result: root-caused to a single mis-identified gp-relative global, fixed with a
+21-line behavioural change in `osdbits/menuconfig.c` (`clockanim.diff`).
+Everything below is from the ROM disassembly plus live retail memory; nothing
+is guessed.
+
+## 1. The rod scale really is the carousel's progress (not the bug)
+
+Confirmed independently of the parent session's trace:
+
+* `0x226028` (the ring emitter) loads `ring[slot].progress` from `+0x10` and
+  stores it into the scene struct's `+0x6C` — `0x2260b4: lwc1 $f0,16(s1)` /
+  `0x2260bc: swc1 $f0,108(s4)`, `s4 = 0x27E950`.
+* `0x22D920` (the rod draw) reloads `+0x6C` at `0x22d974` (the `< 0` skip) and
+  at `0x22da6c`/`0x22daa8` (the split arm's two halves get `progress*split` and
+  `progress*(1-split)`), and `0x22CFA8` consumes it as the Y scale.
+* `0x225BF8` (stage 10) recomputes it every frame:
+  `progress = cfgInterp(carouselTimer, 128) * 0x3C000000f` (= `*1/128`) —
+  `0x225c9c: jal 0x22AC20` with `a1 = 128`, `0x225cb4: mul.s $f0,$f0,$f20`.
+
+So the ramp exists in retail too and must **not** be removed. What differs is
+how long it lasts.
+
+## 2. Root cause: `gp-30380` is NOT `dur80`
+
+The port's `InitMenuConfig` had
+
+```c
+cfgDur80 = rate*80/60;                  /* real: *(gp-30380) */
+carouselTimer.duration = cfgDur80;      /* real: *(gp-30372), 0x225998 */
+```
+
+Both mappings are wrong. `gp = 0x2AF070`, so the four words in play are
+`0x2A79B0` (gp-30400), `0x2A79B4` (gp-30396), `0x2A79C4` (gp-30380),
+`0x2A79C8` (gp-30376) and `0x2A79CC` (gp-30372). Two *different* initialisers
+write them, and `0x21CE58` (the module init) calls them in this order:
+
+| addr | writes | value |
+|---|---|---|
+| `0x22AD7C` (in `0x22AD38`) | `gp-30380` | `rate*40/60` — a **second** forty-frame leg |
+| `0x22ADA4` (in `0x22AD38`) | `gp-30372` | `li v0,1` — the literal **1** |
+| `0x22ADC4` (in `0x22AD38`) | `gp-30376` | `rate*80/60` — the only real "dur80"; it is `0x27F620`'s duration, which no config-screen timer uses |
+| `0x22850C` (in `0x228460`) | `gp-30400` | `rate*40/60` (dur40) |
+| `0x228568` (in `0x228460`) | `gp-30396` | `rate/6` (dur10) |
+
+`0x225998` then does `0x2259B4: sw v1,-5376(v0)` with `v0 = 0x280000` and
+`v1 = *(gp-30372)`, i.e. **`0x27EB00.duration = 1`**. With a duration of 1 the
+timer's very first step (`0x22ACC0`) takes `count` straight from 0 to 1 = the
+duration, so `progress` goes 0 → 1.0 in a **single frame**. Retail's rods are
+at full height the first time the emitter's `progress > 0.05` gate
+(`0x226914`, `*(gp-32148)`) lets them through: the growth is real but it is
+never on screen for more than one frame.
+
+The port had given that timer 80 frames, which is the 80-frame grow-in aap saw.
+
+### Live retail confirmation
+
+`eeMemory.bin` from `20020207-164243 (00000000).04.p2s` and `.05.p2s`
+(both retail BIOS, NTSC, sitting on the config screen), read at the exact
+addresses above:
+
+```
+gp-30400 dur40 @0x2A79B0 = 40      anim   0x27BE44 = [90, 90, 0, 2]
+gp-30396 dur10 @0x2A79B4 = 10      carous 0x27EB00 = [ 1,  1, 0, 2]
+gp-30380       @0x2A79C4 = 40      cube   0x27EC00 = [40, 40, 0, 2]
+gp-30376       @0x2A79C8 = 80      backfd 0x27F190 = [40, 40, 0, 2]
+gp-30372       @0x2A79CC = 1       (struct = duration,count,edge,state)
+```
+
+The Anim's duration is **90** (`= 40+40+10`, `0x227290`), not the port's 130,
+and the carousel's is **1**. `menuback.c` already had `gp-30380` right
+(`bgTimer.duration = 40`); only `menuconfig.c` was wrong.
+
+## 3. The exit: `0x225B68`, and the state machine's staggered close
+
+`0x225B68` is the carousel timer's only closer. Besides `0x22AC90` it walks the
+ring and writes `0` into every slot's `+0x10` by hand (`0x225be0: sw zero,16(v0)`)
+— retail deliberately snaps the rods away instead of letting them ramp down.
+
+It is called from exactly one place: `0x22749C`, the **last** edge of
+`0x227390`'s closing arm. The whole machine (run from `0x227DE8` immediately
+after the Anim's own step, `0x227DF4` → `0x227DFC`):
+
+```
+opening (state 1)  count == *(gp-30380) (40)      -> 0x226B28  open cube timer
+closing (state 3)  duration-count == dur10 (10)   -> 0x226B70  close cube timer
+closing            count == gp-30380+dur40 (80)   -> 0x22AE80  reopen 0x27F620 (not ported)
+closing      else  count == *(gp-30380) (40)      -> 0x229230  close backdrop fade
+closing      else  count == *(gp-30372) (1)       -> 0x225B68  close carousel
+```
+
+(the last three are a real `else if` chain in the ROM, and are gated on
+`0x223790`'s timer — `0x27C258`, the module-level screen state — being idle;
+the port has no such timer so that gate is dropped.)
+
+So on the way out retail keeps the clock at full height for **89 of the 90**
+exit frames and then drops it in one. The port instead closed the carousel,
+the cube timer and the backdrop fade all at once from `MenuLeaveConfig`, which
+with an 80-frame carousel duration produced the 80-frame shrink-out.
+
+## 4. What changed (`clockanim.diff`, `osdbits/menuconfig.c` only)
+
+1. `cfgDur80` → `cfgDur40b = rate*40/60` (= `*(gp-30380)`), and a new
+   `cfgCarouselDur = 1` (= `*(gp-30372)`). This fixes `carouselTimer.duration`
+   (the actual bug), `cfgAnim.duration` (130 → 90) and `MenuConfigAlpha`'s
+   threshold (`count-120` → `count-80`, i.e. the config item list's fade-up is
+   the last dur10 frames of a 90-frame Anim, as in retail).
+2. New `CarouselClose()` = `0x225B68`.
+3. New `MenuConfigStateMachine()` = `0x227390`, called from `MenuConfigStep()`
+   right after the Anim's step, exactly as `0x227DE8` does. This removes the
+   previously-documented cube-timer divergence for free (the cubes now start
+   growing at Anim count 40 rather than at frame 0).
+4. `MenuEnterConfig` no longer opens the cube timer; `MenuLeaveConfig` is now
+   just `cfgClose(&cfgAnim)` (retail's `0x227C20` TRIANGLE arm) — everything
+   else closes on its own edge.
+
+Ordering is preserved: `MenuConfigStep()` (state machine) runs before
+`MenuConfigCarousel()` (stage 10) in `MenuFrame()`, the same as
+`0x2283F0`'s sixth slot running before `0x225BF8`.
+
+## 5. Evidence
+
+`menuconfig.c`'s existing `MeshDebug()` prints one line per drawn mesh on the
+frame given by `argv[6]`, including the Y scale it was handed — so the entry
+envelope can be read straight out of the log. Entry argv
+`menu 18 27 45 0 1 128 N 0 0 0 10 0 1 0 1` (config entered at frame 1):
+
+| dump frame N | pristine rods | pristine cubes | fixed rods | fixed cubes |
+|---|---|---|---|---|
+| 2  | *(none — under the 0.05 gate)* | 5 @ 0.05 | **12 @ 1.00** | none |
+| 3  | none | 5 @ 0.08 | 12 @ 1.00 | none |
+| 5  | none | 5 @ 0.12 | 12 @ 1.00 | none |
+| 10 | 12 @ **0.11** | 5 @ 0.25 | 12 @ 1.00 | none |
+| 20 | 12 @ **0.23** | 5 @ 0.50 | 12 @ 1.00 | none |
+| 40 | 12 @ **0.48** | 5 @ 1.00 | 12 @ 1.00 | none |
+| 41 | 12 @ 0.50 | 5 @ 1.00 | 12 @ 1.00 | **5 @ 0.03** |
+| 60 | 12 @ **0.73** | 5 @ 1.00 | 12 @ 1.00 | 5 @ 0.50 |
+| 90 | 12 @ 1.00 | 5 @ 1.00 | 12 @ 1.00 | 5 @ 1.00 |
+
+The fixed build's rods are at 1.00 on the first frame they exist and never
+move; the cubes now hold off until Anim count 40 and reach full size at
+count 80, i.e. the retail staging.
+
+Exit. Fixed build, leave at frame 100 (`argv[13]=100`, Anim in state 2 by then):
+
+| N | 105 | 110 | 150 | 185 | 188 | 189 | 190 |
+|---|---|---|---|---|---|---|---|
+| rods  | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | gone | gone |
+| cubes | 1.00 | 0.98 | gone | gone | gone | gone | gone |
+
+(cube timer closes 10 frames into the close, backdrop fade at count 40 = frame
+150, carousel at count 1 = frame 188 → rods gone on 189.)
+
+Pristine build for the same shape — it needs `leave 140` because its Anim is
+130 frames long, so a leave at 100 is silently ignored (`state != 2`), which is
+itself a symptom of the wrong duration:
+
+| N | 145 | 160 | 180 | 200 | 218 |
+|---|---|---|---|---|---|
+| rods | **0.94** | **0.75** | **0.50** | **0.25** | gone |
+
+That is the shrink-out aap reported, measured.
+
+ASCII maps confirm it visually too (`grep -o '|.*|'`): at N=10 the pristine
+build shows the five bright cube blobs on the left and almost nothing in the
+ring, the fixed build shows no cubes and a full-height rod column through the
+middle rows.
+
+### Regression
+
+Main menu, `menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`, pristine vs fixed:
+the 28-line ASCII frame map is **byte-identical**, and every `osdsys:`/`mesh `
+program line is identical. (The only log differences are environmental — ELF
+size/CRC, mmap addresses, host path, and the pad handshake's `state 5`/`state 7`
+ordering, which is a wall-clock artefact of the IOP RPC and is unrelated.)
+This is expected: `cfgAnim` is in state 0 on the main menu, so
+`MenuConfigAlpha` returns 0 either way and the state machine returns
+immediately.
+
+## 6. Two things worth recording
+
+* **Retail has no alpha envelope on the rods.** `0x22C4E0` writes the RGBAQ
+  alpha as a hard-coded `0x80` (`t2 = 0x8000 << 16`, `0x22c6a8: or v0,v0,t2`);
+  the RGB is `ring[slot].col0` (scene `+0x80`) plus a Fresnel rim term
+  `trunc(scene->+0x90 * 10 * (1-|dot|)^4)` plus the pass's `extra` (0 or 255).
+  Nothing there is enveloped by the entry. So the "fade" aap sees is not the
+  rods' own alpha — it is the glass being nearly invisible until the backdrop
+  behind it brightens: `MenuBackFadeOpen` (`0x2291E8`) starts `0x27F190`, whose
+  40-frame ramp feeds `bgFade0/1/2` (gp-28840/-28836/-28832) into every
+  TEXCKABE vertex colour, and the rods refract that live picture. No extra
+  mechanism is needed or was added.
+* **`0x22AE80`/`0x22AEC8` (`0x27F620`, duration 80 = gp-30376) are still not
+  ported.** The entry closes that timer and the state machine reopens it at
+  Anim count 80 on the way out. It is the main-menu screen's own timer; nothing
+  in the port reads it, so the corresponding arm of the state machine is an
+  empty statement with the ROM address in a comment.

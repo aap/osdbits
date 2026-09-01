@@ -90,10 +90,28 @@ cfgStep(CfgTimer *t)		/* real: 0x22ACC0 */
 	}
 }
 
-/* real: 0x228460's three durations, all derived from the refresh rate.
- * dur40 (gp-30400) = rate*40/60, dur10 (gp-30396) = rate/6, and dur80
- * (gp-30380) is the long leg the config Anim's first phase uses. */
-static int cfgDur40, cfgDur10, cfgDur80;
+/* The per-screen durations, all derived from the refresh rate.  Two
+ * separate initialisers write them: 0x228460 does dur40 (gp-30400) =
+ * rate*40/60 and dur10 (gp-30396) = rate/6, and 0x22AD38 - which
+ * 0x21CE58 calls BEFORE both 0x225998 and 0x228460 - does three more:
+ *
+ *   gp-30380 = rate*40/60   (0x22AD7C)  a SECOND forty-frame leg
+ *   gp-30376 = rate*80/60   (0x22ADC4)  eighty frames, and 0x27F620's
+ *                                       duration - no config timer uses it
+ *   gp-30372 = 1            (0x22ADA4)  a literal one, the carousel's
+ *
+ * so the config Anim's first phase is forty frames, not eighty, and the
+ * carousel's whole ramp is ONE frame long.  Confirmed against live
+ * retail memory (savestate eeMemory.bin, NTSC): gp-30400/-30396/-30380/
+ * -30376/-30372 = 40/10/40/80/1, Anim 0x27BE44 duration 90 = 40+40+10,
+ * cube timer 0x27EC00 duration 40, backdrop fade 0x27F190 duration 40,
+ * carousel 0x27EB00 duration 1.  An earlier pass here read gp-30380 as
+ * "dur80" and gave the carousel that value, which is what made the rods
+ * grow in over 80 frames instead of snapping to full size in one - see
+ * MenuConfigCarousel/CarouselOpen. */
+static int cfgDur40, cfgDur10;
+static int cfgDur40b;		/* real: *(gp-30380), 0x22AD7C */
+static int cfgCarouselDur;	/* real: *(gp-30372), 0x22ADA4 */
 
 static CfgTimer cfgAnim;	/* real: 0x27BE44, the screen's own Anim */
 static CfgTimer cfgCubeTimer;	/* real: 0x27EC00 */
@@ -1226,7 +1244,15 @@ MenuConfigCarousel(void)
 
 /* real: 0x225AD0 - the ONE opener of 0x27EB00, called only from
  * 0x2272C0 inside "enter System Configuration".  It resets the timer,
- * opens it and clears every slot's progress. */
+ * opens it and clears every slot's progress.
+ *
+ * Its duration is 1 (see cfgCarouselDur), so the very next step takes
+ * the count straight to the duration: progress goes 0 -> 1 in a single
+ * frame and the rods are at full height the first time the emitter's
+ * 0.05 gate lets them through.  The ramp is real - 0x226028 still feeds
+ * it to the scene's +0x6C and 0x22D920 still uses that as the rods' Y
+ * scale - it just never spans more than one frame, which is why retail
+ * shows no growth. */
 static void
 CarouselOpen(void)
 {
@@ -1237,6 +1263,22 @@ CarouselOpen(void)
 	carouselTimer.count = 0;
 	carouselTimer.edge = 0;
 	cfgOpen(&carouselTimer);
+	for(i = 0; i < NRING; i++)
+		ring[i].progress = 0.0f;
+}
+
+/* real: 0x225B68 - the ONE closer of 0x27EB00, called only from
+ * 0x22749C, the last edge of the state machine's closing arm.  Like the
+ * opener it zeroes every slot's progress by hand, so the rods are gone
+ * on the same frame rather than shrinking back down. */
+static void
+CarouselClose(void)
+{
+	int i;
+
+	if(!cfgIsState(&carouselTimer, 2))
+		return;
+	cfgClose(&carouselTimer);
 	for(i = 0; i < NRING; i++)
 		ring[i].progress = 0.0f;
 }
@@ -1486,7 +1528,7 @@ MenuConfigAlpha(int fadeAlpha)
 {
 	int v;
 
-	v = cfgCount(&cfgAnim) - (cfgDur80 + cfgDur40);
+	v = cfgCount(&cfgAnim) - (cfgDur40b + cfgDur40);
 	if(v < 0)
 		v = 0;
 	else if(v > cfgDur10)
@@ -1499,41 +1541,74 @@ MenuConfigAlpha(int fadeAlpha)
  * tail message 0x2287A8(20992, 1, 4) is the UI click.
  *
  * Everything the screen shows is switched on here: the Anim's duration
- * is recomputed from the three per-screen durations, 0x22AEC8 closes the
- * screen at 0x27F620, 0x2291E8 opens the backdrop's fade timer and
- * 0x225AD0 opens the carousel.  The cube timer is NOT opened here - the
- * state machine 0x227390 does that when the Anim's count reaches dur80
- * - but the port opens it from the same place for lack of the count
- * hook (documented divergence; the visible effect is the cubes growing
- * from frame 0 of the entry instead of frame dur80). */
+ * is recomputed from the three per-screen durations (0x227290: gp-30380
+ * + gp-30400 + gp-30396 = 40+40+10 = 90 on NTSC), 0x22AEC8 closes the
+ * screen at 0x27F620 (not ported), 0x2291E8 opens the backdrop's fade
+ * timer and 0x225AD0 opens the carousel.  The cube timer is NOT opened
+ * here - the state machine 0x227390 does that when the Anim's count
+ * reaches gp-30380, and MenuConfigStateMachine now models that edge. */
 void
 MenuEnterConfig(void)
 {
 	if(!cfgIsState(&cfgAnim, 0))
 		return;
-	cfgAnim.duration = cfgDur80 + cfgDur40 + cfgDur10;
+	cfgAnim.duration = cfgDur40b + cfgDur40 + cfgDur10;
 	cfgOpen(&cfgAnim);
 	MenuBackFadeOpen();		/* real: 0x2291E8 */
 	CarouselOpen();			/* real: 0x225AD0 */
-	cfgOpen(&cfgCubeTimer);		/* real: 0x226B28, from 0x2273D0 */
 	OSDDispatch(20992, 1, 4, 0);	/* real: the 0x2287A8 tail */
 	printf("osdsys: enter System Configuration\n");
 }
 
-/* real: the closing arm of 0x227390 - as the Anim counts back down it
- * closes the cube timer at dur10 from the end (0x226B70), the backdrop
- * fade at dur80 (0x229230) and the carousel at *(gp-30372) (0x225B68).
- * The port fires all three at once, which is the same end state. */
+/* real: 0x227C20's TRIANGLE arm - "leave System Configuration" only
+ * closes the Anim.  Every other timer is closed by the state machine
+ * below, on its own edge of the Anim's countdown. */
 void
 MenuLeaveConfig(void)
 {
 	if(!cfgIsState(&cfgAnim, 2))
 		return;
 	cfgClose(&cfgAnim);
-	cfgClose(&cfgCubeTimer);
-	cfgClose(&carouselTimer);
-	MenuBackFadeClose();
 	printf("osdsys: leave System Configuration\n");
+}
+
+/* real: 0x227390 - the state machine proper, run right after the Anim's
+ * own step in 0x227DE8.  Every other timer's edge is keyed on the
+ * Anim's count here, and that phasing is the whole entry/exit
+ * choreography:
+ *
+ *   opening  count == gp-30380 (40)          open the cube timer (0x226B28)
+ *   closing  duration-count == dur10 (10)    close the cube timer (0x226B70)
+ *   closing  count == gp-30380+dur40 (80)    reopen 0x27F620 (0x22AE80, n/p)
+ *   closing  count == gp-30380 (40)          close the backdrop fade (0x229230)
+ *   closing  count == gp-30372 (1)           close the carousel (0x225B68)
+ *
+ * so on the way out the clock stays lit at full height for 89 of the 90
+ * frames and then goes in one - it never shrinks.  The three closing
+ * arms are mutually exclusive `else if's in the ROM and are gated on
+ * 0x223790's timer (0x27C258, the module-level screen state) being
+ * idle; the port has no such timer, so the gate is dropped. */
+static void
+MenuConfigStateMachine(void)
+{
+	int count;
+
+	count = cfgCount(&cfgAnim);
+	if(cfgIsState(&cfgAnim, 1)) {		/* real: 0x2273AC */
+		if(count == cfgDur40b)
+			cfgOpen(&cfgCubeTimer);	/* real: 0x2273D0 */
+		return;
+	}
+	if(!cfgIsState(&cfgAnim, 3))		/* real: 0x2273E0 */
+		return;
+	if(cfgAnim.duration - count == cfgDur10)
+		cfgClose(&cfgCubeTimer);	/* real: 0x227414 */
+	if(count == cfgDur40b + cfgDur40)
+		;				/* real: 0x227454, 0x22AE80 */
+	else if(count == cfgDur40b)
+		MenuBackFadeClose();		/* real: 0x227478, 0x229230 */
+	else if(count == cfgCarouselDur)
+		CarouselClose();		/* real: 0x22749C, 0x225B68 */
 }
 
 /* real: 0x227DE8 - the screen's per-frame slot in the hub 0x2283F0:
@@ -1542,27 +1617,29 @@ MenuLeaveConfig(void)
 void
 MenuConfigStep(void)
 {
-	cfgStep(&cfgAnim);
+	cfgStep(&cfgAnim);		/* real: 0x227DF4 */
+	MenuConfigStateMachine();	/* real: 0x227DFC */
 }
 
 /* real: 0x21CE58's share - the ring is rebuilt by 0x225998 and the
- * durations come from 0x228460. */
+ * durations come from 0x22AD38 and 0x228460, in that order. */
 void
 InitMenuConfig(void)
 {
 	int rate, i, k;
 
 	rate = IsPAL() ? 50 : 60;
-	cfgDur40 = rate*40/60;
-	cfgDur10 = rate/6;
-	cfgDur80 = rate*80/60;		/* real: *(gp-30380) */
+	cfgDur40 = rate*40/60;		/* real: *(gp-30400), 0x22850C */
+	cfgDur10 = rate/6;		/* real: *(gp-30396), 0x228568 */
+	cfgDur40b = rate*40/60;		/* real: *(gp-30380), 0x22AD7C */
+	cfgCarouselDur = 1;		/* real: *(gp-30372), 0x22ADA4 */
 
 	memset(&cfgAnim, 0, sizeof(cfgAnim));
 	memset(&carouselTimer, 0, sizeof(carouselTimer));
 	memset(&cfgCubeTimer, 0, sizeof(cfgCubeTimer));
-	cfgAnim.duration = cfgDur80 + cfgDur40 + cfgDur10;
-	carouselTimer.duration = cfgDur80;	/* real: *(gp-30372), 0x225998 */
-	cfgCubeTimer.duration = cfgDur40;	/* real: 0x228460 */
+	cfgAnim.duration = cfgDur40b + cfgDur40 + cfgDur10;
+	carouselTimer.duration = cfgCarouselDur;	/* real: 0x2259B4 */
+	cfgCubeTimer.duration = cfgDur40;	/* real: 0x228534 */
 
 	rodModel.nfaces = menuRodFaces;
 	rodModel.verts = menuRodVerts;
