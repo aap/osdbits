@@ -1082,13 +1082,22 @@ MeshDrawCubeMask(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 	vif1SetZTest(0);
 	vif1SetAlphaBlend(1, 4, 128);		/* real: 0x22A0C0(1,1) */
 
-	/* real: 0x22AB90(5,0,1) - TEXCREFA, ALPHA_1 0x48, ZTST ALWAYS - then
-	 * the 0x22CD78 loop.  It paints the cubes' only COLOUR into work
-	 * buffer 4; the black pass below adds none (see MeshEmitReflFace). */
+	/* real: 0x22AB90(5,0,1) - TEXCREFA, ALPHA_1 **0x44**, ZTST ALWAYS -
+	 * then the 0x22CD78 loop.  It paints the cubes' only COLOUR into work
+	 * buffer 4; the black pass below adds none (see MeshEmitReflFace).
+	 *
+	 * The 0x44 matters: an earlier read of 0x22AA88 concluded 0x48
+	 * (additive), but the retail GS dumps show ALPHA 0101 = 0x44 (source
+	 * blend) on every REFA strip, in both this walk and the visible one.
+	 * The difference is exactly the bright seams: AA1's antialiased edge
+	 * pixels overlap the neighbouring triangle's interior, so an ADDITIVE
+	 * pass applies twice along every shared edge and tristrip diagonal
+	 * (double the env-map sample = a bright line), while a BLEND applied
+	 * twice just converges on the same colour. */
 	if(cfgMeshTex) {
 		MenuConfigBindRefa();
 		vif1SetZTest(0);
-		vif1SetAlphaBlend(1, 5, 128);	/* real: 0x22AA88's a1 = 0, 0x48 */
+		vif1SetAlphaBlend(1, 4, 128);	/* real: ALPHA_1 0x44 */
 		MeshReflPass(mdl, cubeReflColor, 1);
 	}
 
