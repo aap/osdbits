@@ -1,0 +1,13 @@
+# matrixDrive.c - the shared matrix-stack service.  name va size (hex).
+# Bounds from osdsys_dump.idb; PushMatrix/PopMatrix are IDA-missed, their
+# bounds come from the jr-ra/endEA scan in inventory.py.
+MatrixDrive_InitSinTable	0x22ff70 0xa8
+MatrixDrive_Sin			0x230018 0x4c
+MatrixDrive_Cos			0x230068 0x28
+MatrixDrive_Init		0x230090 0x24
+MatrixDrive_PushMatrix		0x2300b8 0x80
+MatrixDrive_PopMatrix		0x230138 0x44
+MatrixDrive_GetMatrix		0x230180 0x18
+MatrixDrive_RotX		0x230198 0xc8
+MatrixDrive_TranslateV		0x2303e8 0x54
+MatrixDrive_Translate		0x230440 0x34
