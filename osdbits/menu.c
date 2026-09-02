@@ -911,7 +911,20 @@ static void
 DrawOrbSprite(Orb *o, float half, int *col)
 {
 	float *p = o->trail[o->head].pos;
-	int x0, y0, x1, y1;
+	int x0, y0, x1, y1, a;
+
+	/* real: 0x22EFF0 overwrites the colour qword's fourth word with
+	 * TimerInterp(orbTrailTimer, alpha) before EVERY sprite draw (the
+	 * halo at 22f54c/22f550/22f558, the core at 22f678/22f67c/22f684) -
+	 * so both sprites fade with the same trail timer the linestrip does.
+	 * The Clock Adjustment editor closes that timer (0x22EF90 in
+	 * ClockEditOpen), and THAT is what makes the orbs vanish as their
+	 * radius sinks to the centre; the port had scaled only the trail and
+	 * walk-2's halo, leaving the walk-1 halo and both cores at full
+	 * alpha, so they stayed visible in the middle while the clock was
+	 * edited.  With the timer fully open (steady state, and by frame ~37
+	 * on entry) TimerInterp returns the alpha unchanged. */
+	a = TimerInterp(&orbTrailTimer, col[3]);
 
 	x0 = (int)((p[0] - half + 2048.0f)*16.0f);
 	y0 = (int)((p[1] - half*0.5f + 2048.0f)*16.0f);
@@ -920,7 +933,7 @@ DrawOrbSprite(Orb *o, float half, int *col)
 
 	vif1Begin();
 	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_SPRITE, 0, 1, 0, 1, 0, 1, 0, 0));
-	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], col[3], 0x3f800000));
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(col[0], col[1], col[2], a, 0x3f800000));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(ORBUV0, ORBUV0));
 	pktSetAD(SCE_GS_XYZ2, SCE_GS_SET_XYZ(x0, y0, 0));
 	pktSetAD(SCE_GS_UV, SCE_GS_SET_UV(ORBUV1, ORBUV1));
@@ -1081,7 +1094,11 @@ DrawOrb(Orb *o)
 	 * screen walk carries - this is a mesh-style draw, not a blit). */
 	for(k = 0; k < 3; k++)
 		blurCol[k] = o->trail[o->head].col[k];
-	blurCol[3] = baseAlpha;
+	/* real 22f788: `li v1,128; sw v1,60(sp)' resets the halo alpha to 128
+	 * before DrawOrbSprite's TimerInterp scales it - which yields exactly
+	 * baseAlpha, so this is unchanged from the old direct `= baseAlpha'
+	 * (0x80 == 128), it just stops the scale being applied twice. */
+	blurCol[3] = 128;
 	MenuBackWorkTarget(0, nil, MenuBackField());
 	DrawOrbPass(o, zscale, baseAlpha, blurCol, orbCoreColorWork);
 }

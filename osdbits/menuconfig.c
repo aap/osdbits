@@ -1691,36 +1691,51 @@ CarouselClock(void)
 	ringSplitMax = 1.0f - MenuClockMinutes()*(1.0f/60.0f);
 }
 
-/* real: 0x225318 - the per-frame colour spreader.  Every frame it
- * repaints the whole ring from the current ringOffset: the eleven plain
- * slots get the body/edge pair (0x27EAC0 / 0x27EAD0) and the front slot
- * (i == ringOffset) gets the bright front blend and col1 (0x27EAF0).
- * InitMenuConfig only seeded the INITIAL front slot, so once an hour step
- * moved ringOffset the old rod kept its bright colour while the new rod
- * got only the split - two highlighted rods.  (The keyframe cyclers
- * 0x225528 / 0x2255A8 that animate the four vectors over 8 entries are
- * not ported; the idle values are spread directly.)  The tail eases the
- * record colours ringColA -> cfgColFixed and ringColB -> cfgColRingA,
- * which InitMenuConfig already parks on their targets, so idle it is a
- * no-op. */
+/* real: 0x22EC60's mode-1 arm - step each of the four colour components
+ * of dst ONE unit toward src (no overshoot: it stops at equality).  It
+ * is the per-frame colour ease 0x225318 drives the ring with; returns
+ * nonzero once converged (0x225318 ignores the result). */
+static int
+ColorApproach(int *dst, const int *src)
+{
+	int k, moved = 0;
+
+	for(k = 0; k < 4; k++) {
+		if(dst[k] < src[k]) { dst[k]++; moved = 1; }
+		else if(dst[k] > src[k]) { dst[k]--; moved = 1; }
+	}
+	return !moved;
+}
+
+/* real: 0x225318 - the per-frame colour spreader.  Every frame it EASES
+ * the whole ring toward the current ringOffset (via 0x22EC60, ColorApproach
+ * above, one unit per component per frame): the eleven plain slots ease to
+ * the body/edge pair (0x27EAC0 / 0x27EAD0), the front slot (i == ringOffset)
+ * to the bright front blend and col1 (0x27EAF0).  Because it is an ease and
+ * not a set, moving the hour crossfades the highlight - the new front rod
+ * brightens over ~1s while the old one dims back to body - which is what the
+ * hard per-frame assignment here used to skip (the highlight snapped).
+ * InitMenuConfig still seeds the initial front slot so the screen opens with
+ * it lit rather than fading in.  (The keyframe cyclers 0x225528 / 0x2255A8
+ * that animate the four target vectors over 8 entries are not ported; the
+ * idle values are the ease targets.)  The tail eases the record colours
+ * ringColA -> cfgColFixed and ringColB -> cfgColRingA, which InitMenuConfig
+ * already parks on their targets, so idle it is a no-op. */
 static void
 CarouselColors(void)
 {
-	int i, k;
+	int i;
 
 	for(i = 0; i < NRING; i++)
-		for(k = 0; k < 4; k++)
-			if(i == ringOffset) {
-				ring[i].col0[k] = cfgColFront[k];
-				ring[i].col1[k] = cfgColRingB[k];
-			} else {
-				ring[i].col0[k] = cfgColBody[k];
-				ring[i].col1[k] = cfgColEdge[k];
-			}
-	for(k = 0; k < 4; k++) {
-		ringColA[k] = cfgColFixed[k];
-		ringColB[k] = cfgColRingA[k];
-	}
+		if(i == ringOffset) {
+			ColorApproach(ring[i].col0, cfgColFront);
+			ColorApproach(ring[i].col1, cfgColRingB);
+		} else {
+			ColorApproach(ring[i].col0, cfgColBody);
+			ColorApproach(ring[i].col1, cfgColEdge);
+		}
+	ColorApproach(ringColA, cfgColFixed);
+	ColorApproach(ringColB, cfgColRingA);
 }
 
 /* real: 0x225BF8 - stage 10 of the frame body.  Steps the carousel
