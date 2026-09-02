@@ -3379,6 +3379,21 @@ ParseArgs(void)
 	 * the wrong argBase.  Default 0 keeps those pre-args prints (and a
 	 * normal boot) silent. */
 	osdTrace = OsdArgInt(6, 0);
+
+	/* NOT original: the real main() derives the boot-sound state
+	 * (osdBootSound, *(0x1f05e8)) from the boot params via the table at
+	 * 0x207b18 before the opening runs.  osdbits has no loader handing it
+	 * those params, so the scene chosen on the command line picks the
+	 * sound instead: the illegal-disc screen wants the SNDWARNS drone (4),
+	 * a bare jump straight to the menu has no opening so it wants silence
+	 * (0), and a normal boot - or the frozen idle opening - wants the
+	 * SNDBOOTS chime (1).  BootSoundStart (which runs before Init) reads
+	 * this, so ParseArgs is now called before it. */
+	switch(openingMode) {
+	case MODE_ILLEGAL:	osdBootSound = 4; break;	/* SNDWARNS drone */
+	case MODE_MENU:		osdBootSound = 0; break;	/* no opening chime */
+	default:		osdBootSound = 1; break;	/* SNDBOOTS chime */
+	}
 }
 
 /* the numeric-argument accessors, for modes that parse their own args
@@ -4245,7 +4260,8 @@ initTextShit(void)
 static void
 Init(void)
 {
-	ParseArgs();
+	/* ParseArgs now runs in OpeningThread, before BootSoundStart, so the
+	 * scene can pick the boot sound; openingMode is already set by here. */
 	/* the real fooOpeningType comes from systemState (0x1f05e8) == 4 =
 	 * illegal disc, set at 0x211f90 */
 	fooOpeningType = openingMode == MODE_ILLEGAL ? 1 : 0;
@@ -4305,6 +4321,11 @@ BootSoundStart(void)
 static void
 OpeningThread(void *arg)
 {
+	/* NOT original: parse the args before the chime - ParseArgs derives
+	 * osdBootSound from the scene, and BootSoundStart reads it.  (The real
+	 * osdBootSound is set by main() from the boot params, long before the
+	 * opening thread; osdbits learns the scene from argv here instead.) */
+	ParseArgs();
 	BootSoundStart();	/* real: 0x211d50, before the opening init */
 	Init();
 	// ...
