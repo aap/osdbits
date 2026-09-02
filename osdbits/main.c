@@ -36,6 +36,11 @@ int bootLatch = 0;
 int osdBootParam = 100;
 int osdBootParamC = 0;
 int osdBootParam2 = 0;
+/* real: *(0x1f05e8), the boot-sound state main() derives from the boot
+ * params (0x207b18..0x207e08) - that per-param derivation is not ported;
+ * it defaults to the normal fresh-boot value 1, which BootSoundStart
+ * (opening.c) turns into the SNDBOOTS chime.  4 would be the warning. */
+int osdBootSound = 1;
 int HasDisc(void) { return discReady != 0; }
 int GetDiscType(void) { return discType; }
 int BootLatchClear(void) { return bootLatch == 0; }

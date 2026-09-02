@@ -4280,9 +4280,26 @@ Init(void)
 	frameCount = evenOddFrame;
 }
 
+/* real: 0x211fd8, called from OpeningThread's own init at 0x211d50
+ * (right after 0x211f90 arms the derived flags).  It starts the boot
+ * chime: osdBootSound (real *(0x1f05e8), set by main from the boot
+ * params) == 1 plays record 0 = SNDBOOTS, == 4 plays record 6 =
+ * SNDWARNS, anything else is silence (e.g. returning from a game).  The
+ * opening's own OSDDispatch(20501,0,0,15/17) then FADES this record out
+ * later - which is why the port used to fade a sound it never started. */
+static void
+BootSoundStart(void)
+{
+	if(osdBootSound == 1)
+		OSDDispatch(20500, 0, 0, 0);	/* StBgmPlay record 0 = SNDBOOTS */
+	else if(osdBootSound == 4)
+		OSDDispatch(20500, 6, 0, 0);	/* record 6 = SNDWARNS */
+}
+
 static void
 OpeningThread(void *arg)
 {
+	BootSoundStart();	/* real: 0x211d50, before the opening init */
 	Init();
 	// ...
 	if(openingMode == MODE_MENU)

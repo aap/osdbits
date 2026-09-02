@@ -93,6 +93,7 @@ extern int bootLatch;
 extern int osdBootParam;
 extern int osdBootParamC;
 extern int osdBootParam2;
+extern int osdBootSound;
 int HasDisc(void);
 int GetDiscType(void);
 int BootLatchClear(void);
