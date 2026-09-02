@@ -27,8 +27,9 @@ int GetLanguage(void) { return 1; } // english
  *   osdBootParamC = *(0x1f000c), osdBootParam2 = *(0x1f0cf8) (the
  *   latter only checked for boot param 114).
  * - OSDDispatch (real 0x200b80) / OSDDispatch2 (real 0x261738):
- *   message dispatch to the OSD proper ("opening done, boot X" -
- *   messages 20500/20501). */
+ *   these turned out to be the SOUND path - the messages are RPC
+ *   commands for rom0:OSDSND (20500 = StBgmPlay etc.) - and are now
+ *   real, in sound.c. */
 int discReady = 0;
 int discType = 0;
 int bootLatch = 0;
@@ -38,10 +39,6 @@ int osdBootParam2 = 0;
 int HasDisc(void) { return discReady != 0; }
 int GetDiscType(void) { return discType; }
 int BootLatchClear(void) { return bootLatch == 0; }
-void OSDDispatch(int msg, int a, int b, int c)
-{ printf("osd: dispatch(%d, %d, %d, %d)\n", msg, a, b, c); }
-void OSDDispatch2(int x, int msg, int a, int b, int c)
-{ printf("osd: dispatch2(%d, %d, %d, %d, %d)\n", x, msg, a, b, c); }
 
 sceGsDBuff db;
 int evenOddFrame;
@@ -126,6 +123,9 @@ vblankHandler(int id)
 			iSignalSema(swapSema);
 	}
 
+	SoundVblank();	/* real: the drain runs off a periodic thread
+			 * (0x206e00); here the vblank wakes it */
+
 	// TODO: wakeup a thread?
 
 	ExitHandler();
@@ -187,6 +187,11 @@ main(int argc, char *argv[])
 	 * layer and waits on the IOP's loadfile server, and nothing that
 	 * runs after this point should be doing that mid-frame */
 	InitPad();
+
+	/* the real main inits sound early too (0x207774), well before the
+	 * opening runs - the boot jingle message (20500) must find the
+	 * banks already on the SPU */
+	SoundInit();
 
 	MakeOpeningThread();	// this is not quite accurate
 

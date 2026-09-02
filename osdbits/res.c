@@ -3,6 +3,18 @@
 
 #include "res/FNTASCII_EXP.inc"
 #include "res/FNTEXOSD_EXP.inc"
+#include "res/SNDBOOTH_EXP.inc"
+#include "res/SNDBOOTB_EXP.inc"
+#include "res/SNDBOOTS_EXP.inc"
+#include "res/SNDTNNLS_EXP.inc"
+#include "res/SNDCLOKS_EXP.inc"
+#include "res/SNDTM30S_EXP.inc"
+#include "res/SNDTM60S_EXP.inc"
+#include "res/SNDOSDDH_EXP.inc"
+#include "res/SNDOSDDB_EXP.inc"
+#include "res/SNDLOGOS_EXP.inc"
+#include "res/SNDWARNS_EXP.inc"
+#include "res/SNDRCLKS_EXP.inc"
 #include "res/TEXCMARU_EXP.inc"
 #include "res/TEXCBLUR_EXP.inc"
 #include "res/TEXCBUMP_EXP.inc"
@@ -206,6 +218,34 @@ LoadResources(void)
 	/* the cubes' spherical environment map (menuconfig.c) */
 	resources[RESID_TEXCREFA].data = TEXCREFA_EXP;
 	resources[RESID_TEXCREFA].size = TEXCREFA_EXP_len;
+
+	/* the sound banks and sequences (sound.c): two VAB pairs -
+	 * header ("SShd") + body (SPU2 ADPCM) - and eight "SSsq"
+	 * sequences, all opaque to the EE, parsed by rom0:OSDSND */
+	resources[RESID_SNDBOOTH].data = SNDBOOTH_EXP;
+	resources[RESID_SNDBOOTH].size = SNDBOOTH_EXP_len;
+	resources[RESID_SNDBOOTB].data = SNDBOOTB_EXP;
+	resources[RESID_SNDBOOTB].size = SNDBOOTB_EXP_len;
+	resources[RESID_SNDBOOTS].data = SNDBOOTS_EXP;
+	resources[RESID_SNDBOOTS].size = SNDBOOTS_EXP_len;
+	resources[RESID_SNDTNNLS].data = SNDTNNLS_EXP;
+	resources[RESID_SNDTNNLS].size = SNDTNNLS_EXP_len;
+	resources[RESID_SNDCLOKS].data = SNDCLOKS_EXP;
+	resources[RESID_SNDCLOKS].size = SNDCLOKS_EXP_len;
+	resources[RESID_SNDTM30S].data = SNDTM30S_EXP;
+	resources[RESID_SNDTM30S].size = SNDTM30S_EXP_len;
+	resources[RESID_SNDTM60S].data = SNDTM60S_EXP;
+	resources[RESID_SNDTM60S].size = SNDTM60S_EXP_len;
+	resources[RESID_SNDOSDDH].data = SNDOSDDH_EXP;
+	resources[RESID_SNDOSDDH].size = SNDOSDDH_EXP_len;
+	resources[RESID_SNDOSDDB].data = SNDOSDDB_EXP;
+	resources[RESID_SNDOSDDB].size = SNDOSDDB_EXP_len;
+	resources[RESID_SNDLOGOS].data = SNDLOGOS_EXP;
+	resources[RESID_SNDLOGOS].size = SNDLOGOS_EXP_len;
+	resources[RESID_SNDWARNS].data = SNDWARNS_EXP;
+	resources[RESID_SNDWARNS].size = SNDWARNS_EXP_len;
+	resources[RESID_SNDRCLKS].data = SNDRCLKS_EXP;
+	resources[RESID_SNDRCLKS].size = SNDRCLKS_EXP_len;
 }
 
 u8*

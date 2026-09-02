@@ -47,7 +47,7 @@ static sceSifClientData loadfileCd __attribute__((aligned(64)));
 static unsigned char loadfileBuf[512] __attribute__((aligned(64)));
 static int boundLoadfile;
 
-static void
+void
 rpcDelay(int n)
 {
 	volatile int i;
@@ -55,8 +55,10 @@ rpcDelay(int n)
 	for(i = 0; i < n; i++);
 }
 
-/* the module id (>= 0), or a status word - see LoadPadModules */
-static int
+/* the module id (>= 0), or a status word - see LoadPadModules.
+ * Shared with sound.c, which pulls rom0:OSDSND through the same
+ * server. */
+int
 romLoadModule(const char *module)
 {
 	if(!boundLoadfile) {
@@ -93,8 +95,8 @@ romLoadModule(const char *module)
  * negative is reported and treated as "the module is there" rather than
  * bailing out - the pad library's own answer (scePadInit /
  * scePadPortOpen) is the real proof, and that is what InitPad returns. */
-static int
-loadFatal(int r)
+int
+romLoadFatal(int r)
 {
 	return r == -1 || r == -2 ||		/* our own RPC failures */
 	       r == -200 || r == -201 || r == -202 ||
@@ -110,14 +112,14 @@ LoadPadModules(void)
 	 * XSIO2MAN provides */
 	r = romLoadModule("rom0:XSIO2MAN");
 	printf("pad: rom0:XSIO2MAN -> %d\n", r);
-	if(loadFatal(r))
+	if(romLoadFatal(r))
 		return 0;
 	if(r < 0)
 		printf("pad: XSIO2MAN status not a known error, assuming resident\n");
 
 	r = romLoadModule("rom0:XPADMAN");
 	printf("pad: rom0:XPADMAN -> %d\n", r);
-	if(loadFatal(r))
+	if(romLoadFatal(r))
 		return 0;
 	if(r < 0)
 		printf("pad: XPADMAN status not a known error, assuming resident\n");

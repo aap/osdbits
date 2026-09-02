@@ -21,6 +21,7 @@ OBJS        = crt0.o \
               menutext.o \
               menuconfig.o \
               pad.o \
+              sound.o \
               towerchain.o \
               $(TARGET).o
 

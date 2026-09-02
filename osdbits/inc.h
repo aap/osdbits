@@ -296,5 +296,17 @@ extern Pad pad;			/* the pad in port 0 */
 int InitPad(void);		/* brings up the SIF RPC layer too */
 void UpdatePad(void);		/* once per frame */
 
+/* pad.c's rom0: module loader, shared with sound.c */
+int romLoadModule(const char *module);
+int romLoadFatal(int r);
+void rpcDelay(int n);
+
+/* ---- sound.c: the OSDSND (rspu2drv) RPC path ---- */
+int SoundInit(void);		/* after InitPad: loads rom0:OSDSND,
+				 * uploads the SND* banks, starts the
+				 * dispatch-drain thread */
+void SoundVblank(void);		/* from the vblank handler: wake the
+				 * drain thread */
+
 /* ---- menu.c: what the menu's confirm button ends up calling ---- */
 void MenuSelectItem(int n);
