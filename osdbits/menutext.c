@@ -40,9 +40,10 @@
  *
  * What is NOT: the two-byte (Shift-JIS) path and its VRAM glyph cache
  * (0x208460's kinds 1 and 3, 0x208C60's 72-slot LRU), the 0x07 escapes
- * other than \7oNNN and \7rN.NN, the config items' value sub-screens
- * (each item's +0x14 and +0x1C callbacks), the right-edge strip
- * (0x21DB18), and every other screen.
+ * other than \7oNNN and \7rN.NN, the right-edge strip (0x21DB18), and
+ * every other screen.  (The config items' value editors - the +0x14 /
+ * +0x1C / +0x20 / +0x24 callbacks - ARE ported now; see "the item value
+ * editors" below.  The RTC write and the NVRAM save are printf stubs.)
  *
  * Extra argv (menu mode), continuing menu.c's list:
  *     main.elf menu hh mm ss framelimit fromOpening fadeAlpha
@@ -749,12 +750,21 @@ static const ConfigValue cfgDigitalOut[2] =	/* real: 0x27BCB0 */
 	{ { 0, 112 }, { 1, 113 } };
 static const ConfigValue cfgComponent[2] =	/* real: 0x27BBC0 */
 	{ { 1, 116 }, { 0, 115 } };
+/* real: 0x27B920 (and its twin 0x27BA70) - the language list 0x21ED18,
+ * called from the per-screen init 0x228460 (0x2284D4), wires into
+ * items[4].+0x04/+0x10 by region: region 0 gets 0x27B8C0 ({Japanese,
+ * English}, count 2), regions 1 and 2 the seven European languages.
+ * osdbits' region proxy is textRegionSwap (1 = the retail screenshots'
+ * arrangement), so the seven-entry table is the one it wires. */
+static const ConfigValue cfgLanguage[7] =
+	{ { 1, 119 }, { 2, 120 }, { 3, 121 }, { 4, 122 },
+	  { 5, 123 }, { 6, 124 }, { 7, 125 } };
 
 /* real: the 56-byte item records at 0x27BD10 + n*56, with the fields the
  * draw path touches.  The six callbacks live at +0x14..+0x28; `draw' is
- * +0x18.  0x21EDB8, which every widget runs first, re-syncs +0x08 from
- * the live setting *(int*)0x22B0E8(+0x0C) - the port has no settings, so
- * +0x08 keeps the .data value (0 for all five). */
+ * +0x18 and `edit' - the mode-1 widget, drawing AND its own pad input,
+ * exactly as in the ROM - is +0x1C.  0x21EDB8, which every widget runs
+ * first, re-syncs +0x08 from the live setting *(int*)0x22B0E8(+0x0C). */
 typedef struct ConfigItem ConfigItem;
 struct ConfigItem
 {
@@ -764,18 +774,38 @@ struct ConfigItem
 	int setting;			/* real +0x0C */
 	const ConfigValue *values;	/* real +0x10 */
 	void (*draw)(struct ConfigItem*, int, int, int);	/* real +0x18 */
+	void (*edit)(struct ConfigItem*, int, int, int);	/* real +0x1C */
 };
 
 static void DrawItemValue(ConfigItem*, int, int, int);	/* real: 0x21EE78 */
 static void DrawItemClock(ConfigItem*, int, int, int);	/* real: 0x21E350 */
+static void EditItemClock(ConfigItem*, int, int, int);	/* real: 0x21EA20 */
+static void EditItemValue(ConfigItem*, int, int, int);	/* real: 0x21F080 */
+static void EditItemLang(ConfigItem*, int, int, int);	/* real: 0x21F168 */
 
 static ConfigItem configItems[5] = {
-	{ 106, 6, 0, 0, nil,           DrawItemClock },
-	{ 107, 3, 0, 0, cfgScreenSize, DrawItemValue },
-	{ 111, 2, 0, 1, cfgDigitalOut, DrawItemValue },
-	{ 114, 2, 0, 2, cfgComponent,  DrawItemValue },
-	{ 117, 0, 0, 3, nil,           DrawItemValue },
+	{ 106, 6, 0, 0, nil,           DrawItemClock, EditItemClock },
+	{ 107, 3, 0, 0, cfgScreenSize, DrawItemValue, EditItemValue },
+	{ 111, 2, 0, 1, cfgDigitalOut, DrawItemValue, EditItemValue },
+	{ 114, 2, 0, 2, cfgComponent,  DrawItemValue, EditItemValue },
+	/* real: nvalues 0 / values nil in .data; 0x21ED18 wires the region's
+	 * language table in - InitMenuText models it below */
+	{ 117, 0, 0, 3, nil,           DrawItemValue, EditItemLang },
 };
+
+/* ============== the live settings block (0x352880) ==============
+ *
+ * real: 0x22B0E8(n) returns &block[n].  The screen uses indices 0
+ * (screen size), 1 (digital out), 2 (component out), 3 (language) and
+ * 6..11 (the Clock Adjustment editor's Y/M/D/h/m/s fields).  The mode-1
+ * widgets write it LIVE while scrolling - the ROM previews a setting the
+ * moment it is highlighted - and the items' +0x20 confirm callbacks then
+ * compare it against the persisted copy (0x203690/0x203658/0x2036F8/
+ * 0x2040D0) and call 0x22B3F8 to push a changed value out to the
+ * console's NVRAM.  osdbits has no NVRAM, so the persisted copy is a
+ * plain array and 0x22B3F8 is a printf. */
+static int cfgSettings[16];
+static int cfgPersisted[4];
 
 /* real: 0x27BE28 */
 static struct
@@ -830,8 +860,9 @@ static const struct { const char *s; int draw; } cfgClockSep[6] = {
 
 /* NOT original: the ROM's clock fields come from *(int*)0x22B0E8(6..8),
  * the RTC snapshot; osdbits has hh:mm:ss from argv and no date at all,
- * so the date reads as the PS2's own epoch. */
-static const int cfgClockDate[3] = { 2000, 1, 1 };
+ * so the date starts at the PS2's own epoch.  The Clock Adjustment
+ * editor writes an applied date back here (the ROM's sticks in the RTC). */
+static int cfgClockDate[3] = { 2000, 1, 1 };
 
 /* real: the ROM sprintfs each field with "%04d" (year), "%2d" (hour) or
  * "%02d" (the rest) - 0x2A7858 / 0x2A7868 / 0x2A7860. */
@@ -870,41 +901,344 @@ cfgFmtNum(char *p, int v, int width, int zero)
  * \7p@0 / \7p00 (fixed-width on the width of '0'), which is a no-op for
  * the Latin face - '0'..'9' are all {5, 23} in the 0x26FE60 metrics. */
 static void
-DrawItemClock(ConfigItem *it, int x, int y, int alpha)
+DrawClockRow(ConfigItem *it, int x, int y, int alpha, int edit)
 {
 	char buf[16];
-	int i;
+	const int *col, *sepcol;
+	int i, v;
 
 	x -= osdTextWidth("0000/00/00 00:00:00")/2;
+	/* real: edit == 0 draws every field in 0x27B850; edit == 1 (the
+	 * 0x21E3B0 entry) picks the field under item->0x08 out in 0x27B830
+	 * and the rest in 0x27B840 */
+	sepcol = edit ? colUnselected : colDim;
 	for(i = 0; i < it->nvalues; i++) {
-		switch(cfgClockField[i][0]) {
-		case 6:  cfgFmtNum(buf, cfgClockDate[0], 4, 1); break;
-		case 7:  cfgFmtNum(buf, cfgClockDate[1], 2, 1); break;
-		case 8:  cfgFmtNum(buf, cfgClockDate[2], 2, 1); break;
-		case 9:  cfgFmtNum(buf, (int)MenuClockHours(), 2, 0); break;
-		case 10: cfgFmtNum(buf, (int)MenuClockMinutes(), 2, 1); break;
-		default: cfgFmtNum(buf, (int)MenuClockSeconds(), 2, 1); break;
+		/* real: 0x21DFF8 always reads the six settings 0x22B0E8(6..11);
+		 * 0x21DDC0 keeps them synced to the live clock while the editor
+		 * is closed.  The port reads the live clock directly then. */
+		if(edit)
+			v = cfgSettings[cfgClockField[i][0]];
+		else switch(cfgClockField[i][0]) {
+		case 6:  v = cfgClockDate[0]; break;
+		case 7:  v = cfgClockDate[1]; break;
+		case 8:  v = cfgClockDate[2]; break;
+		case 9:  v = (int)MenuClockHours(); break;
+		case 10: v = (int)MenuClockMinutes(); break;
+		default: v = (int)MenuClockSeconds(); break;
 		}
-		drawTextL(x, y, colDim, alpha, buf);
+		switch(cfgClockField[i][0]) {
+		case 6:  cfgFmtNum(buf, v, 4, 1); break;
+		case 9:  cfgFmtNum(buf, v, 2, 0); break;
+		default: cfgFmtNum(buf, v, 2, 1); break;
+		}
+		col = edit ? (i == it->value ? colSelected : colUnselected) :
+			colDim;
+		drawTextL(x, y, col, alpha, buf);
 		x += osdTextWidth(buf);
 		if(cfgClockSep[i].s == nil)
 			continue;
 		if(cfgClockSep[i].draw)
-			drawTextL(x, y, colDim, alpha, cfgClockSep[i].s);
+			drawTextL(x, y, sepcol, alpha, cfgClockSep[i].s);
 		x += osdTextWidth(cfgClockSep[i].s);
 	}
 }
 
+static void
+DrawItemClock(ConfigItem *it, int x, int y, int alpha)
+{
+	DrawClockRow(it, x, y, alpha, 0);
+}
+
 /* real: 0x21EE78 - 0x21EDB8, then the item's current value's string,
- * centred, in 0x27B850.  Language's list pointer is 0 in .data and
- * nothing in Module U fills it in (0x21F168, its +0x1C widget, reads the
- * same pointer), so the port draws no value row for it. */
+ * centred, in 0x27B850.  (Language's list pointer is 0 in .data; the
+ * per-screen init wires the region's table in - see cfgLanguage.) */
 static void
 DrawItemValue(ConfigItem *it, int x, int y, int alpha)
 {
 	if(it->values == nil || (u32)it->value >= (u32)it->nvalues)
 		return;
 	drawTextC(x, y, colDim, alpha, osdGetString(it->values[it->value].strid));
+}
+
+/* ================ the item value editors (mode 1) ================
+ *
+ * Entering an item (0x2279B8's confirm arm) calls its +0x14 and flips
+ * the header's mode to 1; the item's +0x1C widget then owns the value
+ * row - it both DRAWS the expanded value list and reads the pad for
+ * left/right itself (the ROM's widgets poll gp-30316 directly), and it
+ * writes the live setting on every change, so a setting is previewed
+ * the moment it is highlighted.  0x227BE8 keeps only confirm (run the
+ * item's +0x20, back to mode 0) and cancel (+0x24, back to mode 0).
+ *
+ * Each widget's input is gated on the 0x27EC40 timer being idle in the
+ * ROM; nothing in the port ever opens it, so the gate is dropped. */
+
+static void HintSetCustom(int, int, int, int);	/* real: 0x21D768 */
+static int hintCustom[5];			/* real: 0x27B5D0 */
+static void ConfigItemFocus(int, int);		/* real: the items' +0x28 */
+
+/* real: 0x21EDB8 - re-sync the item's value index from the live setting */
+static void
+ConfigItemResync(ConfigItem *it)
+{
+	int i, live;
+
+	live = cfgSettings[it->setting];
+	if(it->values == nil || it->nvalues <= 0)
+		return;
+	if(it->values[it->value].value == live)
+		return;
+	it->value = 0;
+	for(i = 0; i < it->nvalues; i++)
+		if(it->values[i].value == live) {
+			it->value = i;
+			break;
+		}
+}
+
+/* real: 0x21F978(20992, 1, n) - the UI clicks: 4 = confirm, 6 = a value
+ * step, 10 = cancel */
+static void
+cfgClick(int n)
+{
+	OSDDispatch(20992, 1, n, 0);
+}
+
+/* real: the shared left/right half of 0x21F080 and 0x21F168 - move the
+ * value index with wraparound and write the live setting.  The ROM
+ * takes these edges from gp-30316, whose held-repeat matches pad.c's
+ * dirPress. */
+static void
+ConfigValueStep(ConfigItem *it)
+{
+	if(it->values == nil || it->nvalues <= 0)
+		return;
+	if(pad.dirPress & PAD_LEFT) {
+		if(--it->value < 0)
+			it->value += it->nvalues;
+		cfgClick(6);
+	}
+	if(pad.dirPress & PAD_RIGHT) {
+		if(++it->value >= it->nvalues)
+			it->value = 0;
+		cfgClick(6);
+	}
+	/* real: 0x21F080's tail - *(0x22B0E8(+0x0C)) = values[+0x08].value,
+	 * unconditionally, every frame the widget runs */
+	cfgSettings[it->setting] = it->values[it->value].value;
+}
+
+/* real: 0x21EF00 (through 0x21F080) - every value on one row, centred as
+ * a whole, separated by the " " at 0x2A7888; the current one in 0x27B830
+ * and the rest in 0x27B840 */
+static void
+EditItemValue(ConfigItem *it, int x, int y, int alpha)
+{
+	int i, w;
+
+	ConfigValueStep(it);		/* real: 0x21F080's input half */
+	if(alpha <= 0 || it->values == nil)
+		return;
+	w = 0;
+	for(i = 0; i < it->nvalues; i++)
+		w += osdTextWidth(osdGetString(it->values[i].strid));
+	w += (it->nvalues - 1) * osdTextWidth(" ");
+	x -= w/2;
+	for(i = 0; i < it->nvalues; i++) {
+		drawTextL(x, y, i == it->value ? colSelected : colUnselected,
+			alpha, osdGetString(it->values[i].strid));
+		x += osdTextWidth(osdGetString(it->values[i].strid)) +
+			osdTextWidth(" ");
+	}
+}
+
+/* real: 0x21F168 - the language row.  Seven names do not fit on one
+ * line, so the ROM shows only the current one and slides the old name
+ * out sideways (gp-30676, +-150 px decaying by a sixth a frame, drawn by
+ * 0x21F3A8 with the up/down marker glyph 61 alongside).  The slide is
+ * not ported: the row shows the current name centred, in the selected
+ * blue, and steps exactly like the other value items. */
+static void
+EditItemLang(ConfigItem *it, int x, int y, int alpha)
+{
+	ConfigValueStep(it);
+	if(alpha <= 0 || it->values == nil ||
+	   (u32)it->value >= (u32)it->nvalues)
+		return;
+	drawTextC(x, y, colSelected, alpha,
+		osdGetString(it->values[it->value].strid));
+}
+
+/* ================ the Clock Adjustment editor ================ */
+
+/* the h/m/s snapshot taken when the editor opens, for cancel.  real:
+ * 0x21EB30 re-reads the console's RTC (0x22B838); the port has no RTC,
+ * so the pre-edit clock stands in for it. */
+static int cfgClockSaved[3];
+
+/* real: the days-in-month half of 0x21E3B8.  The ROM clamps the whole
+ * date through the calendar library (0x20ABB0/0x20B028, between
+ * 2000-01-01 and 2099-12-31 in epoch seconds); the field ranges at
+ * 0x27B870 already pin everything but the day-vs-month overflow, so the
+ * port keeps just that: the day WRAPS against the real month length
+ * (the up/down arm below uses this as its max) and shrinks to it when
+ * a month or year step leaves it over. */
+static int
+ClockDaysInMonth(void)
+{
+	static const int mdays[12] =
+		{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+	int y, m, max;
+
+	y = cfgSettings[6];
+	m = cfgSettings[7];
+	max = mdays[(m - 1) % 12];
+	if(m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))
+		max = 29;
+	return max;
+}
+
+static void
+ClockClampDay(void)
+{
+	int max = ClockDaysInMonth();
+
+	if(cfgSettings[8] > max)
+		cfgSettings[8] = max;
+}
+
+/* real: 0x21E870 - the editor's own pad half.  Left/right move the
+ * field cursor (item->0x08, which the clock item reuses for it);
+ * up/down step the field through its 0x27B870 range with wraparound.
+ * The ROM reads up/down from gp-30308, the held-repeat word - pad.c's
+ * dirPress carries the same repeat. */
+static void
+ClockEditInput(ConfigItem *it)
+{
+	int f, v, min, max;
+
+	/* real: 0x21D768(1, 85, 86, 1) / 0x21D758(0xF000) - all four hint
+	 * slots, the outer pair with the empty string 1 */
+	HintSetCustom(1, 85, 86, 1);
+	hintCustom[4] = 0xF000;
+
+	f = it->value;
+	if(pad.dirPress & PAD_LEFT) {
+		if(--f < 0)
+			f += it->nvalues;
+		cfgClick(6);
+	}
+	if(pad.dirPress & PAD_RIGHT) {
+		if(++f >= it->nvalues)
+			f = 0;
+		cfgClick(6);
+	}
+	it->value = f;
+
+	v = cfgSettings[cfgClockField[f][0]];
+	min = cfgClockField[f][1];
+	max = f == 2 ? ClockDaysInMonth() : cfgClockField[f][2];
+	if(pad.dirPress & PAD_UP) {
+		if(++v > max)
+			v = min;
+		cfgClick(6);
+	}
+	if(pad.dirPress & PAD_DOWN) {
+		if(--v < min)
+			v = max;
+		cfgClick(6);
+	}
+	cfgSettings[cfgClockField[f][0]] = v;
+	ClockClampDay();		/* real: 0x21E3B8 after either step */
+}
+
+/* real: 0x21EA20 - draw the row in edit colours, run the pad, and
+ * reseed the soft clock from the fields EVERY frame (0x22B8E8's tail
+ * call) - which is what makes the carousel follow the edit live. */
+static void
+EditItemClock(ConfigItem *it, int x, int y, int alpha)
+{
+	DrawClockRow(it, x, y, alpha, 1);	/* real: 0x21E3B0 */
+	ClockEditInput(it);			/* real: 0x21E870, 0x27EC40-gated */
+	MenuClockSet(cfgSettings[9], cfgSettings[10], cfgSettings[11]);
+}
+
+/* real: 0x21DF28 - the clock item's +0x14.  Fades the orb trails down
+ * (0x22EF90), freezes the tick (0x22B960), snapshots the RTC into the
+ * six fields (0x22B960's block already holds it; the port copies its
+ * own clock) and seeds the soft clock from them (0x22B8E8). */
+static void
+ClockEditOpen(ConfigItem *it)
+{
+	int h, m, s;
+
+	(void)it;
+	MenuOrbTrailFade(0);		/* real: 0x22EF90 */
+	MenuClockHold(1);		/* real: 0x22B960 */
+	MenuClockGet(&h, &m, &s);
+	cfgSettings[6] = cfgClockDate[0];
+	cfgSettings[7] = cfgClockDate[1];
+	cfgSettings[8] = cfgClockDate[2];
+	cfgSettings[9] = h;
+	cfgSettings[10] = m;
+	cfgSettings[11] = s;
+	cfgClockSaved[0] = h;
+	cfgClockSaved[1] = m;
+	cfgClockSaved[2] = s;
+}
+
+/* real: 0x21EAE0 - the clock item's +0x20 confirm: 0x22B2A8 writes the
+ * six fields to the CDVD RTC.  STUBBED - aap decides about hardware
+ * side effects; the soft clock keeps the edited time either way. */
+static void
+ClockEditApply(ConfigItem *it)
+{
+	(void)it;
+	printf("osdsys: clock adjustment: set %04d/%02d/%02d %02d:%02d:%02d"
+		" (RTC write stubbed)\n",
+		cfgSettings[6], cfgSettings[7], cfgSettings[8],
+		cfgSettings[9], cfgSettings[10], cfgSettings[11]);
+	cfgClockDate[0] = cfgSettings[6];	/* the port's stand-in RTC date */
+	cfgClockDate[1] = cfgSettings[7];
+	cfgClockDate[2] = cfgSettings[8];
+	MenuClockHold(0);		/* real: 0x22B950 */
+	MenuOrbTrailFade(1);		/* real: 0x22EF30 */
+	ConfigItemFocus(0, 1);		/* real: the 0x21D768/0x21D758 tail */
+}
+
+/* real: 0x21EB30 - the +0x24 cancel: 0x22B838 reseeds the soft clock
+ * from the real RTC; the port restores the pre-edit snapshot. */
+static void
+ClockEditCancel(ConfigItem *it)
+{
+	(void)it;
+	MenuClockSet(cfgClockSaved[0], cfgClockSaved[1], cfgClockSaved[2]);
+	MenuClockHold(0);		/* real: 0x22B950 */
+	MenuOrbTrailFade(1);		/* real: 0x22EF30 */
+	ConfigItemFocus(0, 1);
+}
+
+/* real: the items' +0x20 confirm callbacks - 0x21EBC8 (screen size),
+ * 0x21EC08 (digital out), 0x21EC98 (component), 0x21ECD8 (language).
+ * Each compares the live setting against the persisted copy (0x203690 /
+ * 0x203658 / 0x2036F8 / 0x2040D0) and calls 0x22B3F8 - the NVRAM save -
+ * only on a change; digital out additionally posts 20/21 into
+ * *(0x1F00B4), the message that flips the IOP's S/PDIF driver.  osdbits
+ * has neither NVRAM nor the IOP message port, so both are printfs. */
+static void
+ConfigItemApply(ConfigItem *it)
+{
+	int live = cfgSettings[it->setting];
+
+	if(live == cfgPersisted[it->setting])
+		return;
+	if(it->setting == 1)		/* real: 0x21EC08's *(0x1F00B4) */
+		printf("osdsys: digital out message %d (stubbed)\n",
+			live == 0 ? 20 : 21);
+	printf("osdsys: config save: setting %d = %d (\"%s\") (stubbed)\n",
+		it->setting, live,
+		it->values ? osdGetString(it->values[it->value].strid) : "");
+	cfgPersisted[it->setting] = live;	/* real: 0x22B3F8 */
 }
 
 /* real: 0x228708 - the widest item label, into the header's +0x0C */
@@ -1016,31 +1350,66 @@ DrawConfigMenu(int fadeAlpha)
 		if(right >= screenW - 24)
 			x -= right + 24 - screenW;
 
+		/* real: mode 1 draws the label in 0x27B850 and hands the row to
+		 * the +0x1C widget for the cursor item.  The widget runs even at
+		 * alpha 0 - it owns the left/right input (see EditItem*). */
+		if(configMenu.mode == 1 && i == configCursor) {
+			if(a)
+				drawTextC(x, cfgLabelY, colDim, a, label);
+			configMenu.items[i].edit(&configMenu.items[i], 430,
+				cfgValueY, a);
+			continue;
+		}
 		if(a == 0)
 			continue;
-		/* real: mode 1 draws the label in 0x27B850 and hands the row to
-		 * the +0x1C widget for the cursor item; mode 0 is this arm */
 		drawTextC(x, cfgLabelY, colSelected, a, label);
 		configMenu.items[i].draw(&configMenu.items[i], 430, cfgValueY, a);
 	}
 }
 
-/* real: the System Configuration screen's own share of 0x2279B8 (the
- * mode-0 pad handler 0x227D08 dispatches to).  The cursor WRAPS at both
- * ends there, unlike the main menu's, and each move fires the item's
- * +0x28 focus callback twice, off the old item and onto the new one.
- * Confirm is not wired: 0x2279B8's CIRCLE arm calls the item's +0x14
- * (0x21DF28 for Clock Adjustment, 0x21EE50 for the rest) and sets the
- * header's mode to 1, which is a whole sub-screen. */
-static void ConfigItemFocus(int, int);	/* real: the items' +0x28 */
-
+/* real: the System Configuration screen's own share of 0x2279B8 and
+ * 0x227BE8 (the two pad handlers 0x227D08 dispatches on the header's
+ * mode).  Mode 0: the cursor WRAPS at both ends there, unlike the main
+ * menu's, and each move fires the item's +0x28 focus callback twice,
+ * off the old item and onto the new one; the confirm arm (bit 0x20)
+ * runs the item's +0x14 (0x21DF28 for Clock Adjustment, 0x21EE50 for
+ * the rest), zeroes the marker phase and flips the mode to 1.  Mode 1:
+ * confirm kicks the cursor's cube, runs the item's +0x20 and drops back
+ * to mode 0 (the 0x1F00B0 == 5 && 0x1F00A4 == 18 "launched to set the
+ * clock" arm that would pick mode 2 instead is not ported); cancel runs
+ * the +0x24 (0x21EB30 for the clock, a no-op for the others).  The
+ * left/right value stepping is NOT here in the ROM either - the mode-1
+ * widgets poll the pad themselves (EditItem*). */
 static void
 ConfigMenuInput(void)
 {
+	ConfigItem *it;
 	int old;
 
 	if(!MenuConfigOpen())
 		return;
+	it = &configMenu.items[configCursor];
+
+	if(configMenu.mode == 1) {		/* real: 0x227BE8 */
+		if(pad.press & (PAD_CROSS|PAD_CIRCLE)) {
+			MenuConfigCubeKick(configCursor);	/* *(gp-32136) */
+			if(configCursor == 0)
+				ClockEditApply(it);	/* real: +0x20, 0x21EAE0 */
+			else
+				ConfigItemApply(it);	/* real: +0x20 */
+			configMenu.mode = 0;
+			cfgClick(4);		/* real: 0x2287A8(20992,1,4) */
+			configMenu.phase = 0;	/* real: 0x27BE28+0x34 = 0 */
+		} else if(pad.press & PAD_TRIANGLE) {
+			if(configCursor == 0)
+				ClockEditCancel(it);	/* real: +0x24, 0x21EB30 */
+			configMenu.mode = 0;	/* the others' +0x24 is a nop */
+			cfgClick(10);		/* real: 0x2287A8(20992,1,10) */
+			configMenu.phase = 0;
+		}
+		return;
+	}
+
 	old = configCursor;
 	if(pad.dirPress & PAD_UP)
 		if(--configCursor < 0)
@@ -1054,6 +1423,22 @@ ConfigMenuInput(void)
 	if(configCursor != old) {
 		ConfigItemFocus(old, 0);
 		ConfigItemFocus(configCursor, 1);
+	}
+	/* real: 0x2279B8's confirm arm (bit 0x20) - the item's +0x14, then
+	 * mode 1.  (Its gp-30352 word - 0x22B108 for the clock, 0x22B100
+	 * for the rest, feeding 0x22B138's hint refresh - is not ported;
+	 * the widgets set their own hints.) */
+	if(pad.press & (PAD_CROSS|PAD_CIRCLE)) {
+		it = &configMenu.items[configCursor];
+		if(configCursor == 0)
+			ClockEditOpen(it);	/* real: 0x21DF28 */
+		else
+			ConfigItemResync(it);	/* real: 0x21EE50 -> 0x21EDB8 */
+		configMenu.phase = 0;		/* real: 0x21EE50's 0x27BE5C */
+		configMenu.mode = 1;
+		cfgClick(4);
+		printf("osdsys: config item %d (\"%s\") opened\n", configCursor,
+			osdGetString(it->strid));
 	}
 	/* real: 0x2279B8's TRIANGLE arm leaves the screen (0x2210C8) */
 	if(pad.press & PAD_TRIANGLE)
@@ -1534,7 +1919,7 @@ DrawHintBar(int fadeAlpha)
 void
 InitMenuText(void)
 {
-	int rate;
+	int rate, i;
 
 	menuTextEnable = OsdArgInt(8, 0) ? 0 : 1;
 	menuTextDumpFrame = OsdArgInt(9, 0);
@@ -1579,6 +1964,27 @@ InitMenuText(void)
 	/* real: 0x27BE28's cursor, moved by 0x2279B8's UP/DOWN arms */
 	configCursor = clamp(OsdArgInt(15, 0), 0, configMenu.count-1);
 	memset(configItemAlpha, 0, sizeof(configItemAlpha));
+
+	/* real: 0x21ED18, called from the per-screen init 0x228460
+	 * (0x2284D4) - wire the region's language table into items[4]
+	 * (region 0 gets the two-entry 0x27B8C0; the port's textRegionSwap
+	 * stands in for regions 1/2, whose tables are identical) */
+	configItems[4].nvalues = 7;		/* real: `li v0,7' */
+	configItems[4].values = cfgLanguage;	/* real: 0x27B920 / 0x27BA70 */
+
+	/* real: the 0x352880 block starts as the NVRAM copy the OSD loader
+	 * read; osdbits has no NVRAM, so every item starts on its first
+	 * value and the items' +0x08 already agree (all 0 in .data) */
+	memset(cfgSettings, 0, sizeof(cfgSettings));
+	for(i = 1; i < configMenu.count; i++)
+		if(configItems[i].values)
+			cfgSettings[configItems[i].setting] =
+				configItems[i].values[0].value;
+	for(i = 0; i < 4; i++)
+		cfgPersisted[i] = cfgSettings[i];
+	cfgClockDate[0] = 2000;			/* real: the RTC's date */
+	cfgClockDate[1] = 1;
+	cfgClockDate[2] = 1;
 
 	/* real: 0x227560's own three rows.  The title's y is a literal 88,
 	 * or 101 when 0x204350() (IsPAL) says so, and the two rows under it

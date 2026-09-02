@@ -140,6 +140,17 @@ static int ringOffset;		/* real: *(int*)0x34E6C0 */
 static short ringSpinY;		/* real: *(short*)0x34E6C4 */
 static short ringTiltZ;		/* real: *(short*)0x34E6C6 */
 static float ringSplitMax;	/* real: *(float*)0x34E930 = 1 - minutes/60 */
+/* the two colour qwords 0x225DD8 copies into every deferred record at
+ * +0x100 and +0x120.  0x225318's tail eases 0x34E910 toward 0x34E940
+ * ({167,217,255,0}, the fixed cyan-white) and 0x34E920 toward 0x27EAE0
+ * ({0x3C,0x3C,0x3C,0x80}); live retail memory (savestates .04/.05,
+ * config screen up) shows both settled on exactly those targets.  An
+ * earlier pass here had them as 0x27EAE0/0x27EAF0's values - harmless
+ * then because nothing read the record's colA/colB, but they are the
+ * front rod's SPLIT colours: colA paints the visible lower piece,
+ * colB is what 0x22E4D0 hands 0x22CD78 - the reason all 86 of retail's
+ * flush draws are rgba 3c3c3c80 while the front slot's own col1 is
+ * {0x80,0x80,0x80,0x1E}. */
 static int ringColA[4];		/* real: 0x34E910 */
 static int ringColB[4];		/* real: 0x34E920 */
 
@@ -153,6 +164,11 @@ static const int cfgColBody[4]  = { 0x2D, 0x55, 0x66, 0x80 };	/* 0x27EAC0 */
 static const int cfgColEdge[4]  = { 0x3C, 0x3C, 0x3C, 0x80 };	/* 0x27EAD0 */
 static const int cfgColRingA[4] = { 0x3C, 0x3C, 0x3C, 0x80 };	/* 0x27EAE0 */
 static const int cfgColRingB[4] = { 0x80, 0x80, 0x80, 0x1E };	/* 0x27EAF0 */
+/* real 0x34E940: the fixed bright cyan-white 0x225878 rebuilds every
+ * frame (22d8c8..22d8e8: {167, 217, 255, 0} written out in immediates).
+ * It is both half of the front slot's body blend below and the target
+ * 0x225318's tail eases 0x34E910 toward. */
+static const int cfgColFixed[4] = { 167, 217, 255, 0 };
 /* real 0x225878: the front slot's body colour is the average of
  * 0x27EAC0 and the fixed {167,217,255} at 0x34E940 */
 static const int cfgColFront[4] = { (0x2D+167)/2, (0x55+217)/2, (0x66+255)/2, 0x80 };
@@ -344,6 +360,7 @@ static const float rodBumpOfs = -0.008f;
  * this port transforms one object at a time, so one bank is enough. */
 
 #define MAXFACES 16
+#define MAXFACEMASK 0xFFFFu
 
 typedef struct MeshVertex MeshVertex;
 struct MeshVertex
@@ -372,6 +389,31 @@ struct MeshModel
 };
 
 static MeshFace meshFaces[MAXFACES];
+/* real: 0x3555D0 (= 0x3529D0 + 32*352), the second face bank.  Only the
+ * front rod's split arms use it: the LOWER piece is transformed into the
+ * first bank and the UPPER into this one, and each pass then walks both.
+ *
+ * The two arms also skip fixed face INDICES per piece.  The rod model's
+ * sixteen faces are 0-1 = the flat top cap (y 26.39), 2-7 = the bevel
+ * ring (26..26.39), 8-9 = the bottom cap (y 0), 10-15 = the six shaft
+ * sides (0..26) - so the skips are exactly "no cap at the cut": the
+ * lower piece draws 8..15 (bottom cap + shaft, `slti v0,s2,8' skips the
+ * rest, 22e6b0/22dba0...) and the upper everything but 8 and 9 (top cap
+ * + bevel + shaft, `addiu v0,s2,-8; sltiu v0,v0,2', 22e700/22dbf0...). */
+static MeshFace meshFaces2[MAXFACES];
+static MeshFace *meshBank = meshFaces;	/* the bank the passes below walk */
+static u32 meshMask = MAXFACEMASK;	/* the split arms' face-index skips */
+
+#define MESH_LOWER 0xFF00u		/* faces 8..15 */
+#define MESH_UPPER (MAXFACEMASK & ~0x0300u)	/* all but 8 and 9 */
+
+static void
+MeshSelect(MeshFace *bank, u32 mask)
+{
+	meshBank = bank;
+	meshMask = mask;
+}
+
 static float meshObjX, meshObjY;	/* 0x22CFA8's outX/outY */
 /* the pair 0x22C4E0 actually shrinks toward: the rod path hands it
  * 0x22CFA8's outX/outY unchanged, the cube path (0x22D2E8, right after
@@ -428,7 +470,7 @@ MeshTransform(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 	meshObjY = b[1]*q - 2048.0f;
 
 	for(i = 0; i < mdl->nfaces; i++) {
-		f = &meshFaces[i];
+		f = &meshBank[i];
 		/* the normals carry w = 0, so this is the rotation only */
 		v[0] = mdl->norms[i][0];
 		v[1] = mdl->norms[i][1];
@@ -810,7 +852,9 @@ MeshDrawPass(MeshModel *mdl, const int *col, float size, int back, int extra)
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++) {
-		f = &meshFaces[i];
+		f = &meshBank[i];
+		if(!(meshMask & 1u<<i))
+			continue;
 		if((f->cull != 0) != back)
 			continue;
 		fres = MeshFresnel(f);
@@ -829,7 +873,9 @@ MeshFlatPass(MeshModel *mdl, const int *col, int back)
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++) {
-		f = &meshFaces[i];
+		f = &meshBank[i];
+		if(!(meshMask & 1u<<i))
+			continue;
 		if((f->cull != 0) != back)
 			continue;
 		fres = MeshFresnel(f);
@@ -846,8 +892,8 @@ MeshBlackPass(MeshModel *mdl, int back)
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++)
-		if((meshFaces[i].cull != 0) == back)
-			MeshEmitBlackFace(&meshFaces[i]);
+		if(meshMask & 1u<<i && (meshBank[i].cull != 0) == back)
+			MeshEmitBlackFace(&meshBank[i]);
 }
 
 /* real: the 0x22CD78 loop, 0x22D798's FIRST - the same cull != 0 set the
@@ -859,8 +905,8 @@ MeshReflPass(MeshModel *mdl, const int *col, int back, int aa)
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++)
-		if((meshFaces[i].cull != 0) == back)
-			MeshEmitReflFace(&meshFaces[i], col, aa);
+		if(meshMask & 1u<<i && (meshBank[i].cull != 0) == back)
+			MeshEmitReflFace(&meshBank[i], col, aa);
 }
 
 /* real: the 0x22C920 halves of the same per-face loops - same cull test,
@@ -880,8 +926,8 @@ MeshBumpPass(MeshModel *mdl, const int *col, int back, float ofsx, float ofsy,
 	int i;
 
 	for(i = 0; i < mdl->nfaces; i++)
-		if((meshFaces[i].cull != 0) == back)
-			MeshEmitBumpFace(&meshFaces[i], col,
+		if(meshMask & 1u<<i && (meshBank[i].cull != 0) == back)
+			MeshEmitBumpFace(&meshBank[i], col,
 				ofsx + i*step, ofsy + i*step);
 }
 
@@ -987,11 +1033,11 @@ MeshDebug(MeshModel *mdl, float sy)
 	if(!cfgDebug || frameCount != cfgDebug)
 		return;
 	for(i = 0; i < mdl->nfaces; i++)
-		front += meshFaces[i].cull == 0;
+		front += meshBank[i].cull == 0;
 	printf("mesh %d faces at %.1f %.1f, scale %.2f, %d front, v0 %.0f %.0f\n",
 		mdl->nfaces, meshObjX, meshObjY, sy, front,
-		meshFaces[0].v[0].proj[0] - 2048.0f,
-		meshFaces[0].v[0].proj[1] - 2048.0f);
+		meshBank[0].v[0].proj[0] - 2048.0f,
+		meshBank[0].v[0].proj[1] - 2048.0f);
 }
 
 /* real: 0x22D920's 0x22E0EC arm - the plain one-piece rod, and all five
@@ -1104,6 +1150,142 @@ MeshDrawRod(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
 	vif1SetZTest(1);
 	vif1SetAlphaBlend(1, 4, 128);
 	MeshDrawPass(mdl, col, size, 1, 255);
+}
+
+/* real: 0x22D920's f12 > 0 arm (0x22D9D4) - the FRONT rod, split in two
+ * along Y.  Only the front ring slot ever reaches it: 0x226028 passes
+ * every other record split = -1, and the front slot's split climbs from
+ * 0 by *(gp-32164) = 0.004 per frame toward 1 - minutes/60 (0x225BF8) -
+ * the rod is the clock's minute PROGRESS bar.
+ *
+ * The arm makes two stack copies of the scene (22d9fc/22da38), then:
+ *
+ *   copy1 (LOWER)  +0x6C = progress * split           (22da74)
+ *                  +0x80 = *(rec+0x100)  = ringColA, the fixed bright
+ *                          {167,217,255,0}            (22da7c)
+ *                  +0x90 = f13 = (float)rec->0x110 = 100 (22da70)
+ *                  -> transformed into the 0x3529D0 bank (22da98)
+ *   copy2 (UPPER)  +0x6C = progress * (1 - split)     (22dab0)
+ *                  world matrix translated by (0, 26 * progress * split,
+ *                  0) through the 0x230180/0x230440 stack-top dance
+ *                  (22dabc..22db20) - 26 is the rod's model height, so
+ *                  the upper piece sits exactly on the cut
+ *                  -> transformed into the 0x3555D0 bank (22db38)
+ *
+ * and runs the SAME five passes as the one-piece arm (same binds, same
+ * targets, same blends - 22db44..22e0e0), each pass walking both banks:
+ * lower faces 8..15, upper all but 8-9 (see meshFaces2).  Three deltas
+ * against the one-piece pass bodies:
+ *
+ *   - both pieces shrink toward the WHOLE rod's 0.9 centre (every
+ *     0x22C888 gets f12/f13 = sp+448/452, the head's outX/outY);
+ *   - the upper piece's emboss T offset gains 2 * progress * split
+ *     (22dd58 `add.s f13,f13,f13' on copy1's +0x6C) - the model V spans
+ *     0..2 and is scaled by +0x6C, so the term makes the upper piece's
+ *     TEXCBUMP phase continue exactly where the lower piece's ends;
+ *   - the per-face ST steps are gp-32048/-32044/-32040/-32036, all 0.1
+ *     like the one-piece arm's.
+ *
+ * So the visible result is one rod with a bright cyan-white lower
+ * segment growing at 0.004/frame to the minute mark, glass-refracted
+ * exactly like the rest of the carousel.  (The lower size 100 halves the
+ * Fresnel brightness term against the upper's 200.) */
+static void
+MeshDrawRodSplit(MeshModel *mdl, sceVu0FMATRIX cam, sceVu0FMATRIX world,
+	float progress, float split, const int *colLow, float sizeLow,
+	const int *colUp, float sizeUp, int slot, int field)
+{
+	sceVu0FMATRIX worldUp;
+	float phase, refx, refy, tofs;
+
+	/* the lower piece; its origin is the whole rod's, so 0x22CFA8's
+	 * outX/outY here are the head's (22d9a8) and both pieces' passes
+	 * use them */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshTransform(mdl, cam, world, 1.0f, progress*split, 1.0f);
+	refx = meshObjX * 0.9f;		/* real: 22d9c0/22d9c4, *(gp-32052) */
+	refy = meshObjY * 0.9f;
+	MeshDebug(mdl, progress*split);
+
+	/* real: 22dabc..22db20 - load the world into the stack top,
+	 * 0x230440(0, 26 * progress * split, 0), read it back */
+	matCopy(mdTop, world);
+	mdTranslatef(0.0f, 26.0f*progress*split, 0.0f);
+	matCopy(worldUp, mdTop);
+
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshTransform(mdl, cam, worldUp, 1.0f, progress*(1.0f - split), 1.0f);
+
+	meshRefX = refx;
+	meshRefY = refy;
+	phase = (float)slot * 0.1f;	/* real: 22d928, *(gp-32056) */
+	tofs = 2.0f*progress*split;	/* the upper piece's V continuation */
+
+	vif1SetZWrite(1);		/* ZMSK 0 - see MeshDrawRod */
+
+	if(!cfgMeshTex) {		/* NOT original: argv[14] = 0 */
+		MenuBackScreenTarget(field);
+		vif1SetZTest(0);
+		vif1SetAlphaBlend(1, 4, 128);
+		MeshSelect(meshFaces, MESH_LOWER);
+		MeshDrawPass(mdl, colLow, sizeLow, 0, 0);
+		MeshDrawPass(mdl, colLow, sizeLow, 1, 0);
+		MeshSelect(meshFaces2, MESH_UPPER);
+		MeshDrawPass(mdl, colUp, sizeUp, 0, 0);
+		MeshDrawPass(mdl, colUp, sizeUp, 1, 0);
+		MeshSelect(meshFaces, MAXFACEMASK);
+		return;
+	}
+
+	/* 1 - the far glass refracting wb3, into wb4 (22db44..22dc38) */
+	MenuBackBindWork(0);			/* real: 0x22BFD0(1,0,1) */
+	MenuBackWorkTarget(1, nil, field);
+	vif1SetZTest(0);			/* real: 0x22A0C0(1,1) */
+	vif1SetAlphaBlend(1, 4, 128);		/* real: ALPHA_1 0x44 */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshDrawPass(mdl, colLow, sizeLow, 0, 0);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshDrawPass(mdl, colUp, sizeUp, 0, 0);
+
+	/* 2, 3 - the TEXCBUMP emboss, subtractive at (phase) then additive
+	 * at (B0 + phase), exactly the one-piece order; the upper piece's T
+	 * carries the +2ps continuation in both (22dd58 / 22deb8) */
+	MenuConfigBindBump();			/* real: 0x22AB90(2,1,2) */
+	vif1SetZTest(1);			/* real: 0x22A0C0(x,2) GEQUAL */
+	vif1SetAlphaBlend(1, 6, 128);		/* real: 0x22A0C0(2,2) 0x42 */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshBumpPass(mdl, rodBumpColor, 0, phase, phase, 0.1f);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshBumpPass(mdl, rodBumpColor, 0, phase, phase + tofs, 0.1f);
+	vif1SetAlphaBlend(1, 5, 128);		/* real: 0x22A0C0(0,2) 0x48 */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshBumpPass(mdl, rodBumpColor, 0, rodBumpOfs + phase,
+		rodBumpOfs + phase, 0.1f);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshBumpPass(mdl, rodBumpColor, 0, rodBumpOfs + phase,
+		rodBumpOfs + phase + tofs, 0.1f);
+
+	/* 4 - the near glass refracting wb4, ON THE SCREEN (22defc) */
+	MenuBackBindWork(1);			/* real: 0x22C020(1,0,1) */
+	MenuBackScreenTarget(field);
+	vif1SetZTest(1);			/* real: 0x22A0C0(1,2) GEQUAL */
+	vif1SetAlphaBlend(1, 4, 128);
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshDrawPass(mdl, colLow, sizeLow, 1, 0);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshDrawPass(mdl, colUp, sizeUp, 1, 0);
+
+	/* 5 - the same faces into wb3, extra 255 (22dff4) */
+	MenuBackBindWork(1);			/* real: 0x22BFD0(0,1,1) */
+	MenuBackWorkTarget(0, nil, field);
+	vif1SetZTest(1);
+	vif1SetAlphaBlend(1, 4, 128);
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshDrawPass(mdl, colLow, sizeLow, 1, 255);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshDrawPass(mdl, colUp, sizeUp, 1, 255);
+
+	MeshSelect(meshFaces, MAXFACEMASK);
 }
 
 /* real: 0x22D2E8, all eight loops, in the ROM's own order and against the
@@ -1243,9 +1425,7 @@ static MeshModel cubeModel = { 0, nil, nil, nil };
  * real: 0x2266E0 unpacks the record into 0x22D920(rec+0x10, rec+0x100,
  * f12 = rec->0xF4, f13 = (float)rec->0x110).  0x22D920's f12 <= 0 arm
  * is the plain one-piece rod; its f12 > 0 arm (only the front slot, once
- * its `split' has grown) cuts the rod in two along Y and draws the upper
- * half translated by 26 * progress * split.  Only the one-piece arm is
- * ported. */
+ * its `split' has grown past zero) is MeshDrawRodSplit above. */
 void
 MenuConfigDrawMesh(SceneRec *rec)
 {
@@ -1256,6 +1436,14 @@ MenuConfigDrawMesh(SceneRec *rec)
 	 * the scene struct's +0x00, which 0x22D920 turns into the TEXCBUMP
 	 * phase f21; the field is the module's own snapshot, which is what
 	 * all three of 0x22D920's FRAME pushes pass. */
+	if(rec->f12 > 0.0f) {		/* real: 22d9b4/22d9cc, 0 < split */
+		MeshDrawRodSplit(&rodModel, menuCamera, rec->world,
+			rec->progress, rec->f12,
+			rec->colA, (float)rec->aux,	/* real: rec+0x100, +0x110 */
+			rec->col0, rec->size,
+			rec->index, MenuBackField());
+		return;
+	}
 	MeshDrawRod(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f,
 		rec->col0, rec->size, rec->index, MenuBackField());
 }
@@ -1264,10 +1452,9 @@ MenuConfigDrawMesh(SceneRec *rec)
  *
  * real: 0x22E428, called twice per record by 0x2267E8 (menu.c's
  * SceneFlush) after the sorted walk has finished.  0x22E428 branches on
- * the record's split (+0xF4): `> 0' takes the split-rod arm at 0x22E4D0,
- * everything else the simple arm at **0x22E9A8**, which is what this is.
- * The port has no split rod (MeshDrawRod does not either), so all twelve
- * come through here.
+ * the record's split (+0xF4): `> 0' takes the split-rod arm at 0x22E4D0
+ * (MeshFlushSplit below), everything else the simple arm at **0x22E9A8**,
+ * which is what this is.
  *
  * 0x22E9A8, guarded by `0 <= walk < 2' (22e9a8 slti / 22e9b4 bltz - an
  * out-of-range walk falls to 0x22EB98, a lone pass A that nothing calls):
@@ -1307,6 +1494,90 @@ MenuConfigDrawMesh(SceneRec *rec)
  * added back. */
 static const int rodFlowColor[4] = { 0x28, 0x28, 0x28, 0x80 };
 
+/* real: 0x22E4D0 - 0x22E428's split arm, the front rod's half of the
+ * deferred bloom.  The same two stack copies as MeshDrawRodSplit
+ * (lower = progress*split, upper = progress*(1-split) translated up by
+ * 26*progress*split through the 0x230180/0x230440 dance, same face-index
+ * skips, same 2*progress*split T continuation for the upper piece) with
+ * three deltas of its own:
+ *
+ *   - BOTH copies' +0xC0 - the colour 0x22CD78 stamps - become
+ *     *(rec+0x120) = ringColB = {0x3C,0x3C,0x3C,0x80} (22e580/22e5c0),
+ *     not the slot's own col1.  This is why every one of retail's 86
+ *     flush draws is rgba=3c3c3c80 even though the front slot's col1 is
+ *     {0x80,0x80,0x80,0x1E}: at RGB 0x3C the front rod blooms like the
+ *     other eleven, and - because PRIM 276's pass A writes its alpha
+ *     flat - composites at As 0x80 instead of 0x1E over its own faces.
+ *   - pass A runs under 0x22A0C0(0,1) = ALPHA_1 0x48 (22e674/22e688)
+ *     where the simple arm pushes (1,1) = 0x44 - both dead, PRIM 276
+ *     has ABE clear; mirrored anyway.
+ *   - the emboss TEXTURES are SWAPPED against the simple arm: walk 1
+ *     binds slot 3 = TEXCBINV (22e74c `li a0,3') and walk 0 slot 2 =
+ *     TEXCBUMP (22e884 `li a0,2'), while the ST offset stays with the
+ *     walk (walk 1 gets scene->+0xB0, walk 0 gets 0) exactly as in the
+ *     simple arm.  Net effect: the front rod's sparkle uses the emboss
+ *     pair in the opposite order - the sum is the same, the sign of the
+ *     surviving difference is not.
+ *
+ * The per-face ST steps are gp-32016/-32012/-32008/-32004, all 0.1 like
+ * the simple arm's.  0x22E4D0 has no f13/size argument - pass A's
+ * 0x22CD78 never reads +0x90 - and neither piece keeps the record's
+ * col1, so only progress, split, world and colB come out of the record. */
+static void
+MeshFlushSplit(SceneRec *rec, int walk)
+{
+	sceVu0FMATRIX worldUp;
+	float phase, ofs, tofs;
+
+	/* the lower piece; 0x22E4D0 computes the 0.9 centre from the head's
+	 * transform (22e4ac/22e4c4), but the origin is scale-invariant so
+	 * copy1's is the same - and neither of this stage's emits reads it
+	 * (see MenuConfigFlushMesh) */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshTransform(&rodModel, menuCamera, rec->world, 1.0f,
+		rec->progress*rec->f12, 1.0f);
+	meshRefX = meshObjX * 0.9f;
+	meshRefY = meshObjY * 0.9f;
+
+	/* real: 22e5c8..22e634 - the same stack-top translate */
+	matCopy(mdTop, rec->world);
+	mdTranslatef(0.0f, 26.0f*rec->progress*rec->f12, 0.0f);
+	matCopy(worldUp, mdTop);
+
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshTransform(&rodModel, menuCamera, worldUp, 1.0f,
+		rec->progress*(1.0f - rec->f12), 1.0f);
+
+	phase = (float)rec->index * 0.1f;	/* real: 22e490, *(gp-32024) */
+	tofs = 2.0f*rec->progress*rec->f12;	/* real: 22e850/22e974 */
+
+	/* pass A - both pieces, colour = *(rec+0x120) */
+	MenuConfigBindFlow();			/* real: 0x22AB90(0, 0, 2) */
+	vif1SetZTest(0);			/* real: 0x22A0C0(0, 1) ALWAYS */
+	vif1SetAlphaBlend(1, 5, 128);		/* real: ALPHA_1 0x48, dead */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshReflPass(&rodModel, rec->colB, 1, 0);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshReflPass(&rodModel, rec->colB, 1, 0);
+
+	/* pass B - the emboss, textures swapped against the simple arm */
+	if(walk) {
+		MenuConfigBindBinv();		/* real: 0x22AB90(3, 1, 2) */
+		ofs = rodBumpOfs + phase;
+	} else {
+		MenuConfigBindBump();		/* real: 0x22AB90(2, 1, 2) */
+		ofs = phase;
+	}
+	vif1SetZTest(0);			/* real: 0x22A0C0(2, 1) ALWAYS */
+	vif1SetAlphaBlend(1, 6, 128);		/* real: ALPHA_1 0x42 */
+	MeshSelect(meshFaces, MESH_LOWER);
+	MeshBumpPass(&rodModel, rodFlowColor, 1, ofs, ofs, 0.1f);
+	MeshSelect(meshFaces2, MESH_UPPER);
+	MeshBumpPass(&rodModel, rodFlowColor, 1, ofs, ofs + tofs, 0.1f);
+
+	MeshSelect(meshFaces, MAXFACEMASK);
+}
+
 void
 MenuConfigFlushMesh(SceneRec *rec, int walk)
 {
@@ -1315,6 +1586,11 @@ MenuConfigFlushMesh(SceneRec *rec, int walk)
 	/* real: 22e484/22e48c - `scene->+0x6C < 0' returns immediately */
 	if(rec->progress < 0.0f)
 		return;
+
+	if(rec->f12 > 0.0f) {		/* real: 22e4b8/22e4d0, 0 < split */
+		MeshFlushSplit(rec, walk);
+		return;
+	}
 
 	MeshTransform(&rodModel, menuCamera, rec->world, 1.0f, rec->progress, 1.0f);
 	/* real: 22e4c4/22e4c8, *(gp-32020) = 0.9 - the same 0.9 MeshDrawRod
@@ -1523,11 +1799,10 @@ static int cubeSpin;		/* real: *(u16*)(gp-30432) */
  * so an unselected cube settles on a dim grey 100 and the cursor's one
  * drifts to the menu's blue-cyan, and the {128,128,128,128} in the .data
  * table is only where they start.  The bias is a KICK, not a constant:
- * 0x227C20 (the screen's CIRCLE arm) writes *(gp-32136) = -0.1 into the
- * cursor's entry, so the pressed cube shrinks 10 % and grows back as the
- * 0.95 decays it.  The port's confirm button is not wired, so nothing
- * seeds it yet and the resting scale is the timer ramp alone - but the
- * decay is here so that it will be right when it is.
+ * 0x227BE8's confirm arm writes *(gp-32136) = -0.1 into the cursor's
+ * entry, so the pressed cube shrinks 10 % and grows back as the 0.95
+ * decays it.  menutext.c's mode-1 confirm seeds it through
+ * MenuConfigCubeKick below.
  *
  * The +0x24 label alpha is deliberately NOT touched here: it is the 2D
  * item layer's, and menutext.c owns that side. */
@@ -1547,6 +1822,17 @@ void
 MenuConfigSetCursor(int n)
 {
 	cubeCursor = (u32)n < 5u ? n : 0;
+}
+
+/* real: 0x227BE8's confirm arm writes *(gp-32136) = -0.1 straight into
+ * the cursor's 0x27F090 entry at +0x20 (22c28: `swc1 $f0,32(v0)') - the
+ * pressed cube snaps 10 % smaller and 0x226BB8's 0.95 decay grows it
+ * back.  menutext.c's mode-1 confirm calls this. */
+void
+MenuConfigCubeKick(int n)
+{
+	if((u32)n < 5u)
+		cubeBias[n] = -0.1f;
 }
 
 /* real: 0x22EC60(dst, src, rate) for rate != 1 - four independent
@@ -1740,10 +2026,11 @@ MenuConfigAlpha(int fadeAlpha)
  * Everything the screen shows is switched on here: the Anim's duration
  * is recomputed from the three per-screen durations (0x227290: gp-30380
  * + gp-30400 + gp-30396 = 40+40+10 = 90 on NTSC), 0x22AEC8 closes the
- * screen at 0x27F620 (not ported), 0x2291E8 opens the backdrop's fade
- * timer and 0x225AD0 opens the carousel.  The cube timer is NOT opened
- * here - the state machine 0x227390 does that when the Anim's count
- * reaches gp-30380, and MenuConfigStateMachine now models that edge. */
+ * vignette timer at 0x27F620 (menu.c), 0x2291E8 opens the backdrop's
+ * fade timer and 0x225AD0 opens the carousel.  The cube timer is NOT
+ * opened here - the state machine 0x227390 does that when the Anim's
+ * count reaches gp-30380, and MenuConfigStateMachine now models that
+ * edge. */
 void
 MenuEnterConfig(void)
 {
@@ -1751,6 +2038,7 @@ MenuEnterConfig(void)
 		return;
 	cfgAnim.duration = cfgDur40b + cfgDur40 + cfgDur10;
 	cfgOpen(&cfgAnim);
+	MenuVignetteClose();		/* real: 0x22AEC8 at 0x2272B0 */
 	MenuBackFadeOpen();		/* real: 0x2291E8 */
 	CarouselOpen();			/* real: 0x225AD0 */
 	OSDDispatch(20992, 1, 4, 0);	/* real: the 0x2287A8 tail */
@@ -1776,7 +2064,7 @@ MenuLeaveConfig(void)
  *
  *   opening  count == gp-30380 (40)          open the cube timer (0x226B28)
  *   closing  duration-count == dur10 (10)    close the cube timer (0x226B70)
- *   closing  count == gp-30380+dur40 (80)    reopen 0x27F620 (0x22AE80, n/p)
+ *   closing  count == gp-30380+dur40 (80)    reopen the vignette (0x22AE80)
  *   closing  count == gp-30380 (40)          close the backdrop fade (0x229230)
  *   closing  count == gp-30372 (1)           close the carousel (0x225B68)
  *
@@ -1801,7 +2089,7 @@ MenuConfigStateMachine(void)
 	if(cfgAnim.duration - count == cfgDur10)
 		cfgClose(&cfgCubeTimer);	/* real: 0x227414 */
 	if(count == cfgDur40b + cfgDur40)
-		;				/* real: 0x227454, 0x22AE80 */
+		MenuVignetteOpen();		/* real: 0x227454, 0x22AE80 */
 	else if(count == cfgDur40b)
 		MenuBackFadeClose();		/* real: 0x227478, 0x229230 */
 	else if(count == cfgCarouselDur)
@@ -1869,8 +2157,9 @@ InitMenuConfig(void)
 	for(k = 0; k < 4; k++) {
 		ring[ringOffset].col0[k] = cfgColFront[k];
 		ring[ringOffset].col1[k] = cfgColRingB[k];
-		ringColA[k] = cfgColRingA[k];
-		ringColB[k] = cfgColRingB[k];
+		/* the record colours - see ringColA/ringColB's comment */
+		ringColA[k] = cfgColFixed[k];	/* real: 0x34E910 -> 0x34E940 */
+		ringColB[k] = cfgColRingA[k];	/* real: 0x34E920 -> 0x27EAE0 */
 	}
 
 	cubeSpin = 0;			/* real: 0x2284C4 */

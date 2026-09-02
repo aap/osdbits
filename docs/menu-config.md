@@ -4389,3 +4389,362 @@ vertex streams to REGLIST (retail's `nreg=14/12/10/6`) would roughly halve the
 payload and is the obvious next step if the frame ever gets tight again — but
 after this change the config screen has ~1/3 of a field of slack, so it is not
 urgent.
+
+
+---
+
+# The front rod's split arm, the vignette, and the config item editors
+
+Deliverables in this directory:
+
+* `splitarm.diff` — git-apply-able against `f9a8b46` (checked with
+  `git apply --check` on a clean worktree of that commit)
+* `osdbits/` — the patched tree it came from (builds clean, `main.elf` present)
+* `pristine/osdbits/` — an unmodified copy of the tip, used for every A/B run
+* `test_p2/` — a throwaway instrumented copy (scripted pad injection) used to
+  exercise the phase-2 interactive loop headlessly; NOT part of the diff
+* `dis_*.txt`, `base_*.log`, `new_*.log`, `p2_*.log`, `final_*.log` — the
+  disassembly extracts and the PCSX2 run logs cited below
+
+Everything below is from the ROM disassembly (`expanded.bin`, VAs = file
+offset + 0x200000, gp = 0x2AF070), live retail memory (the
+`20020207-164243 (00000000).0N.p2s` savestates), and the decoded retail GS
+dump `retail614.log`/`retail614v.log` in `tmp/gscmp/`.  Nothing is guessed;
+the few places where the port simplifies are called out as such.
+
+---
+
+# Phase 1a — the front rod's split arms (0x22D920's f12 > 0 arm, and 0x22E4D0)
+
+## What the split IS
+
+The front ring slot is the clock's **minute progress bar**.  Its `split`
+(record +0xF4) climbs from 0 by `*(gp-32164)` = 0.004/frame toward
+`1 - minutes/60` (0x225BF8), and once it is > 0 the rod is drawn as TWO
+pieces:
+
+* the **lower** piece at Y scale `progress * split`, in a bright cyan-white;
+* the **upper** piece at Y scale `progress * (1 - split)`, in the rod's own
+  body colour, its world matrix translated by `(0, 26 * progress * split, 0)`
+  **in the rod's local frame** (26 = the model height, so it sits exactly on
+  the cut).  The ROM does the translate by loading the matrix into the
+  0x230000 stack top (0x230180), calling 0x230440 (`mdTranslatef`) and
+  reading it back — the port does literally that with `mdTop`.
+
+Both `0x22D920` (the visible rod) and `0x22E428` (the deferred bloom) branch
+on `0 < split` at their heads (22d9b4/22d9cc and 22e4b8/22e4d0); the split
+arms are 0x22D9D4 and 0x22E4D0.  Each makes two 224-byte stack copies of the
+scene struct (`move a1,sp` — the "stack-built scene copy" the old Left-open
+note saw), patches them as below, transforms the lower into the face bank at
+**0x3529D0** and the upper into the second bank at **0x3555D0**
+(= 0x3529D0 + 32*352), and then runs the normal pass bodies with each pass
+walking both banks, lower first.
+
+## The face-index skips
+
+The rod model's sixteen faces are: 0–1 the flat top cap (y 26.39), 2–7 the
+bevel ring (26..26.39), 8–9 the bottom cap (y 0), 10–15 the six shaft sides
+(0..26).  Every split-arm loop skips fixed indices per piece:
+
+* lower: only faces **8..15** (`slti v0,s2,8` skips — bottom cap + shaft);
+* upper: everything **except 8 and 9** (`addiu v0,s2,-8; sltiu v0,v0,2` —
+  top cap + bevel + shaft).
+
+I.e. exactly "no cap at the cut".  Port: `meshFaces2[]` + a per-pass
+`meshBank`/`meshMask` pair (`MESH_LOWER` = 0xFF00, `MESH_UPPER` = ~0x0300)
+threaded through the five pass walkers; the per-face ST-phase step still
+counts the raw index i, culled and masked faces included, as the ROM does.
+
+## What the record feeds the two arms
+
+`0x225DD8` (the record appender) lays the record out as: +0x10 the 224-byte
+scene copy, +0xF4 split, +0x100 = `*(0x34E910)`, +0x110 = the aux int
+(100 for the front slot, 0 otherwise — 0x226028 passes `li a2,100`),
++0x120 = `*(0x34E920)`.  `0x2266E0` then calls
+`0x22D920(rec+0x10, rec+0x100, f12=rec->0xF4, f13=(float)rec->0x110)` and
+`0x2267E8` calls `0x22E428(rec+0x10, walk, f12=rec->0xF4, a2=rec+0x120)`.
+
+**The two colour qwords were mis-valued in the port.**  0x225878/0x225318
+ease 0x34E910 toward **0x34E940 = {167, 217, 255, 0}** (the fixed cyan-white,
+written in immediates at 22d8c8..22d8e8 — the same colour whose average with
+the body colour makes the front slot's col0) and 0x34E920 toward
+**0x27EAE0 = {0x3C, 0x3C, 0x3C, 0x80}**.  Live retail memory confirms both
+settled values in savestates .04 and .05 (they are zero in .02/.03 — the
+ring isn't built until the config screen runs).  The port had them as
+0x27EAE0/0x27EAF0's values; harmless before (nothing read `colA`/`colB`),
+load-bearing now.
+
+## The visible split arm (0x22D9D4), pass by pass
+
+Same five passes as the one-piece arm — same binds, targets and blend modes
+(22db44..22e0e0) — with each pass walking lower then upper.  The deltas
+against the one-piece pass bodies:
+
+* copy1 (lower): `+0x6C = progress*split` (22da74), `+0x80 = *(rec+0x100)`
+  = the bright {167,217,255,0} (22da7c), `+0x90 = f13 = (float)rec->0x110`
+  = **100** (22da70) — the lower piece's Fresnel size is half the upper's 200.
+* copy2 (upper): `+0x6C = progress*(1-split)` (22dab0); world translated as
+  above (22dabc..22db20); keeps the scene's own colour and size.
+* both pieces shrink toward the WHOLE rod's 0.9 refraction centre — every
+  0x22C888 call in both loops gets f12/f13 = the head's outX/outY
+  (sp+448/452).  (The origin is scale-invariant, so the port computes it
+  from the lower transform.)
+* the upper piece's emboss **T offset gains `2 * progress * split`**
+  (22dd58 `add.s f13,f13,f13` on copy1's +0x6C): the model V spans 0..2
+  scaled by +0x6C, so this makes the upper piece's TEXCBUMP phase continue
+  exactly where the lower piece's ends.  S is NOT offset.
+* the per-face ST steps are gp-32048/-32044/-32040/-32036 — read from the
+  image, all 0.1, same as the one-piece arm's gp-32032/-32028.
+
+Retail GS-dump evidence: in `retail614.log`'s object walk, D0066
+(`rgba=cfffff80`) and D0116 (`dfffff80`) are the lower piece's on-screen
+draws — 0xCF = 167 + a Fresnel bright of 40 with G and B saturated, which
+only the {167,217,255} base produces (every other rod saturates to
+`ffffff80`).
+
+Port: `MeshDrawRodSplit()` in menuconfig.c; `MenuConfigDrawMesh` dispatches
+on `rec->f12 > 0`.
+
+## The flush split arm (0x22E4D0) — the bloom-colour fix
+
+Same two copies, same skips, same upper-piece translate and T continuation
+(22e850/22e974), with three deltas of its own:
+
+1. **BOTH copies' +0xC0 — the colour 0x22CD78 stamps — become
+   `*(rec+0x120)` = {0x3C,0x3C,0x3C,0x80}** (22e580/22e5c0), not the slot's
+   own col1.  This is the whole answer to the Left-open item: retail's 86
+   flush draws are all `rgba=3c3c3c80` (retail614.log L9655..: 5–8 FST draws
+   per rod, 86 total, every one 3c3c3c80) even though the front slot's col1
+   is {0x80,0x80,0x80,0x1E} — because the front rod goes through THIS arm.
+   Since pass A (PRIM 276, no ABE) writes its alpha flat into wb4, the front
+   rod now also composites at As 0x80 instead of 0x1E — the "bloom at RGB
+   0x80, composite at As ~7" divergence is gone.
+2. pass A runs under `0x22A0C0(0,1)` = ALPHA_1 0x48 (22e674/22e688) where
+   the simple arm pushes (1,1) = 0x44 — both dead (PRIM 276 has ABE clear),
+   mirrored anyway.
+3. **the emboss textures are SWAPPED against the simple arm**: walk 1 binds
+   slot 3 = TEXCBINV (22e74c `li a0,3`) and walk 0 slot 2 = TEXCBUMP
+   (22e884 `li a0,2`), while the ST offset stays with the walk (walk 1 gets
+   scene->+0xB0 = -0.008, walk 0 gets 0) exactly as in the simple arm.
+   Net: the front rod uses the emboss pair in the opposite order — the sum
+   is the same, the sign of the surviving difference is not.
+
+0x22E4D0 takes no size argument and neither copy keeps the record's col1,
+so only progress, split, world and colB come out of the record.  The
+per-face steps gp-32016/-32012/-32008/-32004 are all 0.1.
+
+Port: `MeshFlushSplit()` in menuconfig.c, dispatched from
+`MenuConfigFlushMesh`.
+
+---
+
+# Phase 1b — the state-machine arm: 0x27F620 is the menu VIGNETTE
+
+The empty `count == cfgDur40b + cfgDur40` branch calls **0x22AE80**, which
+opens the timer at **0x27F620** (duration rate*80/60, set by 0x22AD38 with
+the other config durations; 0x22AD38's tail 0x22AC60 RESETS it to state 0).
+Its counterpart **0x22AEC8** — called at 0x2272B0, the second call of "enter
+System Configuration" — closes it.  Those are the only two edges in the
+image.
+
+What the timer gates: **0x22AF10**, run every frame from 0x22B020 (the
+0x21CF20 slot right after the object list 0x2268F0 and before the 2D hub
+0x2283F0 — the same function whose other half, 0x22AFB8, is the fade curtain
+the port already had).  0x22AF10:
+
+* writes the timer's interp (0x22AC20, 0..128) into the record at 0x27F670
+  as its alpha, rewrites the record's y centre as `(screenH/2)<<4` (its x
+  centre 4256 = 266 px and radii 1184/592 = 74/37 px are .data), and returns
+  without drawing while the timer is state 0;
+* otherwise draws a 16-segment TRISTRIP ring (PRIM 76 = TRISTRIP|IIP|ABE via
+  one REGLIST {PRIM} packet, template 0x27F2D0; then sixteen {RGBAQ,XYZF2}
+  REGLIST packets, template 0x27F2E0, six vertices each) of **BLACK**:
+  the inner pair on the (74,37) ellipse at alpha 0, the pair at 1.5x those
+  radii at the timer's alpha, and an outer pair at 10x, clamped to the frame
+  rectangle (0x229BC8/0x229C30 -> 0x229A70).  X uses sin, Y cos, angles
+  seg*4096 as shorts (0x229AA8/0x229B38 — centre + sin*r*scale + the
+  XYOFFSET-relative origin, one trunc).
+* state: ALPHA_1 0x44, TEST ZTST **GEQUAL**, Z = 0 (rec +0x14), ZMSK 0,
+  FRAME **inherited** — no drawenv push; it draws into whatever 0x2267E8's
+  tail left bound, the screen with no half pixel.
+
+Under 0x44 that multiplies everything outside the ellipse toward black — a
+**vignette around the menu's centre** at (266, h/2).  The GEQUAL-with-Z=0
+test is NOT much of a gate in practice: SceneFlush's full-screen clears and
+composites (all ZTST-ALWAYS sprites at z=0 with ZMSK 0) have already reset
+the Z buffer by this point in the frame, so the vignette lands on the whole
+scene, rods and orbs included.  It is skipped while a module fade runs
+(0x22AD30's word — the same gate the curtain uses on the other branch).
+
+The choreography this completes:
+
+* fresh boot -> main menu: timer state 0, **vignette never drawn** (the
+  backdrop is black anyway);
+* enter System Configuration: 0x22AEC8 -> the (open, if it was) vignette
+  lifts over 80 frames as the tunnel fades in;
+* leave: at Anim count 80 the state machine's 0x22AE80 re-opens it — the
+  tunnel (which takes another 40+40 frames to fade out) is masked back down
+  to black around the menu centre while the carousel folds;
+* thereafter the main menu keeps the vignette at 128, i.e. the post-config
+  main menu is "black with a pool of light at the centre".
+
+Port: `MenuVignette()`/`DrawVignette()`/`MenuVignetteOpen`/`MenuVignetteClose`
+in menu.c (the timer lives with the fade code, as in the ROM);
+`MenuEnterConfig` calls the close, the state-machine branch the open; the
+draw sits between `SceneFlush()` and `MenuZoomBlur()` — the ROM's slot, so
+the blur softens the vignette's edge as retail does.  The fade curtain keeps
+its documented (commutative) late position.
+
+**Verification** (windowless PCSX2, :93, headless ASCII maps):
+
+* main-menu regression `menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`:
+  28-line map **byte-identical** to the pristine f9a8b46 build (the vignette
+  timer is state 0 on that path, the split never grows there).
+* config regression `menu 18 27 45 0 1 128 145 0 0 0 10 0 1 0 1`: the map
+  changes ONLY in the front rod's cells (rows 21–25, cols ~33–38): the lower
+  ~55 % of the rod brightens (`##*` -> `%%#`/`@%%`) — the split's bright
+  lower piece plus the 4x-stronger bloom, exactly the localized change the
+  port was missing.  `base_config.log` vs `final_config.log`.
+* vignette, exercised with the argv pad stand-ins (enter frame 1, leave
+  frame 100, dump frame 160 — a leave at 60 does nothing, the Anim is still
+  opening; it must be state 2, i.e. past frame 91): pristine shows the
+  still-fading tunnel across the whole map; patched shows it masked to black
+  everywhere outside an ellipse around (266, 112), the centre surviving
+  through the alpha ramp.  `base_leave2.log` vs `new_leave2.log`.
+* zero `does not terminate` / VIF errors in any run.
+
+Left open from phase 1 (small, listed for honesty):
+
+* the vignette record's static x centre 266 is left-of-centre on a 640-wide
+  frame (the ROM hardcodes `li a2,4256` while computing y from the live
+  height) — reproduced verbatim, worth eyeballing against real hardware;
+* the keyframe cyclers 0x225528/0x2255A8 that animate 0x27EAC0 and 0x34E940
+  around their idle values are still not ported (pre-existing gap; the live
+  .04 ring shows body G mid-swing at 0x60 vs the idle 0x55);
+* 0x22D920's `MeshDebug` diagnostic only reports the lower bank in the split
+  path.
+
+---
+
+# Phase 2 — the config item editors (mode 1)
+
+## The ROM mechanism
+
+The 56-byte item records at 0x27BD10 carry SIX callbacks:
+
+| offset | clock (item 0) | items 1–3 | item 4 (Language) | role |
+|---|---|---|---|---|
+| +0x14 | 0x21DF28 | 0x21EE50 | 0x21EE50 | confirm-OPEN (mode 0 -> 1) |
+| +0x18 | 0x21E350 | 0x21EE78 | 0x21EE78 | mode-0 value row |
+| +0x1C | 0x21EA20 | 0x21F080 | 0x21F168 | mode-1 widget (draw AND pad) |
+| +0x20 | 0x21EAE0 | 0x21EBC8/0x21EC08/0x21EC98 | 0x21ECD8 | confirm-APPLY |
+| +0x24 | 0x21EB30 | 0x21F158 (nop) | 0x21F158 | cancel |
+| +0x28 | 0x21EB80 | 0x21F160 (nop) | 0x21F160 | focus notify |
+
+0x227D08 (the 0x227DE8 tail) dispatches the pad by the header's mode:
+0x2279B8 for 0, 0x227BE8 for 1.  Mode 0's confirm (edge bit 0x20) runs the
++0x14, zeroes the marker phase (0x27BE5C) and sets mode 1.  Mode 1's confirm
+writes `*(gp-32136)` = **-0.1 into the cursor's 0x27F090 cube entry at
++0x20** (the pressed cube shrinks 10 % and the 0.95 decay regrows it), runs
+the +0x20 and drops to mode 0 (a special `*(0x1F00B0)==5 && *(0x1F00A4)==18`
+arm — "launched from a game to set the clock" — picks mode 2 instead; not
+ported); cancel (bit 0x40) runs the +0x24.  The **left/right value stepping
+is NOT in the pad handler** — each +0x1C widget polls gp-30316 itself, from
+inside the draw path, gated on the 0x27EC40 timer being idle (never opened
+by anything the port models; gate dropped).
+
+The settings live in the block at **0x352880** (`0x22B0E8(n)` returns
+`&block[n]`): 0 screen size, 1 digital out, 2 component out, 3 language,
+6..11 the clock's Y/M/D/h/m/s.  The mode-1 widgets write the live setting
+**every frame while scrolling** — a value is previewed the moment it is
+highlighted, and the value items' +0x24 cancel is a genuine nop, so a
+previewed value survives cancel (re-opening re-syncs the index from the live
+setting via 0x21EDB8).  The +0x20 callbacks compare the live value against
+the persisted copy (0x203690/0x203658/0x2036F8/0x2040D0) and call 0x22B3F8 —
+the NVRAM save — only on a change; digital out additionally posts 20/21 into
+`*(0x1F00B4)` (the IOP S/PDIF message).
+
+The value list drawer 0x21EF00 draws ALL of an item's values on one row,
+centred as a whole, separated by the " " at 0x2A7888, the current one in
+0x27B830 (the selected blue) and the rest in 0x27B840 (the dark grey).
+
+**Language** has no list in .data: **0x21ED18**, called from the per-screen
+init 0x228460 (0x2284D4), wires the region's table into items[4] —
+region 0 gets 0x27B8C0 ({Japanese, English}, count 2), regions 1/2 the seven
+European languages at 0x27B920/0x27BA70 ({English..Portuguese}, values 1..7).
+Its widget 0x21F168 shows only the current name and slides the old one out
+(gp-30676, ±150 px decaying a sixth per frame, drawn by 0x21F3A8).
+
+**Clock Adjustment**: +0x14 (0x21DF28) fades the orb trails down (0x22EF90
+closes the 0x27F900 trail timer — a teleporting orb with a live trail would
+smear), freezes the tick (gp-30328 via 0x22B960), snapshots the RTC into
+settings 6..11 and seeds the soft clock from them (0x22B8E8).  The mode-1
+widget 0x21EA20 draws the row via 0x21E3B0 (= the 0x21DFF8 drawer with
+edit=1: the field under the cursor in 0x27B830, the rest in 0x27B840), runs
+0x21E870 — left/right move the field cursor (kept in the item's +0x08!),
+up/down (from gp-30308, the held-repeat word) step the field through its
+0x27B870 {setting, min, max} range ({6,2000,2099} {7,1,12} {8,1,31} {9,0,23}
+{10,0,59} {11,0,59}) with wraparound, 0x21E3B8 re-clamping the calendar
+after every step (epoch conversion between 2000-01-01 and 2099-12-31 via
+0x20ABB0/0x20B028) — and reseeds the soft clock EVERY frame, which is what
+makes the carousel follow the edit live.  Apply (0x21EAE0) calls **0x22B2A8,
+the CDVD RTC write**, unfreezes, fades the trails back up (0x22EF30) and
+restores the hint bar; cancel (0x21EB30) re-reads the real RTC (0x22B838)
+instead.  During the edit the hint bar is 0x21D768(1, 85, 86, 1) with mask
+0xF000 (the outer slots carry the empty string 1).
+
+## What the port does (menutext.c, + small hooks in menu.c/menuconfig.c)
+
+The full minimal loop — enter item -> change value -> confirm/cancel — for
+all five items, structured like the ROM (ConfigItem grows the +0x1C `edit`
+member; the widgets own their pad input; ConfigMenuInput carries only the
+two handlers' confirm/cancel arms):
+
+* `cfgSettings[16]` stands in for 0x352880, `cfgPersisted[4]` for the NVRAM
+  copy; `ConfigItemApply` prints `config save: setting N = V ("...")
+  (stubbed)` on a change (plus `digital out message 20/21 (stubbed)` for
+  item 2) — **no hardware side effects**;
+* `EditItemValue` = 0x21EF00+0x21F080 (full row, selected blue vs dark grey,
+  live setting write, dirPress left/right whose held-repeat matches the
+  ROM's gp-30316);
+* `EditItemLang` = 0x21F168 minus the slide (current name only, centred);
+  the seven-language table is wired in InitMenuText as 0x21ED18 does for
+  regions 1/2;
+* the clock editor: `ClockEditOpen/Input/Apply/Cancel` + `DrawClockRow`'s
+  edit colours.  **The RTC write is a printf stub**
+  (`clock adjustment: set YYYY/MM/DD hh:mm:ss (RTC write stubbed)`) — aap
+  decides about hardware side effects; the soft clock keeps the edited time
+  (and the port's stand-in date cell) either way.  Cancel restores the
+  pre-edit snapshot (the port has no RTC to re-read).  The calendar clamp is
+  simplified to days-in-month (+leap): the day wraps against the real month
+  length and shrinks when a month/year step leaves it over — same visible
+  behaviour as the ROM's epoch clamp inside the 0x27B870 ranges;
+* menu.c grows `MenuClockHold/Set/Get` (gp-30328 / 0x22B8E8's h-m-s third)
+  and `MenuOrbTrailFade` (0x22EF90/0x22EF30, including the turn-a-close-
+  into-an-open arm); menuconfig.c grows `MenuConfigCubeKick` (the -0.1 cube
+  press kick, now actually fired by the confirm).
+
+Verified headlessly with a scripted-pad throwaway build (`test_p2/`,
+inject.c — presses at fixed frames; not in the diff): open/apply/cancel on
+value items and the clock, cursor wrap, live-preview-survives-cancel
+(re-open resyncs to the previewed value, as in the ROM), the German apply
+(`config save: setting 3 = 4 ("German")`), the clock freeze (apply printed
+18:27:47 = the argv clock + 2 s of pre-open runtime, frozen through the
+edit), and the Feb-2000 day wrap (1 -> down -> 29 -> up -> 1).  Both
+regression maps re-checked byte-identical after phase 2 (`p2_mainmenu.log`,
+`p2_config.log`, `final_*.log`).
+
+## Phase-2 polish not ported (each small, none load-bearing)
+
+* the language slide animation (0x21F3A8: ±150 px, marker glyph 61);
+* the 0x27EC40 gate and mode 2 (the "launched to set the clock" path);
+* gp-30352 / 0x22B138 (the hint-refresh word behind 0x22B100/0x22B108/
+  0x22B118) — the port's widgets set their hints directly;
+* gp-30428 (0 while editing the clock, float 1.0 after — some drawer-side
+  blink/factor; consumer not traced);
+* 0x21DDC0 (the idle re-sync of settings 6..11 from the soft clock — the
+  port's mode-0 row reads the clock directly);
+* the ROM's mode-0 leave oddity: 0x2279B8's bit-0x10 arm closes the Anim
+  only when the CURSOR is 0 (`lw v1,16(s0); bnez v1,skip`), and bits
+  0x40/0x80 jump to 0x227338/0x227028 (other top-level screens).  The port
+  keeps its existing leave-on-TRIANGLE-from-anywhere.

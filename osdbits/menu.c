@@ -66,10 +66,44 @@ float MenuClockHours(void)   { return clockHour + MenuClockMinutes()/60.0f; }
 #define ClockMinutes MenuClockMinutes
 #define ClockHours MenuClockHours
 
+/* real: gp-30328, 0x22B950 (set) / 0x22B960 (clear).  The Clock
+ * Adjustment editor clears it on entry (0x21DF28) and both leaving paths
+ * set it back (0x21EAE0 / 0x21EB30); while it is clear the editor
+ * reseeds the block every frame from its six fields (0x21EA20's tail
+ * 0x22B8E8), so the tick must not fight it. */
+static int clockHold;
+
+void
+MenuClockHold(int hold)
+{
+	clockHold = hold;
+}
+
+/* real: the h/m/s third of 0x22B8E8 - reseed the soft clock (the ROM's
+ * block also carries the date; this port's clock does not) */
+void
+MenuClockSet(int h, int m, int s)
+{
+	clockHour = h % 24;
+	clockMin = m % 60;
+	clockSec = s % 60;
+	clockMs = 0.0f;		/* real: `sw zero,10624(v0)', the block's +0 */
+}
+
+void
+MenuClockGet(int *h, int *m, int *s)
+{
+	*h = clockHour;
+	*m = clockMin;
+	*s = clockSec;
+}
+
 /* real: 0x22BB30's ms integration, minus the RTC resync */
 static void
 ClockTick(void)
 {
+	if(clockHold)		/* real: gp-30328 == 0, the editor owns it */
+		return;
 	clockMs += IsPAL() ? 1000.0f/50.0f : 1000.0f/59.94f;
 	while(clockMs >= 1000.0f) {
 		clockMs -= 1000.0f;
@@ -384,6 +418,16 @@ TimerOpen(Timer *t)		/* real: 0x22AC70 */
 }
 
 static void
+TimerClose(Timer *t)		/* real: 0x22AC90 */
+{
+	if(t->state == 2) {
+		t->edge = 1;
+		t->count = t->duration;
+		t->state = 3;
+	}
+}
+
+static void
 TimerStep(Timer *t)		/* real: 0x22ACC0 */
 {
 	t->edge = 0;
@@ -398,6 +442,24 @@ TimerStep(Timer *t)		/* real: 0x22ACC0 */
 			t->state = 0;
 		}
 	}
+}
+
+/* real: 0x22EF90 (down) / 0x22EF30 (up) on the trail timer 0x27F900.
+ * The Clock Adjustment editor fades the orb trails out on entry -
+ * setting the clock teleports every orb, and a teleporting orb with a
+ * live trail smears across the screen - and back in on apply/cancel;
+ * 0x22EF30 also turns a still-running close into an open. */
+void
+MenuOrbTrailFade(int up)
+{
+	if(!up) {
+		TimerClose(&orbTrailTimer);
+		return;
+	}
+	if(orbTrailTimer.state == 0)
+		TimerOpen(&orbTrailTimer);
+	else if(orbTrailTimer.state == 3)
+		orbTrailTimer.state = 1;
 }
 
 /* ==================== the screen fade (0x22ADD8) ====================
@@ -418,6 +480,7 @@ TimerStep(Timer *t)		/* real: 0x22ACC0 */
  * runs on every entry - which is why menuFade{Mode,Alpha} start armed. */
 static int menuFadeMode;	/* real: *(gp-28828), 0x22AD30() */
 static int menuFadeAlpha;	/* real: *(gp-28824), 0x22AD28() */
+static Timer vigTimer;		/* real: 0x27F620 - see the vignette block */
 /* real 0x27F630, the curtain's colour record: 0x22ADD8 sets it black
  * for modes 2/3/4 and white for mode 1 */
 static int menuFadeColor[3];
@@ -1193,6 +1256,12 @@ InitMenuScene(void)
 	orbTrailTimer.duration = (fps<<8)/60;
 	TimerOpen(&orbTrailTimer);
 
+	/* real: 0x22AD38 - the vignette timer's duration (rate*80/60, also
+	 * *(gp-30376)) and its 0x22AC60 reset: it starts IDLE, and only the
+	 * System Configuration edges ever open or close it */
+	memset(&vigTimer, 0, sizeof(vigTimer));
+	vigTimer.duration = fps*80/60;
+
 	/* real: 0x21CE58's last call, 0x22ADD8(2) - arm the fade up from
 	 * black, which is also what drives the orbs' entry fly-in.  argv[5]
 	 * can start it part-way (128 = skip the entry entirely). */
@@ -1205,6 +1274,148 @@ InitMenuScene(void)
 	InitMenuConfig();
 
 	SceneReset();
+}
+
+/* ============ the menu vignette (0x27F620 / 0x22AF10) ============
+ *
+ * The 0x27F620 timer (duration rate*80/60, set with the config-screen
+ * durations by 0x22AD38) gates a stage the port was missing: 0x22AF10,
+ * run every frame from 0x22B020 (the 0x21CF20 slot right after the
+ * object list, before the zoom blur), draws a 16-segment TRISTRIP ring
+ * of BLACK at the timer's interp as its alpha - transparent on an
+ * ellipse of radii (74, 37) px around (266, screenH/2) (the record at
+ * 0x27F670: x centre 4256 and radii 1184/592 in 12.4, y centre rewritten
+ * as (h/2)<<4 every frame), opaque from 1.5x those radii out to the
+ * screen edge (the 10x ring, clamped to the frame by 0x229BC8/0x229C30).
+ * Under ALPHA_1 0x44 that multiplies everything OUTSIDE the ellipse
+ * toward black - a vignette around the menu's centre - and under ZTST
+ * GEQUAL with Z = 0 it only lands where the Z buffer is still empty, so
+ * the orbs and rods punch through and only the BACKDROP is masked.
+ *
+ * The timer is the two config-screen edges this port left empty:
+ * "enter System Configuration" (0x2272B0) closes it - the mask lifts
+ * over 80 frames as the tunnel fades in - and the closing state
+ * machine's count == gp-30380 + gp-30400 arm (0x227454, 0x22AE80)
+ * reopens it, masking the tunnel back out around the menu while it
+ * shrinks.  0x22AD38 leaves it RESET (state 0), and 0x22AF10 draws
+ * nothing while it is idle - on a fresh boot the main menu never shows
+ * it (the backdrop is black anyway); it only ever runs after System
+ * Configuration has been visited.
+ *
+ * 0x22B020 skips the draw while a module fade is running (0x22AD30's
+ * mode word) but STEPS the timer regardless. */
+
+void
+MenuVignetteOpen(void)		/* real: 0x22AE80 */
+{
+	TimerOpen(&vigTimer);
+}
+
+void
+MenuVignetteClose(void)		/* real: 0x22AEC8 */
+{
+	TimerClose(&vigTimer);
+}
+
+/* real: 0x229AA8 / 0x229B38 - one 12.4 coordinate on the (74, 37) px
+ * ellipse, scaled by s.  The ROM keeps the centre and radii in the
+ * 0x27F670 record (4256, (h/2)<<4, 1184, 592) and adds the frame's
+ * XYOFFSET-relative origin as a float before one trunc. */
+static int
+VigX(int a, float s)
+{
+	return (int)(4256.0f + sinf(MDANGLE((short)a))*1184.0f*s +
+		(float)((2048 - screenW/2)<<4));
+}
+
+static int
+VigY(int a, float s)
+{
+	return (int)((float)((screenH/2)<<4) + cosf(MDANGLE((short)a))*592.0f*s +
+		(float)((2048 - screenH/2)<<4));
+}
+
+/* real: 0x229BC8 / 0x229C30 - the outer ring: 10x the radii, clamped to
+ * the frame rectangle */
+static int
+VigXc(int a)
+{
+	int lo = (2048 - screenW/2)<<4;
+
+	return clamp(VigX(a, 10.0f), lo, lo + (screenW<<4));
+}
+
+static int
+VigYc(int a)
+{
+	int lo = (2048 - screenH/2)<<4;
+
+	return clamp(VigY(a, 10.0f), lo, lo + (screenH<<4));
+}
+
+/* real: 0x229C98's per-vertex pair - RGBAQ {0,0,0,a} with Q = 1.0, then
+ * the XYZF2 at rec+0x14 = z = 0 */
+static void
+VigVertex(int a, int x, int y)
+{
+	pktSetAD(SCE_GS_RGBAQ, SCE_GS_SET_RGBAQ(0, 0, 0, a, 0x3f800000));
+	pktSetAD(SCE_GS_XYZF2, SCE_GS_SET_XYZF(x, y, 0, 0));
+}
+
+/* real: 0x22AF10.  FRAME is inherited - the ROM pushes no drawenv here,
+ * it draws into whatever 0x2267E8's tail left bound, which is the screen
+ * with no half pixel (0x22C020(1,0,0)); MenuBackFlushOver leaves exactly
+ * that.  Runs BEFORE the zoom blur, so the vignette's edge is softened
+ * with the rest of the frame. */
+static void
+DrawVignette(void)
+{
+	int a, seg, ang, ang2;
+
+	/* real: 0x22AC20(0x27F620, 128), stored to the record even while
+	 * the timer is idle */
+	a = TimerInterp(&vigTimer, 128);
+	if(vigTimer.state == 0)		/* real: 0x22AC48(t, 0) at 22af68 */
+		return;
+
+	vif1SetZWrite(1);		/* ZMSK 0, as everywhere in the menu */
+	vif1SetZTest(1);		/* real: 0x22A0C0(1, 2) ZTST GEQUAL */
+	vif1SetAlphaBlend(1, 4, 128);	/* real: ALPHA_1 0x44 */
+
+	/* real: 0x229A18 - one REGLIST {PRIM} packet, PRIM = 76 =
+	 * TRISTRIP | IIP | ABE.  The sixteen segment packets that follow
+	 * carry only {RGBAQ, XYZF2} pairs (template 0x27F2E0), so the strip
+	 * runs on across them. */
+	vif1Begin();
+	pktSetAD(SCE_GS_PRIM, SCE_GS_SET_PRIM(SCE_GS_PRIM_TRISTRIP, 1, 0, 0,
+		1, 0, 0, 0, 0));
+	vif1End();
+
+	/* real: 0x22A030's loop, angle += 4096 while <= 0xFFFF - sixteen
+	 * segments, six vertices each: the transparent inner ring pair, the
+	 * full-alpha 1.5x pair, and the clamped outer pair */
+	for(seg = 0; seg < 16; seg++) {
+		ang = seg<<12;
+		ang2 = ang + 4096;
+		vif1Begin();		/* real: one 0x2293E0 packet each */
+		VigVertex(0, VigX(ang, 1.0f), VigY(ang, 1.0f));
+		VigVertex(0, VigX(ang2, 1.0f), VigY(ang2, 1.0f));
+		VigVertex(a, VigX(ang, 1.5f), VigY(ang, 1.5f));
+		VigVertex(a, VigX(ang2, 1.5f), VigY(ang2, 1.5f));
+		VigVertex(a, VigXc(ang), VigYc(ang));
+		VigVertex(a, VigXc(ang2), VigYc(ang2));
+		vif1End();
+	}
+}
+
+/* real: 0x22B020's 0x27F620 half - step, then draw unless a module fade
+ * is running (0x22AD30; the fade curtain half is DrawFadeCurtain below) */
+static void
+MenuVignette(void)
+{
+	TimerStep(&vigTimer);		/* real: 0x22ACC0 at 22b02c */
+	if(menuFadeMode == 0)		/* real: 22b03c `bnez v0' */
+		DrawVignette();
 }
 
 /* real: 0x22AFB8 - the whole-screen fade curtain, normal alpha blend,
@@ -1232,7 +1443,7 @@ DrawFadeCurtain(void)
  *   0x21CFD8  camera + projection                        [ported]
  *   0x21D0A0  zoom-blur composite + full-screen blit     [deferred]
  *   0x2268F0  reset / carousel fly-in / orbit / draw / flush
- *   0x22B020  the fade curtain (0x22AFB8)                [ported]
+ *   0x22B020  the vignette (0x22AF10) + fade curtain (0x22AFB8) [ported]
  *   0x2283F0  per-screen UI init hub                     [not scene]
  *   0x21D368  letterbox, 0x21D3A0/0x21DA68/0x21DB18 UI   [not scene]
  *   0x225BF8  the fly-in carousel timer                  [ported]
@@ -1287,6 +1498,10 @@ MenuFrame(void)
 	 * is the wb4 clear and two additive composites of a black buffer -
 	 * exactly as in the ROM, and exactly as invisible. */
 	SceneFlush();
+	/* real: 0x22B020's first half (0x22ACC0 + 0x22AF10) - the vignette,
+	 * in the ROM's own slot between the object list and the zoom blur.
+	 * Its curtain half (0x22AFB8) stays below as DrawFadeCurtain. */
+	MenuVignette();
 	/* real: 0x2283D0, the FIRST thing stage 5 (0x2283F0) does, before any
 	 * of the 2D layer: 0x22C3C0(phase - 5), which is 0x22C3C0(5) in the
 	 * idle menu.  Five bilinear shrink/stretch round trips over the whole

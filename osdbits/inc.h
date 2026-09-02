@@ -173,11 +173,21 @@ void SceneAddMesh(sceVu0FMATRIX world, int slot, float progress, float size,
 	float split, const int *col0, const int *col1,
 	const int *colA, const int *colB, int aux);
 
+/* menu.c's vignette timer 0x27F620 - the two System Configuration edges
+ * that drive it (see menu.c's vignette block) */
+void MenuVignetteOpen(void);	/* real: 0x22AE80 */
+void MenuVignetteClose(void);	/* real: 0x22AEC8 */
+
 /* menu.c's software clock (real: the 0x352980 block's accessors
  * 0x22B5E8 / 0x22B6B0 / 0x22B720) */
 float MenuClockSeconds(void);
 float MenuClockMinutes(void);
 float MenuClockHours(void);
+/* the Clock Adjustment editor's hooks on it (menutext.c) */
+void MenuClockHold(int hold);	/* real: gp-30328, 0x22B950/0x22B960 */
+void MenuClockSet(int h, int m, int s);	/* real: 0x22B8E8's h/m/s third */
+void MenuClockGet(int *h, int *m, int *s);
+void MenuOrbTrailFade(int up);	/* real: 0x22EF30 (up) / 0x22EF90 (down) */
 
 /* menu.c's matrix layer, in plain C because freesce's libvu0 is broken
  * (see the header comment there); the camera and view-screen matrices
@@ -208,6 +218,7 @@ int MenuConfigOpen(void);
 int MenuConfigAlpha(int fadeAlpha);
 int MenuConfigItemPos(int i, float *x, float *y);
 void MenuConfigSetCursor(int n);
+void MenuConfigCubeKick(int n);	/* real: 0x227BE8's *(gp-32136) = -0.1 */
 
 /* ---- menutext.c: the readback diagnostic, run from DoMenuScene's
  * post-swap window ---- */
