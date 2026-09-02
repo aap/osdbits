@@ -1691,6 +1691,38 @@ CarouselClock(void)
 	ringSplitMax = 1.0f - MenuClockMinutes()*(1.0f/60.0f);
 }
 
+/* real: 0x225318 - the per-frame colour spreader.  Every frame it
+ * repaints the whole ring from the current ringOffset: the eleven plain
+ * slots get the body/edge pair (0x27EAC0 / 0x27EAD0) and the front slot
+ * (i == ringOffset) gets the bright front blend and col1 (0x27EAF0).
+ * InitMenuConfig only seeded the INITIAL front slot, so once an hour step
+ * moved ringOffset the old rod kept its bright colour while the new rod
+ * got only the split - two highlighted rods.  (The keyframe cyclers
+ * 0x225528 / 0x2255A8 that animate the four vectors over 8 entries are
+ * not ported; the idle values are spread directly.)  The tail eases the
+ * record colours ringColA -> cfgColFixed and ringColB -> cfgColRingA,
+ * which InitMenuConfig already parks on their targets, so idle it is a
+ * no-op. */
+static void
+CarouselColors(void)
+{
+	int i, k;
+
+	for(i = 0; i < NRING; i++)
+		for(k = 0; k < 4; k++)
+			if(i == ringOffset) {
+				ring[i].col0[k] = cfgColFront[k];
+				ring[i].col1[k] = cfgColRingB[k];
+			} else {
+				ring[i].col0[k] = cfgColBody[k];
+				ring[i].col1[k] = cfgColEdge[k];
+			}
+	for(k = 0; k < 4; k++) {
+		ringColA[k] = cfgColFixed[k];
+		ringColB[k] = cfgColRingA[k];
+	}
+}
+
 /* real: 0x225BF8 - stage 10 of the frame body.  Steps the carousel
  * timer, re-derives the clock angles (0x225978 -> 0x225628, 0x225878)
  * and refreshes every slot's progress from the timer. */
@@ -1701,6 +1733,7 @@ MenuConfigCarousel(void)
 
 	cfgStep(&carouselTimer);
 	CarouselClock();
+	CarouselColors();	/* real: 0x225318 - re-front the bright colours */
 
 	for(i = 0; i < NRING; i++) {
 		if(i != ringOffset)
