@@ -1,0 +1,5 @@
+# matrixdrive2.c - the RotY/RotZ rotators.  name va size (hex).
+# Bounds from the disassembly (0x230328 runs to 0x2303e4, the nop at
+# 0x2303e4 is alignment padding).
+MatrixDrive_RotY	0x230260 0xc8
+MatrixDrive_RotZ	0x230328 0xbc
