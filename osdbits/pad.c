@@ -223,6 +223,12 @@ static int padLogConn = -1;
 static void
 PadLog(int state, int mode)
 {
+	/* the warm-up logs every frame for PADLOGFRAMES - fine for a debug
+	 * run, but on PCSX2 a per-frame SIF-console printf wrecks the frame
+	 * rate, so gate on the debug arg (OsdArgInt(6), 0 on a normal boot).
+	 * InitPad's one-time status lines are not gated and still print. */
+	if(!osdTrace)
+		return;
 	printf("pad: state %d mode 0x%02x conn %d btns %04x dirs %04x "
 		"L %d,%d R %d,%d\n",
 		state, mode, pad.connected, pad.btns, pad.dirs,

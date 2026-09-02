@@ -41,6 +41,12 @@ int osdBootParam2 = 0;
  * it defaults to the normal fresh-boot value 1, which BootSoundStart
  * (opening.c) turns into the SNDBOOTS chime.  4 would be the warning. */
 int osdBootSound = 1;
+/* NOT original: gates the per-frame/per-event diagnostic printfs (the
+ * sound dispatches, the pad log, the menu echoes).  Set by ParseArgs from
+ * the debug arg OsdArgInt(6); 0 on a normal boot, so those printfs - each
+ * one an expensive SIF-console flush on PCSX2 - stay off unless a debug
+ * run asked for them.  The one-time startup/health lines are not gated. */
+int osdTrace = 0;
 int HasDisc(void) { return discReady != 0; }
 int GetDiscType(void) { return discType; }
 int BootLatchClear(void) { return bootLatch == 0; }

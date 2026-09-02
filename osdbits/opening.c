@@ -3373,6 +3373,12 @@ ParseArgs(void)
 			}
 	}
 	printf("osdsys: mode %s\n", modeNames[openingMode]);
+	/* cache the debug knob now that argBase is final - the sound/pad
+	 * diagnostic printfs gate on it, and some (the SPU upload) run from
+	 * SoundInit BEFORE this point, so reading OsdArgInt(6) there would see
+	 * the wrong argBase.  Default 0 keeps those pre-args prints (and a
+	 * normal boot) silent. */
+	osdTrace = OsdArgInt(6, 0);
 }
 
 /* the numeric-argument accessors, for modes that parse their own args

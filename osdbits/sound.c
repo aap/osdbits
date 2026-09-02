@@ -128,7 +128,12 @@ SndRpc(int msg, int a, int b, int c)
 void
 OSDDispatch2(int x, int msg, int a, int b, int c)
 {
-	printf("osd: dispatch2(%d, %d, %d, %d, %d)\n", x, msg, a, b, c);
+	/* diagnostic only, and each SIF-console printf is expensive on PCSX2
+	 * - gate on the debug arg (OsdArgInt(6), 0 on a normal boot) so the
+	 * reverb-depth ramp (120 of these in the first second) and every
+	 * later message stay silent unless a debug run asked for them. */
+	if(osdTrace)
+		printf("osd: dispatch2(%d, %d, %d, %d, %d)\n", x, msg, a, b, c);
 	if(sndBound)
 		SndRpc(msg, a, b, c);
 }
@@ -171,7 +176,8 @@ OSDDispatch(int msg, int a, int b, int c)
 {
 	int i;
 
-	printf("osd: dispatch(%d, %d, %d, %d)\n", msg, a, b, c);
+	if(osdTrace)	/* debug-only, see OSDDispatch2 */
+		printf("osd: dispatch(%d, %d, %d, %d)\n", msg, a, b, c);
 	qLock = 1;
 	if(qWrite - qRead < SNDQLEN) {
 		i = qWrite % SNDQLEN;

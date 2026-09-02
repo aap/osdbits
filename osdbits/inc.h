@@ -94,6 +94,7 @@ extern int osdBootParam;
 extern int osdBootParamC;
 extern int osdBootParam2;
 extern int osdBootSound;
+extern int osdTrace;	/* gates the diagnostic printfs; see main.c */
 int HasDisc(void);
 int GetDiscType(void);
 int BootLatchClear(void);

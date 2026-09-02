@@ -1472,8 +1472,9 @@ ConfigMenuInput(void)
 		configMenu.phase = 0;		/* real: 0x21EE50's 0x27BE5C */
 		configMenu.mode = 1;
 		cfgClick(4);
-		printf("osdsys: config item %d (\"%s\") opened\n", configCursor,
-			osdGetString(it->strid));
+		if(osdTrace)	/* debug echo, silent on a normal boot */
+			printf("osdsys: config item %d (\"%s\") opened\n", configCursor,
+				osdGetString(it->strid));
 	} else if(pad.press & PAD_CROSS) {	/* the cancel button, 0x40 */
 		MenuLeaveConfig();	/* real: 0x227338 - close the Anim */
 		cfgClick(10);		/* real: 0x227338's 0x2287A8 tail */
@@ -2072,13 +2073,14 @@ MainMenuInput(void)
 		mainMenu.cursor++;
 		moved = 1;
 	}
-	if(moved)
+	if(moved && osdTrace)
 		printf("menu: cursor %d (\"%s\")\n", mainMenu.cursor,
 			osdGetString(mainMenu.items[mainMenu.cursor].strid));
 
 	if(pad.press & (PAD_CROSS|PAD_CIRCLE)) {
-		printf("menu: select item %d (\"%s\")\n", mainMenu.cursor,
-			osdGetString(mainMenu.items[mainMenu.cursor].strid));
+		if(osdTrace)
+			printf("menu: select item %d (\"%s\")\n", mainMenu.cursor,
+				osdGetString(mainMenu.items[mainMenu.cursor].strid));
 		MenuSelectItem(mainMenu.cursor);
 	}
 }
