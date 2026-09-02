@@ -1153,8 +1153,19 @@ ClockEditInput(ConfigItem *it)
 }
 
 /* real: 0x21EA20 - draw the row in edit colours, run the pad, and
- * reseed the soft clock from the fields EVERY frame (0x22B8E8's tail
- * call) - which is what makes the carousel follow the edit live. */
+ * reseed the soft clock from the six fields EVERY frame (0x22B8E8's
+ * tail call).  The per-frame reseed is the FREEZE: it re-pins h/m/s and
+ * zeroes the ms fraction faster than 0x22BB30's tick can advance them
+ * (the gp-30328 "hold" word 0x21DF28 writes is read by nothing in the
+ * whole image), so the carousel's pose - which 0x225628 derives from
+ * the soft clock every frame - settles and STOPS.  With the seconds
+ * zeroed on entry that settled pose is spin 0 / tilt snapped to the
+ * hour slot: the fixed presentation pose aap describes.  The pose only
+ * moves again when a field VALUE is edited, and then the reaction IS
+ * the highlight: an hour step re-fronts the ring onto the new hour's
+ * rod (the front slot carries the bright colours and the split), a
+ * minute step resizes the front rod's bright segment, a second step
+ * swings the ring to the new second and parks again. */
 static void
 EditItemClock(ConfigItem *it, int x, int y, int alpha)
 {
@@ -1163,28 +1174,40 @@ EditItemClock(ConfigItem *it, int x, int y, int alpha)
 	MenuClockSet(cfgSettings[9], cfgSettings[10], cfgSettings[11]);
 }
 
-/* real: 0x21DF28 - the clock item's +0x14.  Fades the orb trails down
- * (0x22EF90), freezes the tick (0x22B960), snapshots the RTC into the
- * six fields (0x22B960's block already holds it; the port copies its
- * own clock) and seeds the soft clock from them (0x22B8E8). */
+/* real: 0x21DF28 - the clock item's +0x14, in the ROM's own order:
+ * 0x21DDC0 (re-sync the six fields from the soft clock), `sw zero,
+ * -30428(gp)' (the orb scale TARGET - 0x2285C0 eases the live 0x27B440
+ * toward it at 0.1 a frame and 0x2261B8 multiplies the orbit radius by
+ * it, so the orbs sink into the CENTRE), 0x22EF90 (trail fade down),
+ * 0x22B960 (the gp-30328 word; write-only in the image - the real
+ * freeze is the widget's per-frame reseed, see EditItemClock),
+ * `0x22B0E8(11) = 0' (ZERO THE SECONDS - what parks the carousel at
+ * the fixed spin-0 pose), 0x22B8E8 (seed the soft clock from the six
+ * fields) and the 0x21E3B8 tail (the calendar clamp). */
 static void
 ClockEditOpen(ConfigItem *it)
 {
 	int h, m, s;
 
 	(void)it;
+	MenuClockGet(&h, &m, &s);	/* real: 0x21DDC0's re-sync */
+	MenuOrbScaleTarget(0.0f);	/* real: `sw zero,-30428(gp)' */
 	MenuOrbTrailFade(0);		/* real: 0x22EF90 */
 	MenuClockHold(1);		/* real: 0x22B960 */
-	MenuClockGet(&h, &m, &s);
 	cfgSettings[6] = cfgClockDate[0];
 	cfgSettings[7] = cfgClockDate[1];
 	cfgSettings[8] = cfgClockDate[2];
 	cfgSettings[9] = h;
 	cfgSettings[10] = m;
-	cfgSettings[11] = s;
+	cfgSettings[11] = 0;		/* real: 0x21DF68 - the seconds */
+	/* NOT original: the cancel snapshot keeps the REAL seconds - the
+	 * ROM's cancel re-reads the RTC (0x22B838), which never stopped */
 	cfgClockSaved[0] = h;
 	cfgClockSaved[1] = m;
 	cfgClockSaved[2] = s;
+	/* real: 0x21DFC4 - seed the soft clock, ms = 0 */
+	MenuClockSet(cfgSettings[9], cfgSettings[10], cfgSettings[11]);
+	ClockClampDay();		/* real: the j 0x21E3B8 tail */
 }
 
 /* real: 0x21EAE0 - the clock item's +0x20 confirm: 0x22B2A8 writes the
@@ -1201,6 +1224,7 @@ ClockEditApply(ConfigItem *it)
 	cfgClockDate[0] = cfgSettings[6];	/* the port's stand-in RTC date */
 	cfgClockDate[1] = cfgSettings[7];
 	cfgClockDate[2] = cfgSettings[8];
+	MenuOrbScaleTarget(1.0f);	/* real: 0x21EAFC - orbs fly back out */
 	MenuClockHold(0);		/* real: 0x22B950 */
 	MenuOrbTrailFade(1);		/* real: 0x22EF30 */
 	ConfigItemFocus(0, 1);		/* real: the 0x21D768/0x21D758 tail */
@@ -1213,6 +1237,7 @@ ClockEditCancel(ConfigItem *it)
 {
 	(void)it;
 	MenuClockSet(cfgClockSaved[0], cfgClockSaved[1], cfgClockSaved[2]);
+	MenuOrbScaleTarget(1.0f);	/* real: 0x21EB4C */
 	MenuClockHold(0);		/* real: 0x22B950 */
 	MenuOrbTrailFade(1);		/* real: 0x22EF30 */
 	ConfigItemFocus(0, 1);
@@ -1368,30 +1393,45 @@ DrawConfigMenu(int fadeAlpha)
 }
 
 /* real: the System Configuration screen's own share of 0x2279B8 and
- * 0x227BE8 (the two pad handlers 0x227D08 dispatches on the header's
- * mode).  Mode 0: the cursor WRAPS at both ends there, unlike the main
- * menu's, and each move fires the item's +0x28 focus callback twice,
- * off the old item and onto the new one; the confirm arm (bit 0x20)
- * runs the item's +0x14 (0x21DF28 for Clock Adjustment, 0x21EE50 for
- * the rest), zeroes the marker phase and flips the mode to 1.  Mode 1:
- * confirm kicks the cursor's cube, runs the item's +0x20 and drops back
- * to mode 0 (the 0x1F00B0 == 5 && 0x1F00A4 == 18 "launched to set the
- * clock" arm that would pick mode 2 instead is not ported); cancel runs
- * the +0x24 (0x21EB30 for the clock, a no-op for the others).  The
- * left/right value stepping is NOT here in the ROM either - the mode-1
- * widgets poll the pad themselves (EditItem*). */
+ * 0x227BE8 - the two pad handlers 0x227D08 dispatches on the header's
+ * mode, and ONLY while the screen's Anim is fully open (state 2, see
+ * MenuConfigFullyOpen); during the whole opening and closing
+ * choreography the ROM reads no pad at all, which is what makes entry
+ * land in the item LIST rather than falling straight through into an
+ * item's editor on the press that opened the screen.
+ *
+ * Both handlers read gp-30316, the press-EDGE word (pad.press) - only
+ * the clock editor's up/down (0x21E870, gp-30308) repeats.  The arms
+ * are exclusive: every taken arm of 0x2279B8 tail-jumps out through the
+ * 0x2287A8 click, in this order: up (0x1000, wrap + the two +0x28 focus
+ * calls + click 5), down (0x4000, same), confirm (0x20, the item's
+ * +0x14 - 0x21DF28 for Clock Adjustment, 0x21EE50 for the rest - then
+ * mode 1), 0x80 -> 0x227028 (the version sub-screen, not ported), the
+ * cancel button (0x40) -> 0x227338 (close the Anim, click 10 - the way
+ * BACK to the main menu), triangle (0x10) -> only from cursor 0: click
+ * 4, close the Anim, 0x223658 (the Options screen - not ported, so it
+ * leaves like cancel; the hint bar only offers triangle on item 0).
+ * Mode 1 (0x227BE8): confirm (0x20) kicks the cursor's cube, runs the
+ * item's +0x20 and drops to mode 0 (the 0x1F00B0 == 5 && 0x1F00A4 == 18
+ * "launched to set the clock" arm that would pick mode 2 instead is not
+ * ported); the cancel button (0x40) runs the +0x24 (0x21EB30 for the
+ * clock, a no-op for the others).  The left/right value stepping is NOT
+ * here in the ROM either - the mode-1 widgets poll gp-30316 themselves
+ * (EditItem*).  The gp-30352 hint-refresh word (0x22B100/0x22B108/
+ * 0x22B118 feeding 0x22B138) is not ported; the widgets set their own
+ * hints. */
 static void
 ConfigMenuInput(void)
 {
 	ConfigItem *it;
 	int old;
 
-	if(!MenuConfigOpen())
+	if(!MenuConfigFullyOpen())	/* real: 0x227D08's state-2 gate */
 		return;
 	it = &configMenu.items[configCursor];
 
 	if(configMenu.mode == 1) {		/* real: 0x227BE8 */
-		if(pad.press & (PAD_CROSS|PAD_CIRCLE)) {
+		if(pad.press & PAD_CIRCLE) {	/* the confirm button, 0x20 */
 			MenuConfigCubeKick(configCursor);	/* *(gp-32136) */
 			if(configCursor == 0)
 				ClockEditApply(it);	/* real: +0x20, 0x21EAE0 */
@@ -1400,7 +1440,7 @@ ConfigMenuInput(void)
 			configMenu.mode = 0;
 			cfgClick(4);		/* real: 0x2287A8(20992,1,4) */
 			configMenu.phase = 0;	/* real: 0x27BE28+0x34 = 0 */
-		} else if(pad.press & PAD_TRIANGLE) {
+		} else if(pad.press & PAD_CROSS) {	/* the cancel button, 0x40 */
 			if(configCursor == 0)
 				ClockEditCancel(it);	/* real: +0x24, 0x21EB30 */
 			configMenu.mode = 0;	/* the others' +0x24 is a nop */
@@ -1410,28 +1450,23 @@ ConfigMenuInput(void)
 		return;
 	}
 
+	/* real: 0x2279B8 - one arm a frame, in the ROM's own order */
 	old = configCursor;
-	if(pad.dirPress & PAD_UP)
+	if(pad.press & PAD_UP) {
 		if(--configCursor < 0)
 			configCursor = configMenu.count-1;
-	if(pad.dirPress & PAD_DOWN)
+		ConfigItemFocus(old, 0);	/* real: the two +0x28 calls - */
+		ConfigItemFocus(configCursor, 1); /* the hint-bar handover */
+		cfgClick(5);		/* real: 0x2287A8(20992,1,5) */
+	} else if(pad.press & PAD_DOWN) {
 		if(++configCursor >= configMenu.count)
 			configCursor = 0;
-	/* real: 0x2279B8 calls items[old].fn28(&items[old], 0) and then
-	 * items[new].fn28(&items[new], 1) on every move - which is what
-	 * hands the button hint bar over between items */
-	if(configCursor != old) {
 		ConfigItemFocus(old, 0);
 		ConfigItemFocus(configCursor, 1);
-	}
-	/* real: 0x2279B8's confirm arm (bit 0x20) - the item's +0x14, then
-	 * mode 1.  (Its gp-30352 word - 0x22B108 for the clock, 0x22B100
-	 * for the rest, feeding 0x22B138's hint refresh - is not ported;
-	 * the widgets set their own hints.) */
-	if(pad.press & (PAD_CROSS|PAD_CIRCLE)) {
-		it = &configMenu.items[configCursor];
+		cfgClick(5);
+	} else if(pad.press & PAD_CIRCLE) {	/* the confirm button, 0x20 */
 		if(configCursor == 0)
-			ClockEditOpen(it);	/* real: 0x21DF28 */
+			ClockEditOpen(it);	/* real: +0x14, 0x21DF28 */
 		else
 			ConfigItemResync(it);	/* real: 0x21EE50 -> 0x21EDB8 */
 		configMenu.phase = 0;		/* real: 0x21EE50's 0x27BE5C */
@@ -1439,10 +1474,18 @@ ConfigMenuInput(void)
 		cfgClick(4);
 		printf("osdsys: config item %d (\"%s\") opened\n", configCursor,
 			osdGetString(it->strid));
+	} else if(pad.press & PAD_CROSS) {	/* the cancel button, 0x40 */
+		MenuLeaveConfig();	/* real: 0x227338 - close the Anim */
+		cfgClick(10);		/* real: 0x227338's 0x2287A8 tail */
+	} else if(pad.press & PAD_TRIANGLE) {
+		/* real: 0x227B90's `lw v1,16(s0); bnez v1' - triangle only
+		 * acts on item 0, where the hint bar offers "Options"; the
+		 * 0x223658 screen switch is not ported, so it leaves. */
+		if(configCursor == 0) {
+			cfgClick(4);	/* real: 0x227BB0 */
+			MenuLeaveConfig();
+		}
 	}
-	/* real: 0x2279B8's TRIANGLE arm leaves the screen (0x2210C8) */
-	if(pad.press & PAD_TRIANGLE)
-		MenuLeaveConfig();
 }
 
 /* real: 0x228050 - open the menu once the module's fade-up has come far
@@ -1802,11 +1845,12 @@ static int cfgFocusNotified;
 
 /* real: the head of 0x227D08 - fire the cursor item's +0x28 with 1 on
  * the frame the screen becomes fully open (state 2 with no sub-screen
- * up) and with 0 when it stops being. */
+ * up) and with 0 when it stops being.  The ROM's condition is the same
+ * 0x22AC48 pair the pad gate uses, not an alpha threshold. */
 static void
-ConfigFocusNotify(int fadeAlpha)
+ConfigFocusNotify(void)
 {
-	if(MenuConfigAlpha(fadeAlpha) >= 128) {
+	if(MenuConfigFullyOpen()) {
 		if(!cfgFocusNotified) {
 			ConfigItemFocus(configCursor, 1);
 			cfgFocusNotified = 1;
@@ -2055,7 +2099,7 @@ MenuTextFrame(int fadeMode, int fadeAlpha)
 	MainMenuInput();
 	/* real: 0x227D08's head, which runs after 0x227560's draw and before
 	 * the pad handler it dispatches to */
-	ConfigFocusNotify(fadeAlpha);
+	ConfigFocusNotify();
 	ConfigMenuInput();
 	DrawMainMenu(fadeAlpha);
 	/* real: 0x227DE8's tail 0x227D08, one slot earlier in 0x2283F0 */

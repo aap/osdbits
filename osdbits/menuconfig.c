@@ -1709,7 +1709,14 @@ MenuConfigCarousel(void)
 			ring[i].split += 0.004f;	/* real *(gp-32164) */
 			if(ring[i].split > ringSplitMax)
 				ring[i].split = ringSplitMax;
-		}
+		} else
+			/* real: 225c6c's bc1fl arm - `split >= max' STORES the
+			 * max, so the front rod's bright segment snaps DOWN the
+			 * moment the max shrinks.  The Clock Adjustment editor
+			 * is where it shows: stepping the minute field UP
+			 * shrinks 1 - minutes/60 and retail's rod follows
+			 * instantly; the port only ever grew toward it. */
+			ring[i].split = ringSplitMax;
 		ring[i].progress = carouselTimer.duration ?
 			(float)(carouselTimer.count*128/carouselTimer.duration) * 0.0078125f : 0.0f;
 	}
@@ -2002,6 +2009,22 @@ int
 MenuConfigOpen(void)
 {
 	return !cfgIsState(&cfgAnim, 0);
+}
+
+/* real: the head of 0x227D08, the 0x227DE8 tail that dispatches the pad.
+ * It runs the focus dance and reaches a pad handler (0x2279B8/0x227BE8)
+ * ONLY while the screen's Anim is fully open - 0x22AC48(0x27BE44, 2) -
+ * AND no value sub-screen timer is running - 0x22AC48(0x27EC40, 0); on
+ * any other frame it fires the focus-off callback and returns.  So the
+ * ROM ignores the pad for the whole 90-frame opening (and closing)
+ * choreography, which is what keeps the confirm press that ENTERED the
+ * screen from falling through into the item list on the same frame.
+ * The port never opens its 0x27EC40 counterpart, so that half of the
+ * gate is always true and only the state-2 check is modelled. */
+int
+MenuConfigFullyOpen(void)
+{
+	return cfgIsState(&cfgAnim, 2);
 }
 
 /* real: 0x226A60 - the config screen's own alpha: the last dur10 frames

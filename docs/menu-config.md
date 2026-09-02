@@ -4748,3 +4748,314 @@ regression maps re-checked byte-identical after phase 2 (`p2_mainmenu.log`,
   only when the CURSOR is 0 (`lw v1,16(s0); bnez v1,skip`), and bits
   0x40/0x80 jump to 0x227338/0x227028 (other top-level screens).  The port
   keeps its existing leave-on-TRIANGLE-from-anywhere.
+
+
+---
+
+# Config-mode + clock-adjust fix (bugs A and B of 6f72b1c's phase 2)
+
+Scratch tree: `tmp/clockfix/osdbits` = HEAD **fb7a2f5** + this fix.
+`clockfix.diff` is git-apply-able against fb7a2f5 (checked with
+`git apply --check`).  Files touched: `menuconfig.c`, `menutext.c`,
+`menu.c`, `inc.h` (declarations only, away from the `osdBootSound`
+line).  `verify-old/` / `verify-new/` are throwaway builds (baseline /
+fixed + a scripted-press injector and two debug printfs, marked
+`VERIFY ONLY`) used for the evidence below - not part of the diff.
+
+## Bug A - entry fell straight into the item editor
+
+### The real mechanism (0x227D08)
+
+`0x227DE8` (the screen's per-frame slot) ends in `0x227D08`, and THAT
+is where the pad enters the config screen:
+
+    0x227D08:
+      if(!0x22AC48(0x27BE44, 2))  ->  focus-off path, NO pad dispatch
+      if(!0x22AC48(0x27EC40, 0))  ->  focus-off path, NO pad dispatch
+      ...focus-on dance (gp-30404 latch, the cursor item's +0x28)...
+      mode 0 -> tail-jump 0x2279B8;  mode 1 -> tail-jump 0x227BE8
+
+(the second call's `a1 = 0` sits in the first branch's delay slot at
+0x227D2C - it checks the value sub-screen timer for IDLE, not open).
+So the ROM reads **no pad at all** unless the screen's Anim `0x27BE44`
+is in state 2 - fully open.  The whole 90-frame opening choreography,
+and the closing one, are input-dead.  In particular the confirm press
+that *entered* the screen (main menu handler `0x228278` runs the same
+frame the Anim leaves idle) can never fall through into the item list.
+
+### What phase 2 got wrong
+
+`ConfigMenuInput()` gated on `MenuConfigOpen()` = "Anim not idle".  On
+a real pad, the X that selects "System Configuration" in the main menu
+was still set in `pad.press` when `ConfigMenuInput` ran later the same
+frame, its mode-0 confirm arm fired, and the cursor item's editor
+opened - on the default cursor that is Clock Adjustment, whose open
+callback grabs the soft clock and fights the opening animation.
+
+### The fix
+
+* `menuconfig.c`: new `MenuConfigFullyOpen()` = `cfgIsState(&cfgAnim,
+  2)`, the exact 0x227D08 head (the 0x27EC40 half of the gate is
+  always true here - the port never opens that timer - and stays
+  dropped, documented).
+* `menutext.c`: `ConfigMenuInput()` and `ConfigFocusNotify()` now gate
+  on it (the ROM's focus dance sits under the same gate, not under an
+  alpha threshold).
+
+While rewriting the handler I also matched the arms of
+`0x2279B8`/`0x227BE8` bit for bit against the canonical pad word the
+new pad.c (fb7a2f5) publishes - both handlers read gp-30316, the
+press-EDGE word (`pad.press`), and every taken arm tail-jumps out, so
+they are exclusive and in ROM order:
+
+    mode 0 (0x2279B8):  up 0x1000 / down 0x4000  wrap + the two +0x28
+                          focus calls + click 5  (edges - the ROM's
+                          config list does NOT auto-repeat)
+                        confirm 0x20 = PAD_CIRCLE  item's +0x14, mode 1,
+                          click 4  (0x21DF28 clock / 0x21EE50 rest)
+                        0x80 -> 0x227028  version sub-screen, not ported
+                        cancel 0x40 = PAD_CROSS -> 0x227338 = close the
+                          Anim + click 10 - the real way back to the
+                          main menu (the old port had confirm on
+                          CROSS|CIRCLE and leave on TRIANGLE)
+                        triangle 0x10  only from cursor 0 (the ROM's
+                          `lw v1,16(s0); bnez` oddity - the hint bar
+                          only offers "Options" there): click 4, close
+                          the Anim, 0x223658 (the Options screen switch,
+                          not ported, so it leaves like cancel)
+    mode 1 (0x227BE8):  confirm 0x20  cube kick (*(gp-32136) = -0.1),
+                          item's +0x20, mode 0, click 4, phase 0
+                        cancel 0x40   item's +0x24 (0x21EB30 for the
+                          clock, nop for the rest), mode 0, click 10
+                        (mode 2, the "launched from a game to set the
+                        clock" arm at 0x227C44, stays unported)
+
+Entry state: `0x227268` (enter) touches neither mode nor cursor; mode
+is 0 whenever the screen closes, so entry = the item LIST, and an
+item's `+0x1C` editor is reached only through the mode-0 confirm.
+
+## Bug B - the clock-adjust screen
+
+### The real display path, function by function
+
+**Entry, `0x21DF28`** (the clock item's +0x14), in order:
+
+1. `0x21DDC0` - selects the 12/24-hour field table and re-syncs the
+   six settings `0x22B0E8(6..11)` from the soft clock block.
+2. `sw zero, -30428(gp)` - the **orb scale target** (see below).
+3. `0x22EF90` - closes the 0x27F900 trail timer (trails fade down).
+4. `0x22B960` - writes 0 into gp-30328.  **This word is write-only in
+   the whole image** (the only accesses are the stores in 0x22B950/
+   0x22B960) - it is NOT what freezes the clock; see the reseed below.
+5. `*(0x22B0E8(11)) = 0` - **the SECONDS are zeroed** (0x21DF68).
+6. `0x22B8E8(Y,M,D,h,m,s)` - seed the soft clock from the six fields,
+   ms fraction = 0.
+7. tail `j 0x21E3B8` - the calendar clamp.
+
+**Per frame, `0x21EA20`** (the +0x1C widget): draw the row in edit
+colours (`0x21E3B0`), run the pad half `0x21E870` if 0x27EC40 is idle
+(left/right = field cursor in the item's +0x08, from gp-30316 edges;
+up/down = value step with wrap through the 0x27B870 ranges, from
+gp-30308, the repeat word), then **tail-jump `0x22B8E8` again - the
+soft clock is reseeded from the six raw fields EVERY frame**.  That
+per-frame reseed IS the freeze: it re-pins h/m/s and zeroes the ms
+fraction faster than the frame-body tick `0x22BB30` can advance them
+(it also rewrites gp-28816, so the tick's RTC-drift resync never
+fires).
+
+**Why that is a FIXED pose.**  The carousel pose is derived every
+frame by `0x225628` (from `0x225BF8` -> `0x225978`) purely from the
+soft-clock accessors:
+
+    ringOffset (0x34E6C0+0) = trunc(hours 0x22B720) % 12
+    spin  (0x34E6C4)  eases toward seconds * 65536/60  at *(gp-32168)=0.1
+    tilt  (0x34E6C6)  SNAPS to (offset<<16)/12 while |spin| < 201,
+                      eases at *(gp-32172)=0.1 otherwise
+    0x34E930 = 1 - minutes/60   (the front rod's split target)
+    gp-28854/-28856  the orbs' hour/second angles, same eases
+
+With the clock pinned and the seconds zeroed at entry, spin eases to
+**0** and parks, tilt then satisfies |spin| < 201 and **snaps** to the
+hour slot's angle: the canonical presentation pose, rotation stopped.
+The front slot (`i == ringOffset` in the colour spreader `0x225318`
+and slot 0 of the emitter `0x226028`) is the ring's highlighted rod -
+it carries the bright col1 `0x27EAF0` {80,80,80,1E}, the front body
+blend, and the minute split.
+
+**The highlight while editing** is the same machinery reacting to the
+edited VALUES (the reseed passes the raw fields - there is no
+field-cursor-driven code anywhere in the path):
+
+* stepping the HOUR moves `ringOffset` - the ring re-fronts onto the
+  new hour's rod instantly (tilt snaps, spin is ~0);
+* stepping the MINUTE resizes the front rod's bright split -
+  `0x225BF8`'s front-slot arm both grows the split at *(gp-32164) =
+  0.004 AND (the `bc1fl` arm at 0x225C6C) **snaps it DOWN** to the new
+  `1 - minutes/60` when the max shrinks;
+* stepping the SECOND swings spin to the new angle and parks again.
+
+**The orbs disappear into the centre.**  gp-30428 (0x2A7994, .data
+1.0) is the target of a per-frame ease in `0x2285C0`'s head:
+
+    *(0x27B440) += (*(gp-30428) - *(0x27B440)) * *(gp-32128 = 0.1)
+
+and the orb emitter `0x2261B8` computes the orbit radius as
+
+    radius = (gp-28848 * 7.25 + 10.0) * *(0x27B440)     (0x22626C)
+
+`0x22625C` is the only reader of 0x27B440 in the image.  So writing 0
+into gp-30428 on entry sends the whole orbit radius to 0 over ~1s -
+the orbs sink into the centre - and the exits restore it:
+**Apply `0x21EAE0`**: `0x22B2A8` (CDVD RTC write), gp-30428 = 1.0f
+(0x21EAFC), `0x22EF30` (trails back up), `0x22B950`, hint restore.
+**Cancel `0x21EB30`**: `0x22B838` (re-read the real RTC, which never
+stopped), then the same 1.0f / trails / hints.
+(The browser transition writes 0x27B440 and gp-30428 too - 0x224278 /
+0x2245F0 - and 0x21CE40 snaps 0x27B440 to 1.0 at module start; neither
+is this screen's business.)
+
+### What phase 2 got wrong
+
+* No orb-scale machinery at all: `menuScale` (the port's 0x27B440) was
+  a constant 1.0, so the orbs stayed on the ring through the edit and
+  every up/down press flung them around (`RotY(minutes*65536/60*1100)`
+  and `RotX((i+21)*seconds*65536/60)` are direct clock terms - in the
+  ROM they are invisible during the edit because the radius is 0).
+* The seconds were NOT zeroed at entry, so the pose froze wherever the
+  live second hand happened to be instead of parking at spin 0 with
+  the tilt snapped - and the ROM's open-time seed (`0x22B8E8` at
+  0x21DFC4) was skipped, leaving the first frame on the old clock.
+* The front rod's split never shrank (the 0x225C6C snap-down arm was
+  missing), so a minute step UP left the bright segment too long.
+* The doc's phase-2 write-up read the per-frame reseed as "what makes
+  the carousel follow the edit live" - it is the opposite: it is the
+  freeze (gp-30328 being write-only, the reseed is the ONLY freeze),
+  and the pose only moves when a field value actually changes.
+
+### The fix
+
+* `menu.c`: `menuScaleTarget` (real gp-30428) + exported setter
+  `MenuOrbScaleTarget()`; the 0x2285C0 ease
+  `menuScale += (menuScaleTarget - menuScale)*0.1f` in `MenuFrame`,
+  in the frame-body slot right after `MenuConfigCarousel()` (the ROM
+  runs 0x2285C0 right after 0x225BF8).  Init target = 1.0 (the .data
+  value), live = 1.0 (0x21CE40's snap), so the idle menu is
+  bit-identical to before.  Also documented that gp-30328 is
+  write-only in the image and the port's `clockHold` is the
+  one-frame-exact stand-in for the ROM's reseed-pinned clock.
+* `menutext.c` `ClockEditOpen`: reordered to 0x21DF28's exact order -
+  sync, `MenuOrbScaleTarget(0)`, trail fade, hold, **`cfgSettings[11]
+  = 0`**, the open-time `MenuClockSet` seed, `ClockClampDay()` (the
+  0x21E3B8 tail).  The cancel snapshot keeps the real seconds (the
+  ROM's cancel re-reads the RTC, which never stopped - the port has no
+  RTC, documented).
+* `menutext.c` `ClockEditApply`/`ClockEditCancel`: +
+  `MenuOrbScaleTarget(1.0f)` (0x21EAFC / 0x21EB4C).
+* `menuconfig.c` `MenuConfigCarousel`: the front slot's split snap-down
+  arm (`else split = max`, real 0x225C6C's bc1fl).
+* `EditItemClock` keeps the per-frame reseed (it is real) with the
+  corrected comment.
+
+## Matching status
+
+These functions are C reconstructions in osdbits, not byte-matched
+TUs - none of menuconfig.c/menutext.c/menu.c is in `matching/`'s bound
+tables, so "matching" here means instruction-level behavioural
+equivalence, verified arm by arm against the disassembly:
+
+| real | port | status |
+|---|---|---|
+| 0x227D08 head | MenuConfigFullyOpen + ConfigFocusNotify + the ConfigMenuInput gate | exact (0x27EC40 half of the gate constant-true, documented) |
+| 0x2279B8 | ConfigMenuInput mode 0 | all six arms, ROM order/exclusivity/click ids; 0x80 (version screen) and 0x223658 (Options screen) unported - both documented, triangle leaves instead |
+| 0x227BE8 | ConfigMenuInput mode 1 | exact incl. cube kick and click ids; mode 2 arm unported |
+| 0x21DF28 | ClockEditOpen | exact order incl. the seconds zero and open seed; RTC snapshot is the port's argv clock |
+| 0x21EA20/0x21E870 | EditItemClock/ClockEditInput | unchanged from HEAD (already matched: gp-30316 edges for left/right, gp-30308 repeat for up/down, per-frame reseed) |
+| 0x21EAE0/0x21EB30 | ClockEditApply/Cancel | + the gp-30428 = 1.0 write; RTC write/re-read remain printf/snapshot stubs |
+| 0x2285C0 head | the menuScale ease | exact (rate 0.1 read from gp-32128 in the image) |
+| 0x2261B8's radius | UpdateOrbs (unchanged) | already multiplied by menuScale; only the factor was dead |
+| 0x225BF8 front-slot split | MenuConfigCarousel | exact (grow 0.004, clamp, snap-down) |
+
+Left alone, pre-existing and documented in the sources: the orbs'
+gp-28854/-28856 eased hour/second angles (port seeds once - invisible
+during the edit, radius is 0), the 0x27EC40 sub-screen timer, the
+gp-30352 hint-refresh word, DrawConfigMenu's `alpha >= 128` marker
+guard.
+
+## Verification (windowless PCSX2, display :93, llvmpipe)
+
+Logs live next to this file.  All runs used the full --nosocket
+wrapper; the two verify builds add a scripted-press injector
+(confirm at frames 1 and 130, RIGHT at 150/155/160 = field cursor to
+hour, UP at 170 = hour 18 -> 19) plus per-50-frame `carousel ...` /
+`orbscale ...` printfs - `VERIFY ONLY`, not in the diff.
+
+**Main-menu regression** - argv
+`menu 12 34 56 0 1 128 60 0 0 0 10 0 0 0 1`, pristine fb7a2f5 build
+(`base_mainmenu.log`) vs fixed build (`fix_mainmenu.log`): the
+28-line frame-60 luminance maps (`grep -o '|.*|'`) are
+**byte-identical** (base_map.txt == fix_map.txt).
+
+**Config entry + clock adjust** - argv
+`menu 18 27 45 0 1 128 260 0 0 0 10 0 1 0 0` (clock 18:27:45,
+cfgEnter frame 1, debug/exit frame 260, meshTex 0, cursor default 0 =
+Clock Adjustment; note the last token lands on OsdArgInt(14) =
+meshTex - cfgCursor would be a 17th token, over the 16-token cap, so
+the cursor rides on its default).
+
+`old_config.log` (baseline + injector) - both bugs on display:
+
+    [0.8823] osdsys: enter System Configuration
+    [0.8869] osdsys: config item 0 ("Clock Adjustment") opened   <- SAME frame: bug A
+    [1.70]   carousel off=6 spin=-16304 tilt=-32768 ... ; orbscale 1.0000
+    [3.03]   ...set 2000/01/01 18:27:45 (RTC write stubbed)      <- frame-130 press APPLIES
+    [3.36..5.03] spin=-16159 -> -15271 -> -14360 ; orbscale 1.0000
+
+i.e. entry dropped straight into the editor; inside it the pose froze
+mid-swing at the live seconds (spin -16304, not 0), the orbs never
+left the ring (orbscale pinned 1.0), and after the accidental apply
+the carousel is visibly rotating again by the dump frame.
+
+`new_config.log` (fixed + injector):
+
+    [1.0083] osdsys: enter System Configuration      <- frame-1 confirm IGNORED
+    (frames 10..120: item list; spin eases with the live clock,
+     orbscale 1.0 - normal list mode through the opening)
+    [3.1617] osdsys: config item 0 ("Clock Adjustment") opened   <- the frame-130
+             confirm, first frame the Anim is fully open is 91
+    [3.49]   carousel off=6 spin=-1552  tilt=-32768 splitmax=0.550 ; orbscale 0.1094
+    [4.33]   carousel off=7 spin=-4     tilt=-27307 splitmax=0.550 ; orbscale 0.0006
+    [5.16]   carousel off=7 spin=0      tilt=-27307               ; orbscale 0.0000
+
+* entry lands in the item LIST (no editor until the fully-open
+  confirm) - bug A fixed;
+* in the editor the spin parks at exactly **0** (seconds zeroed) and
+  the tilt **snaps** to the hour slot - after the hour edit,
+  -27307 = (7<<16)/12 as s16, off=7 = 19%12: the ring re-fronted onto
+  the new hour's rod, i.e. the edited rod is the highlighted one -
+  and splitmax snapped to 1 - 27/60 = 0.550;
+* orbscale 1.0 -> 0.0000: the orbs sink into the centre.
+
+The frame-260 MeshDebug rod lines show the pose itself: the fixed
+build's twelve rods sit in a symmetric, level ring (front rod at
+y +0.2, pairs at y ±22.5/23.0, ±39.6/40.2, ±46.4/47.0, ±40.9/41.1,
+±24.0/23.8, back rod y -0.2 - spin 0, edge-on), where the old build's
+are bunched mid-swing (x -73..-21, y asymmetric) and still moving.
+The five cube lines are identical between the two runs (the cube
+stage is untouched).
+
+## Loose ends for aap
+
+* The prescribed verification argv's last token is OsdArgInt(14) =
+  meshTex, not cfgCursor - see above; nothing to fix, just naming.
+* Mode-0 leave is now the CANCEL button (0x40 -> 0x227338), exactly as
+  retail; TRIANGLE only acts on item 0 (retail sends it to the Options
+  screen 0x223658, which the port lacks, so it leaves too).  If the
+  triangle-from-anywhere leave was a UX preference, it is a two-line
+  revert in ConfigMenuInput's last arm.
+* The config item list no longer auto-repeats up/down (gp-30316 is the
+  edge word; only the clock editor's up/down, gp-30308, repeats) -
+  ROM-exact, but worth knowing it is deliberate.
+* Retail's 0x27B440 starts at .data 0.0 and 0x21CE40 snaps it to 1.0
+  at module start; the port never sees the 0.0 (init order), matching
+  the settled state.  The browser transition's writes (0x224278/
+  0x2245F0) remain unported.

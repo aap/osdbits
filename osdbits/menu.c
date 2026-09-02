@@ -68,9 +68,14 @@ float MenuClockHours(void)   { return clockHour + MenuClockMinutes()/60.0f; }
 
 /* real: gp-30328, 0x22B950 (set) / 0x22B960 (clear).  The Clock
  * Adjustment editor clears it on entry (0x21DF28) and both leaving paths
- * set it back (0x21EAE0 / 0x21EB30); while it is clear the editor
- * reseeds the block every frame from its six fields (0x21EA20's tail
- * 0x22B8E8), so the tick must not fight it. */
+ * set it back (0x21EAE0 / 0x21EB30) - but the word is WRITE-ONLY in the
+ * whole image (the only accesses are those two stores), so the real
+ * freeze is not a gate at all: 0x21EA20 reseeds the block from the six
+ * fields EVERY frame (its 0x22B8E8 tail zeroes the ms fraction and
+ * re-pins h/m/s), which pins the clock at the edited value no matter
+ * what 0x22BB30's tick adds in between.  The port keeps the hold as the
+ * one-frame-exact equivalent: reseed-then-tick would drift 17 ms a
+ * frame here because the port's tick runs after the widget. */
 static int clockHold;
 
 void
@@ -462,6 +467,17 @@ MenuOrbTrailFade(int up)
 		orbTrailTimer.state = 1;
 }
 
+/* real: gp-30428, the orb scale's ease target.  The Clock Adjustment
+ * editor is its only writer on this screen: 0 on entry, 1.0 on
+ * apply/cancel - see menuScale below. */
+static float menuScaleTarget;	/* real *(gp-30428) = 0x2A7994, .data 1.0 */
+
+void
+MenuOrbScaleTarget(float t)
+{
+	menuScaleTarget = t;
+}
+
 /* ==================== the screen fade (0x22ADD8) ====================
  *
  * `mode` (gp-28828, read back by 0x22AD30) and `alpha` (gp-28824, read
@@ -533,8 +549,16 @@ static sceVu0FVECTOR menuOrigin = { 0.0f, 0.0f, 0.0f, 1.0f };
  * position by *(gp-32224) = 0.97 per frame (0x21CFD8's tail) */
 static float menuCamZOffset;
 
-/* real *(0x27B440), set to 1.0 by 0x21CE40 - a global size multiplier
- * for the orbit radius */
+/* real *(0x27B440), set to 1.0 by 0x21CE40 - the orbit radius's LIVE
+ * scale.  It is not a constant: 0x2285C0's head eases it toward
+ * *(gp-30428) every frame at *(gp-32128) = 0.1, and the Clock Adjustment
+ * editor drives that target - 0 on entry (0x21DF28's `sw zero,-30428(gp)'),
+ * 1.0 on both ways out (0x21EAE0/0x21EB30).  0x2261B8 multiplies the
+ * orbit radius by the live word, so the orbs sink into the CENTRE while
+ * the clock is edited and fly back out after.  (The reader is 0x22625C,
+ * the only one in the image; the browser transition writes both words
+ * too - 0x224278/0x2245F0 - and is not ported.)  The target lives with
+ * its setter, MenuOrbScaleTarget above. */
 static float menuScale;
 
 /* real *(0x27B44C) / *(0x27B450), set by 0x21C9D0 from IsPAL: the
@@ -1235,6 +1259,7 @@ InitMenuScene(void)
 	menuScreenAY = IsPAL() ? 0.5405f : 0.47f;
 
 	menuScale = 1.0f;		/* real: 0x21CE40 */
+	menuScaleTarget = 1.0f;		/* real: gp-30428's .data value */
 	menuCamZOffset = -100.0f;	/* real: 0x21CE58's tail */
 	orbEase = 0.0f;
 	orbEaseOut = 0.0f;
@@ -1528,6 +1553,10 @@ MenuFrame(void)
 	/* real: 0x225BF8, stage 10 - after the 2D layer, so the progress the
 	 * emitter reads at stage 3 is always the previous frame's */
 	MenuConfigCarousel();
+	/* real: 0x2285C0's head, the frame-body slot right after 0x225BF8 -
+	 * ease the live orb scale 0x27B440 toward *(gp-30428) at *(gp-32128)
+	 * = 0.1.  (Its cubeSpin += 30 half lives in MenuConfigCubes.) */
+	menuScale += (menuScaleTarget - menuScale)*0.1f;
 	FadeStep();
 	ClockTick();
 }

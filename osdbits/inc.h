@@ -189,6 +189,8 @@ void MenuClockHold(int hold);	/* real: gp-30328, 0x22B950/0x22B960 */
 void MenuClockSet(int h, int m, int s);	/* real: 0x22B8E8's h/m/s third */
 void MenuClockGet(int *h, int *m, int *s);
 void MenuOrbTrailFade(int up);	/* real: 0x22EF30 (up) / 0x22EF90 (down) */
+void MenuOrbScaleTarget(float t);	/* real: gp-30428 - 0 sinks the orbs
+					 * into the centre, 1.0 sends them back */
 
 /* menu.c's matrix layer, in plain C because freesce's libvu0 is broken
  * (see the header comment there); the camera and view-screen matrices
@@ -216,6 +218,7 @@ void MenuConfigDrawMesh(SceneRec *rec);
 void MenuConfigFlushMesh(SceneRec *rec, int walk);	/* real: 0x22E428 */
 void MenuConfigCubes(void);	/* real: 0x226FA8 */
 int MenuConfigOpen(void);
+int MenuConfigFullyOpen(void);	/* real: 0x227D08's 0x22AC48(0x27BE44, 2) */
 int MenuConfigAlpha(int fadeAlpha);
 int MenuConfigItemPos(int i, float *x, float *y);
 void MenuConfigSetCursor(int n);
