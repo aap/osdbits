@@ -1,9 +1,19 @@
 /* NOT original: the port-0 controller.  The retail OSDSYS never touches
- * a pad library - the buttons arrive from the OSD system module, which
- * has padman up long before Module U is entered and hands the menu a
- * cooked button word (the reads at 0x228278 and friends).  osdbits boots
- * as a bare ELF with nothing running on the IOP but the boot ROM's own
- * modules, so the whole IOP side has to be brought up here.
+ * a pad library from Module U - its own pad thread (0x206E00) reads all
+ * eight port/slot combinations through XPADMAN, merges the active-low
+ * button bytes, applies the region swap (below), and publishes them to
+ * 0x1F0C58..5B plus a state word at 0x1F0C78.  Each menu frame the tick
+ * (0x21CF20) then calls the cooker 0x22BE30, which builds the canonical
+ * word `~((b[0x1F0C5A]<<8) | b[0x1F0C5B])` - exactly libpad's bit
+ * layout, the PAD_* enum in inc.h - and derives four globals from it:
+ * held (gp-30320), press edges (gp-30316, the word 0x228278 and every
+ * other menu consumer reads), release edges (gp-30312), and an UP/DOWN
+ * repeat word (gp-30308, the clock editor's up/down).  UpdatePad below
+ * reproduces that pipeline: pad.press == gp-30316, pad.dirPress ==
+ * gp-30308 for up/down plus gp-30316's press edges for left/right.
+ * osdbits boots as a bare ELF with nothing running on the IOP but the
+ * boot ROM's own modules, so the whole IOP side has to be brought up
+ * here.
  *
  * Lifted from ~/src/xtc/src/joy.c, aap's known-working pad layer, with
  * the module bookkeeping rewritten (see LoadPadModules).
@@ -164,18 +174,41 @@ SetAnalogMode(int state)
 }
 
 /* the four directions from the dpad and from the left stick, so both
- * drive the menu.  The stick threshold sits well past PADDEADZONE: a
- * resting stick must never step the cursor. */
+ * drive the menu (the stick is a port amenity - the retail pad thread
+ * reads the two raw button bytes only).  The stick threshold sits well
+ * past PADDEADZONE: a resting stick must never step the cursor. */
 #define PADSTICKDIR 0.5f
 
-/* NOT verified against the retail image: OSDSYS repeats a held direction
- * after a pause, but the two counts are the OSD module's, not Module U's,
- * and were not read out of it.  These are the usual OSD feel (a third of
- * a second, then twelve steps a second on NTSC). */
-#define PADREPEATDELAY 20
-#define PADREPEATRATE 5
+/* Read out of the retail image now (0x22BE98..0x22BF50, the tail of the
+ * cooker 0x22BE30): only UP and DOWN repeat - left and right are press
+ * edges only, everywhere in the menu.  Each of the two keeps a frame
+ * counter that sits at -1 while released and counts up from 0 (the
+ * press frame - count 0 IS the repeat word's press edge) while held; a
+ * repeat fires on every count >= 31 that is divisible by 3, so the
+ * first lands 33 frames after the press (~0.55 s NTSC) and then every
+ * 3 (20 Hz). */
+#define PADREPEATFIRST 31
+#define PADREPEATMOD 3
 
-static int padRepeatCount;
+static int padUpCount = -1;
+static int padDownCount = -1;
+
+/* the confirm/cancel region convention, the retail pad thread's publish
+ * step (0x207024..0x207058): when 0x204318() says the console is not
+ * Japanese (rom0:ROMVER's region letter - 'J' = 0, 'A'/'H' = 1,
+ * 'E' = 2, negative/unknown treated as 0), the circle (0x20) and cross
+ * (0x40) bits are exchanged in the raw button byte before the menu ever
+ * sees it.  Bit 0x20 of the canonical word therefore always means "the
+ * confirm button" - physical circle in Japan, physical cross everywhere
+ * else - and 0x40 "the cancel button", which is what every matched menu
+ * consumer tests (0x227BE8 confirms on 0x20).  osdbits has no ROMVER to
+ * read; the region proxy is argv slot 16, the same one menutext.c's
+ * textRegionSwap uses for the hint bar and osdGetString's 85<->86
+ * exchange, so the button under the "Enter" hint is always the button
+ * that enters.  Default 1 = the world arrangement.  Read lazily on the
+ * first UpdatePad - InitPad runs before opening.c's ParseArgs has
+ * located the numeric args. */
+static int padRegionSwap = -1;
 
 /* diagnostics: every frame while the pad is settling, then only when
  * something changes.  Kept in the build - a run with no pad and a run
@@ -202,7 +235,10 @@ UpdatePad(void)
 {
 	unsigned char rdata[32];
 	int state, mode;
-	u16 btns, dirs;
+	u16 btns, dirs, rep;
+
+	if(padRegionSwap < 0)
+		padRegionSwap = OsdArgInt(16, 1);
 
 	state = padOpen ? scePadGetState(0, 0) : scePadStateClosed;
 	if(padOpen)
@@ -212,12 +248,24 @@ UpdatePad(void)
 	mode = 0;
 	pad.lx = pad.ly = pad.rx = pad.ry = 0.0f;
 	/* a pad is only really there once padman answers a read; the state
-	 * alone still says Stable for a frame or two after an unplug */
+	 * alone still says Stable for a frame or two after an unplug.  The
+	 * state gate is the retail one (0x206FD4): a read only counts while
+	 * the pad is Stable or FindCTP1. */
 	pad.connected = 0;
-	if(padOpen && scePadRead(0, 0, rdata) > 0) {
+	if(padOpen &&
+	   (state == scePadStateStable || state == scePadStateFindCTP1) &&
+	   scePadRead(0, 0, rdata) > 0) {
 		pad.connected = 1;
 		mode = rdata[1];
 		btns = 0xFFFF ^ ((rdata[2] << 8) | rdata[3]);
+		/* the region swap - the retail thread's exact bit shuffle
+		 * ((b & 0x9f) | (b & 0x20) << 1 | (b & 0x40) >> 1), done on
+		 * the composed word instead of the raw active-low byte, which
+		 * commutes with the inversion */
+		if(padRegionSwap)
+			btns = (btns & ~(PAD_CIRCLE|PAD_CROSS)) |
+				((btns & PAD_CIRCLE) << 1) |
+				((btns & PAD_CROSS) >> 1);
 		/* 0x73 = analog mode, 16 bytes: the two sticks follow the
 		 * button word.  0x41 (digital) has no stick bytes at all. */
 		if(mode == 0x73) {
@@ -237,13 +285,22 @@ UpdatePad(void)
 	if(pad.ly > PADSTICKDIR) dirs |= PAD_DOWN;
 	if(pad.lx < -PADSTICKDIR) dirs |= PAD_LEFT;
 	if(pad.lx > PADSTICKDIR) dirs |= PAD_RIGHT;
-	pad.dirPress = dirs & ~pad.dirs;
-	if(pad.dirPress || dirs == 0)
-		padRepeatCount = PADREPEATDELAY;
-	else if(--padRepeatCount <= 0) {
-		padRepeatCount = PADREPEATRATE;
-		pad.dirPress = dirs;
-	}
+	/* the retail repeat word, bit for bit (see PADREPEATFIRST above);
+	 * the counters key off the merged dirs so the stick repeats too.
+	 * A fresh DOWN press STORES over an UP repeat due the same frame
+	 * rather than ORing - the ROM's own quirk (sw at 0x22BF20), kept. */
+	rep = 0;
+	if(dirs & PAD_UP) padUpCount++; else padUpCount = -1;
+	if(padUpCount == 0)
+		rep = PAD_UP;
+	else if(padUpCount >= PADREPEATFIRST && padUpCount % PADREPEATMOD == 0)
+		rep |= PAD_UP;
+	if(dirs & PAD_DOWN) padDownCount++; else padDownCount = -1;
+	if(padDownCount == 0)
+		rep = PAD_DOWN;
+	else if(padDownCount >= PADREPEATFIRST && padDownCount % PADREPEATMOD == 0)
+		rep |= PAD_DOWN;
+	pad.dirPress = (dirs & ~pad.dirs & (PAD_LEFT|PAD_RIGHT)) | rep;
 	pad.dirs = dirs;
 
 	if(padLogLeft > 0 || state != padLogState || mode != padLogMode ||
