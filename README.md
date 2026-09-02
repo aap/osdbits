@@ -6,6 +6,17 @@ image.
 
 ![the reconstructed opening animation](docs/opening.png)
 
+<table>
+  <tr>
+    <td align="center"><img src="docs/illegal.png" width="400" alt="the reconstructed illegal disc animation"><br><sub>illegal disc</sub></td>
+    <td align="center"><img src="docs/menu.png" width="400" alt="the reconstructed main menu"><br><sub>main menu</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/config1.png" width="400" alt="the reconstructed system configuration"><br><sub>system configuration</sub></td>
+    <td align="center"><img src="docs/config2.png" width="400" alt="the reconstructed system configuration (clock)"><br><sub>clock adjustment</sub></td>
+  </tr>
+</table>
+
 ## Layout
 
 - `osdbits/` — buildable reconstruction of the opening ("towers") boot
